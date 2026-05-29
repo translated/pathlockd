@@ -1,0 +1,36 @@
+# Single-node PD + TiKV for development and the Rust integration tests.
+#
+# PD/TiKV advertise their compose-DNS names, which is the only scheme that works
+# uniformly (notably under Docker Desktop, where `network_mode: host` does not
+# bind the host's localhost and a 127.0.0.1 advertise breaks TiKV→PD). Clients
+# therefore run *on this network*:
+#
+#   docker compose -f docker-compose.dev.yml up -d
+#   # run the integration tests in a throwaway container on the same network:
+#   ./scripts/test-in-docker.sh
+#
+# On a native-Linux host you can instead publish 2379/20160 and reach the
+# cluster from localhost; under Docker Desktop, join the network as above.
+
+services:
+  pd:
+    image: pingcap/pd:latest
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+
+  tikv:
+    image: pingcap/tikv:latest
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv
+      - --pd=http://pd:2379
+    depends_on:
+      - pd

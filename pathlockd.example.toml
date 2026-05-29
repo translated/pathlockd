@@ -1,0 +1,29 @@
+# Example pathlockd configuration. Pass with `--config pathlockd.toml` or
+# `PATHLOCKD_CONFIG=pathlockd.toml`. Every value can be overridden by the
+# corresponding PATHLOCKD_* environment variable (env wins over the file).
+
+# gRPC listen address.
+listen = "0.0.0.0:50051"
+
+# PD endpoints of the TiKV cluster (one or more).
+pd_endpoints = ["127.0.0.1:2379"]
+
+# Other pathlockd replicas, for best-effort cross-instance event fan-out.
+# Leave empty for a single instance; the client-side recheck poll is always the
+# correctness backstop.
+peers = []
+
+# Active GC sweep of expired keys, every N seconds (1 reclaims promptly, like a
+# 1Hz expiry cycle). 0 disables it — lazy expiry still guarantees correctness, so
+# raise this on very large keyspaces if the periodic full sweep is too costly.
+gc_interval_secs = 1
+gc_page = 1024
+
+# In-process event broadcast channel capacity.
+event_buffer = 8192
+
+# Enable the PathLockDebug service (test fault injection). MUST be false in prod.
+enable_debug = false
+
+# tracing log filter.
+log_level = "info"

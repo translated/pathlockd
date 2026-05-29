@@ -1,0 +1,337 @@
+syntax = "proto3";
+
+package pathlockd.v1;
+
+// pathlockd — fast, scalable, opinionated path-based distributed locking
+// primitives for developers building user-space virtual filesystems, with lock
+// metadata persisted in TiKV.
+//
+// Each lock is owned by a caller-supplied owner id, leases a set of hierarchical
+// paths (read or write), renews its lease to stay alive, and observes lifecycle
+// events (release / kill / revoke) for its own owner id over a server stream.
+// The RPCs below are the complete primitive surface; higher-level orchestration
+// (renewal cadence, contention waiting, deadlock resolution policy) lives in the
+// client.
+
+// ---------------------------------------------------------------------------
+// Shared value objects
+// ---------------------------------------------------------------------------
+
+enum Mode {
+  // Proto3 requires a zero default; WRITE is the implicit default wherever
+  // mode is optional.
+  MODE_WRITE = 0;
+  MODE_READ = 1;
+}
+
+enum LockState {
+  // A brand-new acquisition request.
+  LOCK_STATE_NEW = 0;
+  // A path the owner already holds and is re-validating: folded into the
+  // acquire transaction so an expired key surfaces as LOST.
+  LOCK_STATE_HELD = 1;
+}
+
+message LockRequest {
+  // Path form: "<handlerType>:<normalizedPath>", e.g. "google_drive:/a/b".
+  string path = 1;
+  Mode mode = 2;
+  LockState state = 3;
+}
+
+message ReleaseRequest {
+  string path = 1;
+  Mode mode = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Acquire
+// ---------------------------------------------------------------------------
+
+message AcquireRequest {
+  string owner_id = 1;
+  uint64 ttl_ms = 2;
+  repeated LockRequest requests = 3;
+  int64 fencing_token = 4;
+  // Releases folded into the same atomic transaction (shadowing transitions).
+  repeated ReleaseRequest release_requests = 5;
+  // When true and releases were applied, publish a RELEASED event for owner_id.
+  bool emit_release = 6;
+}
+
+enum AcquireStatus {
+  ACQUIRE_STATUS_OK = 0;
+  ACQUIRE_STATUS_CONFLICT = 1;
+  ACQUIRE_STATUS_LOST = 2;
+}
+
+message AcquireResponse {
+  AcquireStatus status = 1;
+  // CONFLICT: the conflicting path. LOST: the path whose key/fence went missing.
+  string path = 2;
+  // CONFLICT: the conflicting owner id (or, for stale_fencing_token, the
+  // persisted fence value as a string). Empty for LOST/OK.
+  string owner = 3;
+  // CONFLICT/LOST: machine-readable reason
+  // (ancestor_locked | write_locked | read_locked | descendant_write_locked |
+  //  descendant_read_locked | stale_fencing_token | missing_write | missing_read |
+  //  missing_fence | missing_alive).
+  string reason = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Release / ReleaseAll
+// ---------------------------------------------------------------------------
+
+message ReleaseLocksRequest {
+  string owner_id = 1;
+  repeated ReleaseRequest requests = 2;
+  // Fold the owner's wait-edge deletion into the same transaction.
+  bool del_wait_key = 3;
+}
+
+message ReleaseAllRequest {
+  string owner_id = 1;
+  bool del_wait_key = 2;
+}
+
+message ReleaseResponse {}
+
+// ---------------------------------------------------------------------------
+// Renew
+// ---------------------------------------------------------------------------
+
+message RenewRequest {
+  string owner_id = 1;
+  uint64 ttl_ms = 2;
+}
+
+enum RenewStatus {
+  RENEW_STATUS_OK = 0;
+  RENEW_STATUS_LOST = 1;
+}
+
+message RenewResponse {
+  RenewStatus status = 1;
+  string path = 2;
+  string reason = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ForceRelease (victim preemption)
+// ---------------------------------------------------------------------------
+
+message ForceReleaseRequest {
+  string victim_id = 1;
+}
+
+message ForceReleaseResponse {}
+
+// ---------------------------------------------------------------------------
+// AssertFencing
+// ---------------------------------------------------------------------------
+
+message AssertFencingRequest {
+  string owner_id = 1;
+  int64 fencing_token = 2;
+  repeated string paths = 3; // path form "<handlerType>:<normalizedPath>"
+}
+
+enum AssertStatus {
+  ASSERT_STATUS_OK = 0;
+  ASSERT_STATUS_FAIL = 1;
+}
+
+message AssertFencingResponse {
+  AssertStatus status = 1;
+  string path = 2;
+  string reason = 3; // stale_owner | stale_fencing_token
+}
+
+// ---------------------------------------------------------------------------
+// DetectCycle (deadlock wait-for graph walk)
+// ---------------------------------------------------------------------------
+
+message DetectCycleRequest {
+  string start_owner_id = 1;
+  uint32 max_depth = 2;
+}
+
+enum CycleKind {
+  CYCLE_KIND_NONE = 0;
+  CYCLE_KIND_FOUND = 1;
+  CYCLE_KIND_TRUNCATED = 2;
+}
+
+message DetectCycleResponse {
+  CycleKind kind = 1;
+  repeated string chain = 2;
+}
+
+// ---------------------------------------------------------------------------
+// IsBlocking (is a conflicting owner still holding the contended lock)
+// ---------------------------------------------------------------------------
+
+message IsBlockingRequest {
+  string conflict_path = 1;
+  string conflict_owner = 2;
+  string reason = 3;
+}
+
+message IsBlockingResponse {
+  bool blocking = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Fencing counter (monotonic INCR)
+// ---------------------------------------------------------------------------
+
+message IncrFencingTokenRequest {}
+
+message IncrFencingTokenResponse {
+  int64 token = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Wait edges (deadlock-detection adjacency: owner -> conflictOwner)
+// ---------------------------------------------------------------------------
+
+message SetWaitEdgeRequest {
+  string owner_id = 1;
+  string conflict_owner = 2;
+  uint64 ttl_ms = 3;
+}
+
+message SetWaitEdgeResponse {}
+
+message ClearWaitEdgeRequest {
+  string owner_id = 1;
+}
+
+message ClearWaitEdgeResponse {}
+
+// ---------------------------------------------------------------------------
+// Owner liveness probe
+// ---------------------------------------------------------------------------
+
+message IsOwnerAliveRequest {
+  string owner_id = 1;
+}
+
+message IsOwnerAliveResponse {
+  bool alive = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Cooperative revoke (publish a REVOKE event for an owner)
+// ---------------------------------------------------------------------------
+
+message RequestRevokeRequest {
+  string owner_id = 1;
+}
+
+message RequestRevokeResponse {}
+
+// ---------------------------------------------------------------------------
+// Event stream — scoped to a single owner.
+//
+// A subscription is bound to exactly one owner id and receives ONLY that owner's
+// lifecycle events: a cooperative REVOKE request, a forced KILL, or its own
+// RELEASED notification. Nothing about any other owner is delivered on the
+// stream — a lock's channel carries only that lock's information.
+// ---------------------------------------------------------------------------
+
+enum EventType {
+  EVENT_TYPE_RELEASED = 0;
+  EVENT_TYPE_KILLED = 1;
+  EVENT_TYPE_REVOKE = 2;
+}
+
+message SubscribeRequest {
+  // The owner id this subscription is bound to. Only events for this owner are
+  // delivered.
+  string owner_id = 1;
+}
+
+message Event {
+  EventType type = 1;
+  string owner_id = 2;
+}
+
+// Internal: instances forward events to configured peers so an event raised on
+// instance A reaches the owner's subscription on instance B.
+message PublishEventRequest {
+  Event event = 1;
+}
+
+message PublishEventResponse {}
+
+// ---------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------
+
+message HealthRequest {}
+
+message HealthResponse {
+  bool ok = 1;
+  string detail = 2;
+}
+
+service PathLock {
+  rpc Acquire(AcquireRequest) returns (AcquireResponse);
+  rpc Release(ReleaseLocksRequest) returns (ReleaseResponse);
+  rpc ReleaseAll(ReleaseAllRequest) returns (ReleaseResponse);
+  rpc Renew(RenewRequest) returns (RenewResponse);
+  rpc ForceRelease(ForceReleaseRequest) returns (ForceReleaseResponse);
+  rpc AssertFencing(AssertFencingRequest) returns (AssertFencingResponse);
+  rpc DetectCycle(DetectCycleRequest) returns (DetectCycleResponse);
+  rpc IsBlocking(IsBlockingRequest) returns (IsBlockingResponse);
+  rpc IncrFencingToken(IncrFencingTokenRequest) returns (IncrFencingTokenResponse);
+  rpc SetWaitEdge(SetWaitEdgeRequest) returns (SetWaitEdgeResponse);
+  rpc ClearWaitEdge(ClearWaitEdgeRequest) returns (ClearWaitEdgeResponse);
+  rpc IsOwnerAlive(IsOwnerAliveRequest) returns (IsOwnerAliveResponse);
+  rpc RequestRevoke(RequestRevokeRequest) returns (RequestRevokeResponse);
+  rpc Subscribe(SubscribeRequest) returns (stream Event);
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Internal peer fan-out.
+  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Debug service — gated behind PATHLOCKD_ENABLE_DEBUG=1. Lets tests inject
+// fault scenarios (flush, kill an owner, drop a key, plant a stale fence/owner,
+// read back raw state) without coupling them to the storage backend's byte
+// layout. Never enable in production.
+// ---------------------------------------------------------------------------
+
+message FlushRequest {}
+message FlushResponse { uint64 deleted = 1; }
+
+message ExpireOwnerRequest { string owner_id = 1; }
+message DeleteLockKeyRequest { string path = 1; Mode mode = 2; string owner_id = 3; }
+message SetWriteOwnerRequest { string path = 1; string owner_id = 2; }
+message GetWriteOwnerRequest { string path = 1; }
+message GetWriteOwnerResponse { bool exists = 1; string owner_id = 2; }
+message SetFenceRequest { string path = 1; int64 value = 2; }
+message GetFenceRequest { string path = 1; }
+message GetFenceResponse { bool exists = 1; int64 value = 2; }
+message SetFencingCounterRequest { int64 value = 1; }
+message GetFencingCounterRequest {}
+message GetFencingCounterResponse { int64 value = 1; }
+message OwnedPathsRequest { string owner_id = 1; }
+message OwnedPathsResponse { repeated string members = 1; bool alive = 2; }
+message DebugAck {}
+
+service PathLockDebug {
+  rpc Flush(FlushRequest) returns (FlushResponse);
+  rpc ExpireOwner(ExpireOwnerRequest) returns (DebugAck);
+  rpc DeleteLockKey(DeleteLockKeyRequest) returns (DebugAck);
+  rpc SetWriteOwner(SetWriteOwnerRequest) returns (DebugAck);
+  rpc GetWriteOwner(GetWriteOwnerRequest) returns (GetWriteOwnerResponse);
+  rpc SetFence(SetFenceRequest) returns (DebugAck);
+  rpc GetFence(GetFenceRequest) returns (GetFenceResponse);
+  rpc SetFencingCounter(SetFencingCounterRequest) returns (DebugAck);
+  rpc GetFencingCounter(GetFencingCounterRequest) returns (GetFencingCounterResponse);
+  rpc OwnedPaths(OwnedPathsRequest) returns (OwnedPathsResponse);
+}

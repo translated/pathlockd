@@ -1,0 +1,56 @@
+# Full in-container stack: a single-node TiKV cluster (PD + TiKV) plus pathlockd.
+# Everything talks over the compose network; only pathlockd's gRPC port is
+# published. Use this to run the daemon locally:
+#
+#   docker compose up --build
+#
+# pathlockd is then reachable at localhost:50051. TiKV is intentionally not
+# exposed to the host here — for host-run tests use docker-compose.dev.yml.
+
+services:
+  pd:
+    image: pingcap/pd:latest
+    restart: unless-stopped
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://0.0.0.0:2379
+      - --peer-urls=http://0.0.0.0:2380
+      - --advertise-client-urls=http://pd:2379
+      - --advertise-peer-urls=http://pd:2380
+      - --initial-cluster=pd=http://pd:2380
+    volumes:
+      - pd-data:/data/pd
+
+  tikv:
+    image: pingcap/tikv:latest
+    restart: unless-stopped
+    command:
+      - --addr=0.0.0.0:20160
+      - --advertise-addr=tikv:20160
+      - --status-addr=0.0.0.0:20180
+      - --data-dir=/data/tikv
+      - --pd=http://pd:2379
+    volumes:
+      - tikv-data:/data/tikv
+    depends_on:
+      - pd
+
+  pathlockd:
+    build: .
+    restart: unless-stopped
+    environment:
+      PATHLOCKD_LISTEN: "0.0.0.0:50051"
+      PATHLOCKD_PD_ENDPOINTS: "pd:2379"
+      PATHLOCKD_LOG_LEVEL: "info"
+      # Cross-instance fan-out: list sibling pathlockd endpoints here when you
+      # scale to multiple replicas, e.g. "http://pathlockd-2:50051".
+      # PATHLOCKD_PEERS: ""
+    ports:
+      - "50051:50051"
+    depends_on:
+      - tikv
+
+volumes:
+  pd-data:
+  tikv-data:
