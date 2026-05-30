@@ -4,7 +4,7 @@
 # steps done by hand for v0.1.1.
 #
 # Usage:
-#   scripts/release.sh [--dry-run] [--prerelease] [--draft] <tag>
+#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--docker] <tag>
 #
 # <tag> is the git tag to create, e.g. v0.1.2. Release notes are read from
 #   release_notes/<tag>/gh.md     (required; author it before releasing)
@@ -12,11 +12,15 @@
 #
 # Preconditions (checked, fails fast before anything irreversible):
 #   - cargo, gh (authenticated), tar, sha256sum, git installed;
+#   - docker required only when --docker is passed;
 #   - clean working tree, not behind the remote;
 #   - Cargo.toml's [package] version == <tag> without the leading 'v'
 #     (if it doesn't match and --dry-run is NOT set, Cargo.toml + Cargo.lock
 #     are bumped and committed automatically);
 #   - the tag (local + remote) and a GitHub release for it do not yet exist.
+#
+# Docker images are published automatically by the GitHub Actions workflow on
+# every v* tag push; use --docker only for local / manual image builds.
 #
 # Artifacts are built ON THIS HOST, so they are dynamically linked against the
 # host's glibc/libssl3. For maximally portable binaries, build in the Dockerfile
@@ -36,12 +40,13 @@ note() { echo "▶ $*"; }
 warn() { echo "⚠ $*" >&2; }
 
 # ---------------------------------------------------------------- args
-DRY_RUN=0; PRERELEASE=0; DRAFT=0; TAG=""
+DRY_RUN=0; PRERELEASE=0; DRAFT=0; DOCKER=0; TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1 ;;
     --prerelease) PRERELEASE=1 ;;
     --draft)      DRAFT=1 ;;
+    --docker)     DOCKER=1 ;;
     -h|--help)    usage; exit 0 ;;
     -*)           die "unknown flag: $1 (try --help)" ;;
     *)            [ -z "$TAG" ] || die "unexpected extra argument: $1"; TAG="$1" ;;
@@ -53,9 +58,10 @@ done
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- tooling
-for t in cargo gh tar sha256sum git awk docker; do
+for t in cargo gh tar sha256sum git awk; do
   command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
 done
+[ "$DOCKER" = 0 ] || command -v docker >/dev/null 2>&1 || die "required tool not found: docker (needed by --docker)"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
 # ---------------------------------------------------------------- tag / version
@@ -126,17 +132,26 @@ fi
 note "artifacts in $DIST:"
 ls -lh "$DIST"/*.tar.gz "$DIST"/SHA256SUMS | awk '{print "   " $9 "  (" $5 ")"}'
 
-# ---------------------------------------------------------------- docker build
-if docker image inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
-  note "container image $GHCR_IMAGE:$VERSION already present locally — skipping build."
+# ---------------------------------------------------------------- docker build (opt-in)
+if [ "$DOCKER" = 1 ]; then
+  if docker image inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
+    note "container image $GHCR_IMAGE:$VERSION already present locally — skipping build."
+  else
+    note "building container image ($GHCR_IMAGE:$VERSION) …"
+    docker build -t "$GHCR_IMAGE:$VERSION" .
+    note "building x86-64-v4 container image ($GHCR_IMAGE:$VERSION-x86-64-v4) …"
+    docker build --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
+      -t "$GHCR_IMAGE:$VERSION-x86-64-v4" .
+  fi
 else
-  note "building container image ($GHCR_IMAGE:$VERSION) …"
-  docker build -t "$GHCR_IMAGE:$VERSION" -t "$GHCR_IMAGE:latest" .
+  note "skipping docker build (pass --docker to build and push images locally)."
 fi
 
 # ---------------------------------------------------------------- dry-run stop
 if [ "$DRY_RUN" = 1 ]; then
-  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, create the GitHub release with the assets above, and push $GHCR_IMAGE:$VERSION to GHCR."
+  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release with the assets above."
+  [ "$DOCKER" = 1 ] && note "  --docker: would also push $GHCR_IMAGE:$VERSION and :$VERSION-x86-64-v4 to GHCR."
+  note "  The GitHub Actions workflow will publish both container images automatically on tag push."
   exit 0
 fi
 
@@ -154,13 +169,15 @@ note "creating GitHub release $TAG …"
 gh release create "$TAG" "${GH_FLAGS[@]}" \
   "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
 
-note "logging in to ghcr.io as $GH_USER …"
-gh auth refresh -s write:packages
-gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
-note "pushing $GHCR_IMAGE:$VERSION and :latest …"
-docker push "$GHCR_IMAGE:$VERSION"
-docker push "$GHCR_IMAGE:latest"
+if [ "$DOCKER" = 1 ]; then
+  note "logging in to ghcr.io as $GH_USER …"
+  gh auth refresh -s write:packages
+  gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
+  note "pushing $GHCR_IMAGE:$VERSION and :$VERSION-x86-64-v4 …"
+  docker push "$GHCR_IMAGE:$VERSION"
+  docker push "$GHCR_IMAGE:$VERSION-x86-64-v4"
+fi
 
 note "done:"
 gh release view "$TAG" --json url,assets --jq '.url, (.assets[] | "  asset: " + .name)'
-echo "  image: $GHCR_IMAGE:$VERSION"
+note "the GitHub Actions workflow will publish container images to GHCR automatically."
