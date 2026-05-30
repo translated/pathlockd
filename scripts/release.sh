@@ -3,7 +3,7 @@
 # release from a notes file.
 #
 # Usage:
-#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--build] [--docker] [--docker-v4] [--arm64] <tag>
+#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--build] [--docker] [--docker-force] [--arm64] <tag>
 #
 # <tag> is the git tag to create, e.g. v0.2.1. Release notes are read from
 #   release_notes/<tag>/gh.md     (required; author it before releasing)
@@ -25,8 +25,8 @@
 #
 # Docker images are published automatically by the GitHub Actions workflow on
 # every v* tag push; use --docker only for local / manual image builds.
-# Add --docker-v4 to also build and push the AVX-512-optimized :VERSION-x86-64-v4 variant
-# (linux/amd64 only); this is intentionally not built by CI.
+# The docker image is built with RUSTFLAGS="-C target-cpu=x86-64-v3" by default.
+# Add --docker-force to rebuild and push even if the image tag already exists in GHCR.
 # Add --arm64 to also build and push the linux/arm64 target alongside linux/amd64
 # (skipped by default; requires the local builder to have arm64 emulation).
 # Set GHCR_TOKEN to a PAT with write:packages to avoid interactive gh auth prompts.
@@ -46,19 +46,19 @@ note() { echo "▶ $*"; }
 warn() { echo "⚠ $*" >&2; }
 
 # ---------------------------------------------------------------- args
-DRY_RUN=0; PRERELEASE=0; DRAFT=0; BUILD=0; DOCKER=0; DOCKER_V4=0; ARM64=0; TAG=""
+DRY_RUN=0; PRERELEASE=0; DRAFT=0; BUILD=0; DOCKER=0; DOCKER_FORCE=0; ARM64=0; TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --dry-run)    DRY_RUN=1 ;;
-    --prerelease) PRERELEASE=1 ;;
-    --draft)      DRAFT=1 ;;
-    --build)      BUILD=1 ;;
-    --docker)     DOCKER=1 ;;
-    --docker-v4)  DOCKER=1; DOCKER_V4=1 ;;
-    --arm64)      ARM64=1 ;;
-    -h|--help)    usage; exit 0 ;;
-    -*)           die "unknown flag: $1 (try --help)" ;;
-    *)            [ -z "$TAG" ] || die "unexpected extra argument: $1"; TAG="$1" ;;
+    --dry-run)       DRY_RUN=1 ;;
+    --prerelease)    PRERELEASE=1 ;;
+    --draft)         DRAFT=1 ;;
+    --build)         BUILD=1 ;;
+    --docker)        DOCKER=1 ;;
+    --docker-force)  DOCKER=1; DOCKER_FORCE=1 ;;
+    --arm64)         ARM64=1 ;;
+    -h|--help)       usage; exit 0 ;;
+    -*)              die "unknown flag: $1 (try --help)" ;;
+    *)               [ -z "$TAG" ] || die "unexpected extra argument: $1"; TAG="$1" ;;
   esac
   shift
 done
@@ -174,9 +174,9 @@ if [ "$DRY_RUN" = 1 ]; then
   [ "$BUILD" = 0 ]  && note "  no --build: release will be created without binary artifacts."
   if [ "$DOCKER" = 1 ]; then
     PLATFORMS="linux/amd64"; [ "$ARM64" = 1 ] && PLATFORMS="linux/amd64,linux/arm64"
-    note "  --docker:    would push $GHCR_IMAGE:$VERSION ($PLATFORMS) to GHCR."
+    note "  --docker:    would push $GHCR_IMAGE:$VERSION ($PLATFORMS, x86-64-v3 optimized) to GHCR."
+    [ "$DOCKER_FORCE" = 1 ] && note "  --docker-force: will overwrite existing image tag."
   fi
-  [ "$DOCKER_V4" = 1 ] && note "  --docker-v4: would also push $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) to GHCR."
   note "  The GitHub Actions workflow will publish the default container image automatically on tag push."
   exit 0
 fi
@@ -222,29 +222,16 @@ if [ "$DOCKER" = 1 ]; then
   printf '%s' "$GHCR_LOGIN_TOKEN" | docker login ghcr.io -u "$GH_USER" --password-stdin
 
   DOCKER_PLATFORMS="linux/amd64"; [ "$ARM64" = 1 ] && DOCKER_PLATFORMS="linux/amd64,linux/arm64"
-  if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
-    note "$GHCR_IMAGE:$VERSION already exists — skipping multi-platform push."
+  if [ "$DOCKER_FORCE" = 0 ] && docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
+    note "$GHCR_IMAGE:$VERSION already exists — skipping multi-platform push (use --docker-force to override)."
   else
-    note "pushing $GHCR_IMAGE:$VERSION ($DOCKER_PLATFORMS) …"
+    note "pushing $GHCR_IMAGE:$VERSION ($DOCKER_PLATFORMS, x86-64-v3 optimized) …"
     docker buildx build \
       --platform "$DOCKER_PLATFORMS" \
+      --build-arg RUSTFLAGS="-C target-cpu=x86-64-v3" \
       -t "$GHCR_IMAGE:$VERSION" \
       --push \
       .
-  fi
-
-  if [ "$DOCKER_V4" = 1 ]; then
-    if docker buildx imagetools inspect "$GHCR_IMAGE:$VERSION-x86-64-v4" >/dev/null 2>&1; then
-      note "$GHCR_IMAGE:$VERSION-x86-64-v4 already exists — skipping x86-64-v4 push."
-    else
-      note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64, AVX-512) …"
-      docker buildx build \
-        --platform linux/amd64 \
-        --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
-        -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
-        --push \
-        .
-    fi
   fi
 fi
 
