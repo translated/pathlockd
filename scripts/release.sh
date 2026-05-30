@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
-# Publish a pathlockd release: validate, build linux/amd64 artifacts (release +
-# debug), tag, push, and create the GitHub release from a notes file — the same
-# steps done by hand for v0.1.1.
+# Publish a pathlockd release: validate, tag, push, and create the GitHub
+# release from a notes file.
 #
 # Usage:
-#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--docker] <tag>
+#   scripts/release.sh [--dry-run] [--prerelease] [--draft] [--build] [--docker] <tag>
 #
-# <tag> is the git tag to create, e.g. v0.1.2. Release notes are read from
+# <tag> is the git tag to create, e.g. v0.2.1. Release notes are read from
 #   release_notes/<tag>/gh.md     (required; author it before releasing)
 # and used both as the GitHub release body and the annotated-tag message.
 #
+# By default the script runs `cargo check --release --locked` to verify
+# buildability without producing binaries. Pass --build to compile full release
+# + debug binaries, package them, and attach them to the GitHub release.
+#
 # Preconditions (checked, fails fast before anything irreversible):
-#   - cargo, gh (authenticated), tar, sha256sum, git installed;
+#   - cargo, gh (authenticated), git, awk installed;
+#   - tar, sha256sum required only when --build is passed;
 #   - docker required only when --docker is passed;
 #   - clean working tree, not behind the remote;
 #   - Cargo.toml's [package] version == <tag> without the leading 'v'
@@ -22,10 +26,7 @@
 # Docker images are published automatically by the GitHub Actions workflow on
 # every v* tag push; use --docker only for local / manual image builds.
 #
-# Artifacts are built ON THIS HOST, so they are dynamically linked against the
-# host's glibc/libssl3. For maximally portable binaries, build in the Dockerfile
-# builder stage instead and attach those.
-#
+# Artifacts (when --build):
 #   dist/<tag>/pathlockd-<version>-linux-amd64.tar.gz        (release, stripped)
 #   dist/<tag>/pathlockd-<version>-linux-amd64-debug.tar.gz  (debug, with symbols)
 #   dist/<tag>/SHA256SUMS
@@ -40,12 +41,13 @@ note() { echo "▶ $*"; }
 warn() { echo "⚠ $*" >&2; }
 
 # ---------------------------------------------------------------- args
-DRY_RUN=0; PRERELEASE=0; DRAFT=0; DOCKER=0; TAG=""
+DRY_RUN=0; PRERELEASE=0; DRAFT=0; BUILD=0; DOCKER=0; TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)    DRY_RUN=1 ;;
     --prerelease) PRERELEASE=1 ;;
     --draft)      DRAFT=1 ;;
+    --build)      BUILD=1 ;;
     --docker)     DOCKER=1 ;;
     -h|--help)    usage; exit 0 ;;
     -*)           die "unknown flag: $1 (try --help)" ;;
@@ -58,9 +60,14 @@ done
 cd "$(dirname "$0")/.."
 
 # ---------------------------------------------------------------- tooling
-for t in cargo gh tar sha256sum git awk; do
+for t in cargo gh git awk; do
   command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t"
 done
+if [ "$BUILD" = 1 ]; then
+  for t in tar sha256sum; do
+    command -v "$t" >/dev/null 2>&1 || die "required tool not found: $t (needed by --build)"
+  done
+fi
 [ "$DOCKER" = 0 ] || command -v docker >/dev/null 2>&1 || die "required tool not found: docker (needed by --docker)"
 gh auth status >/dev/null 2>&1 || die "gh is not authenticated (run: gh auth login)"
 
@@ -108,29 +115,35 @@ if git rev-parse -q --verify "refs/remotes/origin/$BRANCH" >/dev/null; then
     || die "local $BRANCH is behind origin/$BRANCH — pull/rebase before releasing"
 fi
 
-# ---------------------------------------------------------------- build + package
+# ---------------------------------------------------------------- check / build + package
 DIST="dist/$TAG"
 REL_TGZ="pathlockd-$VERSION-linux-amd64.tar.gz"
 DBG_TGZ="pathlockd-$VERSION-linux-amd64-debug.tar.gz"
 
-if [ -f "$DIST/$REL_TGZ" ] && [ -f "$DIST/$DBG_TGZ" ] && [ -f "$DIST/SHA256SUMS" ]; then
-  note "dist artifacts already present in $DIST — skipping build and package."
+if [ "$BUILD" = 1 ]; then
+  if [ -f "$DIST/$REL_TGZ" ] && [ -f "$DIST/$DBG_TGZ" ] && [ -f "$DIST/SHA256SUMS" ]; then
+    note "dist artifacts already present in $DIST — skipping build and package."
+  else
+    note "building release + debug binaries (linux/amd64) …"
+    cargo build --release --locked
+    cargo build --locked
+    REL="target/release/pathlockd"; DBG="target/debug/pathlockd"
+    [ -x "$REL" ] && [ -x "$DBG" ] || die "expected binaries missing after build"
+    GOT="$("$REL" --version | awk '{print $2}')"
+    [ "$GOT" = "$VERSION" ] || die "release binary reports version $GOT, expected $VERSION"
+    rm -rf "$DIST"; mkdir -p "$DIST/.stage"
+    cp "$REL" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$REL_TGZ" pathlockd
+    cp "$DBG" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$DBG_TGZ" pathlockd
+    rm -rf "$DIST/.stage"
+    ( cd "$DIST" && sha256sum "$REL_TGZ" "$DBG_TGZ" > SHA256SUMS )
+  fi
+  note "artifacts in $DIST:"
+  ls -lh "$DIST"/*.tar.gz "$DIST"/SHA256SUMS | awk '{print "   " $9 "  (" $5 ")"}'
 else
-  note "building release + debug binaries (linux/amd64) …"
-  cargo build --release
-  cargo build
-  REL="target/release/pathlockd"; DBG="target/debug/pathlockd"
-  [ -x "$REL" ] && [ -x "$DBG" ] || die "expected binaries missing after build"
-  GOT="$("$REL" --version | awk '{print $2}')"
-  [ "$GOT" = "$VERSION" ] || die "release binary reports version $GOT, expected $VERSION"
-  rm -rf "$DIST"; mkdir -p "$DIST/.stage"
-  cp "$REL" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$REL_TGZ" pathlockd
-  cp "$DBG" "$DIST/.stage/pathlockd"; tar -C "$DIST/.stage" -czf "$DIST/$DBG_TGZ" pathlockd
-  rm -rf "$DIST/.stage"
-  ( cd "$DIST" && sha256sum "$REL_TGZ" "$DBG_TGZ" > SHA256SUMS )
+  note "checking buildability (pass --build to compile and package artifacts) …"
+  cargo check --release --locked
+  note "cargo check passed."
 fi
-note "artifacts in $DIST:"
-ls -lh "$DIST"/*.tar.gz "$DIST"/SHA256SUMS | awk '{print "   " $9 "  (" $5 ")"}'
 
 # ---------------------------------------------------------------- docker build (opt-in)
 if [ "$DOCKER" = 1 ]; then
@@ -144,7 +157,9 @@ fi
 
 # ---------------------------------------------------------------- dry-run stop
 if [ "$DRY_RUN" = 1 ]; then
-  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release with the assets above."
+  note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release."
+  [ "$BUILD" = 1 ]  && note "  --build:  would attach artifacts from $DIST to the release."
+  [ "$BUILD" = 0 ]  && note "  no --build: release will be created without binary artifacts."
   [ "$DOCKER" = 1 ] && note "  --docker: would also push $GHCR_IMAGE:$VERSION (linux/amd64+arm64) and :$VERSION-x86-64-v4 (linux/amd64) to GHCR."
   note "  The GitHub Actions workflow will publish both container images automatically on tag push."
   exit 0
@@ -161,8 +176,12 @@ GH_FLAGS=(--title "$TAG" --notes-file "$NOTES" --verify-tag)
 [ "$PRERELEASE" = 1 ] && GH_FLAGS+=(--prerelease)
 [ "$DRAFT" = 1 ] && GH_FLAGS+=(--draft)
 note "creating GitHub release $TAG …"
-gh release create "$TAG" "${GH_FLAGS[@]}" \
-  "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
+if [ "$BUILD" = 1 ]; then
+  gh release create "$TAG" "${GH_FLAGS[@]}" \
+    "$DIST/$REL_TGZ" "$DIST/$DBG_TGZ" "$DIST/SHA256SUMS"
+else
+  gh release create "$TAG" "${GH_FLAGS[@]}"
+fi
 
 if [ "$DOCKER" = 1 ]; then
   note "logging in to ghcr.io as $GH_USER …"
