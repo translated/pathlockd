@@ -274,9 +274,20 @@ needs nothing on the host.
 
 ## Testing
 
+Everything runs inside containers, so Docker is the only prerequisite (no host
+cargo/protoc/clang). The first run builds a small cached builder image.
+
 ```bash
-docker compose -f docker-compose.dev.yml up -d
-./scripts/test-in-docker.sh
+./scripts/test-unit.sh           # crate unit tests (no cluster needed)
+./scripts/test-integration.sh    # brings up TiKV (PD + TiKV) and runs the integration tests
+```
+
+The cluster used by the integration tests is managed on its own:
+
+```bash
+./scripts/infra.sh up      # start PD + TiKV and wait until ready
+./scripts/infra.sh status  # show container + TiKV store status
+./scripts/infra.sh down    # stop it (reset also wipes the data volumes)
 ```
 
 See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).

@@ -1,5 +1,28 @@
 # Testing
 
+Everything runs in containers — Docker is the only host prerequisite (no cargo/
+protoc/clang locally). The scripts build a small cached builder image on first
+use (`pathlockd-builder:bookworm`) and cache the cargo registry/target in named
+volumes for fast reruns.
+
+| Script | What it does |
+| --- | --- |
+| `scripts/test-unit.sh` | `cargo test --lib --bins` in a container — the in-source `#[cfg(test)]` modules. No cluster needed. |
+| `scripts/test-integration.sh` | brings up PD + TiKV (via `infra.sh`) and runs the engine integration tests in a container joined to the dev network. |
+| `scripts/infra.sh` | lifecycle for the local TiKV cluster: `up` / `wait` / `status` / `logs` / `down` / `reset`. |
+
+Both test scripts forward extra args to the test (e.g. a name filter):
+`scripts/test-unit.sh handler_of`, `scripts/test-integration.sh fencing`.
+
+## Unit tests (in-source `#[cfg(test)]`)
+
+Pure tests in `engine.rs` / `service.rs` / `store.rs` (path/ttl validation,
+ancestor walking, fence parsing, expiry math). They don't touch TiKV.
+
+```bash
+./scripts/test-unit.sh
+```
+
 ## Engine integration tests (`tests/engine_integration.rs`)
 
 Exercise the primitives against a **real** TiKV cluster: hierarchical conflict
