@@ -134,15 +134,10 @@ ls -lh "$DIST"/*.tar.gz "$DIST"/SHA256SUMS | awk '{print "   " $9 "  (" $5 ")"}'
 
 # ---------------------------------------------------------------- docker build (opt-in)
 if [ "$DOCKER" = 1 ]; then
-  if docker image inspect "$GHCR_IMAGE:$VERSION" >/dev/null 2>&1; then
-    note "container image $GHCR_IMAGE:$VERSION already present locally — skipping build."
-  else
-    note "building container image ($GHCR_IMAGE:$VERSION) …"
-    docker build -t "$GHCR_IMAGE:$VERSION" .
-    note "building x86-64-v4 container image ($GHCR_IMAGE:$VERSION-x86-64-v4) …"
-    docker build --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
-      -t "$GHCR_IMAGE:$VERSION-x86-64-v4" .
-  fi
+  # Ensure a buildx builder capable of multi-platform builds exists.
+  docker buildx inspect pathlockd-builder >/dev/null 2>&1 \
+    || docker buildx create --name pathlockd-builder --use --bootstrap
+  docker buildx use pathlockd-builder
 else
   note "skipping docker build (pass --docker to build and push images locally)."
 fi
@@ -150,7 +145,7 @@ fi
 # ---------------------------------------------------------------- dry-run stop
 if [ "$DRY_RUN" = 1 ]; then
   note "dry-run complete — would tag $TAG on $BRANCH ($(git rev-parse --short HEAD)), push, and create the GitHub release with the assets above."
-  [ "$DOCKER" = 1 ] && note "  --docker: would also push $GHCR_IMAGE:$VERSION and :$VERSION-x86-64-v4 to GHCR."
+  [ "$DOCKER" = 1 ] && note "  --docker: would also push $GHCR_IMAGE:$VERSION (linux/amd64+arm64) and :$VERSION-x86-64-v4 (linux/amd64) to GHCR."
   note "  The GitHub Actions workflow will publish both container images automatically on tag push."
   exit 0
 fi
@@ -173,9 +168,21 @@ if [ "$DOCKER" = 1 ]; then
   note "logging in to ghcr.io as $GH_USER …"
   gh auth refresh -s write:packages
   gh auth token | docker login ghcr.io -u "$GH_USER" --password-stdin
-  note "pushing $GHCR_IMAGE:$VERSION and :$VERSION-x86-64-v4 …"
-  docker push "$GHCR_IMAGE:$VERSION"
-  docker push "$GHCR_IMAGE:$VERSION-x86-64-v4"
+
+  note "pushing $GHCR_IMAGE:$VERSION (linux/amd64, linux/arm64) …"
+  docker buildx build \
+    --platform linux/amd64,linux/arm64 \
+    -t "$GHCR_IMAGE:$VERSION" \
+    --push \
+    .
+
+  note "pushing $GHCR_IMAGE:$VERSION-x86-64-v4 (linux/amd64) …"
+  docker buildx build \
+    --platform linux/amd64 \
+    --build-arg RUSTFLAGS="-C target-cpu=x86-64-v4" \
+    -t "$GHCR_IMAGE:$VERSION-x86-64-v4" \
+    --push \
+    .
 fi
 
 note "done:"

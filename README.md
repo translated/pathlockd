@@ -55,7 +55,7 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 ## Core concepts
 
 | Concept | What it does |
-|---|---|
+| --- | --- |
 | **Owner** | A caller-supplied id that owns a lock and all the paths it holds. |
 | **Read / write modes** | Shared readers, exclusive writer — but hierarchical, not flat: a write covers its whole subtree, a read covers only its node. A tree-shaped RWLock, not the symmetric textbook one. Full rules: [docs/locking-semantics.md](docs/locking-semantics.md). |
 | **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
@@ -66,7 +66,7 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 
 ## Architecture
 
-```
+```text
    your application (one lock = one owner id = one connection)
         │  gRPC
         ▼
@@ -143,8 +143,9 @@ filesystem, see the [**usage guide**](docs/usage-virtual-filesystem.md).
 
 ## Platform support
 
-Linux **x86_64 (amd64)** only, at the moment. The provided container images and
-the Node.js client target `linux/amd64`.
+Container images are published for **linux/amd64** and **linux/arm64** (Apple
+Silicon / AWS Graviton). The x86-64-v4 optimized image is amd64-only. The
+Node.js client targets `linux/amd64`.
 
 ## Running from the container image
 
@@ -188,7 +189,7 @@ docker run -d --restart=unless-stopped \
 **Key env vars** (see [Configuration](#configuration) for the full list):
 
 | Env var | Default | Notes |
-|---|---|---|
+| --- | --- | --- |
 | `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | Comma-separated PD addresses — set this in any non-local deployment |
 | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
 | `PATHLOCKD_PEERS` | *(none)* | Comma-separated sibling pathlockd addresses; needed only when clients are not sticky to one replica |
@@ -258,7 +259,7 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 [`pathlockd.example.toml`](pathlockd.example.toml).
 
 | TOML key | Env var | Default | Meaning |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC listen address |
 | `pd_endpoints` | `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints (comma-separated in env) |
 | `peers` | `PATHLOCKD_PEERS` | `[]` | sibling pathlockd endpoints for cross-instance event fan-out |
