@@ -3,3 +3,4 @@
 *.pdb
 pathlockd.toml
 .env
+.claude/

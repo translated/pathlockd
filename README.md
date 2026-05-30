@@ -75,14 +75,57 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
   survives node loss, and scales horizontally as you add TiKV nodes (PD
   rebalances regions). There is no single Redis-style SPOF.
 - **Atomicity.** Each multi-key operation runs as one optimistic TiKV
-  transaction that writes a shared serialization key, so any two overlapping
-  mutations conflict at commit and one retries — giving single-threaded
-  correctness cluster-wide. Read-mostly checks run lock-free.
+  transaction that writes a **per-handler** serialization key, so any two
+  overlapping mutations *on the same handler* conflict at commit and one retries
+  — giving single-threaded correctness within a handler while letting disjoint
+  handlers commit in parallel. Containment hazards never cross handlers, so this
+  is sufficient. Read-mostly and advisory checks (`AssertFencing`, `IsBlocking`,
+  `DetectCycle`) run lock-free.
 - **TTL is emulated** on top of TiKV: writes stamp an absolute expiry; reads
   treat elapsed entries as absent (correctness), and a background sweep reclaims
-  them (housekeeping, runs every second by default).
+  them (housekeeping, runs every second by default). Set entries (read sets,
+  descendant indexes) expire **per member**, so a short-lived lock can never
+  shorten the visibility of a longer-lived one sharing the same key.
+
+### Scope & limits
+
+- **Write throughput scales per handler, not without bound.** All mutations that
+  touch a given handler serialize through that handler's key (one TiKV region /
+  Raft leader). Spread load across handlers — or split a hot handler — to scale;
+  a single hot handler is the throughput ceiling.
+- **Descendant index size.** A write lock is indexed under every ancestor up to
+  the handler root, so the root index aggregates every write lock in the handler
+  in one value. This bounds the practical number of concurrent locks per handler;
+  very wide/deep trees in one handler are not yet sharded (future work).
+- **Input limits (enforced server-side).** `ttl_ms` must be `> 0` (a `0` TTL
+  would never expire) and `≤ 7 days`; paths must be normalized
+  (`<handler>:/rooted/path`, no `//`, `.`/`..`, or trailing slash);
+  `owner_id`/paths are length-bounded; `DetectCycle.max_depth` is clamped.
+  Malformed input is rejected with `InvalidArgument`.
+- **Trust model.** There is no authentication on the gRPC surface — any client
+  can release or revoke any owner's locks. Run pathlockd on a trusted network
+  (or behind a TLS-terminating, authenticating proxy).
+- **Storage format.** This is a pre-1.0 daemon; the on-disk value encoding may
+  change between versions. Run against a fresh/flushed keyspace when upgrading.
+
+### Roadmap to 1.0.0 (TODO)
+
+The following are **not yet implemented** and are planned for the final `1.0.0`
+release:
+
+- [ ] **Metrics** — no metrics/observability endpoint yet (e.g. Prometheus:
+  retry/conflict rates, lock counts, transaction latency, GC reclaimed).
+- [ ] **CI** — no continuous-integration pipeline yet (build, clippy, unit +
+  integration tests against an ephemeral TiKV on every push/PR).
+- [ ] **Authentication & authorization, TLS** — the gRPC surface is currently
+  unauthenticated and in plaintext; until then, run pathlockd only on a trusted
+  network or behind a TLS-terminating, authenticating proxy.
+- [ ] **Multitenancy** — no tenant isolation yet (per-tenant authn/authz,
+  namespacing beyond the handler convention, and quotas).
 
 Internals are documented for contributors and tools in [`llmwiki/`](llmwiki/).
+For end-to-end, copy-pasteable usage when building a user-space virtual
+filesystem, see the [**usage guide**](docs/usage-virtual-filesystem.md).
 
 ## Platform support
 
