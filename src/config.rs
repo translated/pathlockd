@@ -76,12 +76,18 @@ struct Cli {
     /// Path to a TOML config file.
     #[arg(long, env = "PATHLOCKD_CONFIG")]
     config: Option<PathBuf>,
+    /// Probe a locally-running instance's Health RPC and exit 0 (ready) or 1.
+    /// Used by the container HEALTHCHECK; not for normal startup.
+    #[arg(long, hide = true)]
+    health_check: bool,
 }
 
 impl Config {
-    pub fn load() -> anyhow::Result<Config> {
+    /// Parse CLI + config, returning the resolved config and whether this
+    /// invocation is a one-shot `--health-check` probe rather than the daemon.
+    pub fn load() -> anyhow::Result<(Config, bool)> {
         let cli = Cli::parse();
-        Config::load_from(cli.config)
+        Ok((Config::load_from(cli.config)?, cli.health_check))
     }
 
     /// Resolve config from an optional file path plus the environment.

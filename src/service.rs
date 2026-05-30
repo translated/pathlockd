@@ -32,6 +32,106 @@ fn internal<E: std::fmt::Display>(e: E) -> Status {
     Status::internal(e.to_string())
 }
 
+/// Map an engine error to a gRPC status. A transient TiKV error that survived
+/// the bounded retry budget becomes `Unavailable` so the client backs off and
+/// retries; anything else is a genuine internal fault — logged in full, but
+/// reported to the client without the internal detail.
+fn engine_err(e: anyhow::Error) -> Status {
+    if crate::store::is_retryable(&e) {
+        Status::unavailable("storage temporarily unavailable (contention/region churn); retry")
+    } else {
+        tracing::error!(error = %e, "internal error serving request");
+        Status::internal("internal error")
+    }
+}
+
+// --- request validation (defensive backstop; clients are expected to send
+// already-normalized paths and sane leases) ---
+
+/// Upper bound on a lease TTL. Leases are normally seconds to minutes; this just
+/// guards against an absurd value (and a `0` that would mean "never expires").
+const MAX_TTL_MS: u64 = 7 * 86_400_000; // 7 days
+const MAX_ID_LEN: usize = 1024;
+const MAX_PATH_LEN: usize = 4096;
+const MAX_PATHS_PER_REQUEST: usize = 1024;
+/// Hard cap on a deadlock-detection walk so a client can't request an unbounded
+/// scan; `DetectCycle.max_depth` is clamped to this rather than rejected.
+const MAX_CYCLE_DEPTH: u32 = 4096;
+
+fn check_id(label: &str, id: &str) -> Result<(), Status> {
+    if id.is_empty() {
+        return Err(Status::invalid_argument(format!("{label} must not be empty")));
+    }
+    if id.len() > MAX_ID_LEN {
+        return Err(Status::invalid_argument(format!(
+            "{label} too long (max {MAX_ID_LEN} bytes)"
+        )));
+    }
+    Ok(())
+}
+
+fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
+    if ttl_ms == 0 {
+        return Err(Status::invalid_argument(
+            "ttl_ms must be > 0 (a 0 TTL would create a lock that never expires)",
+        ));
+    }
+    if ttl_ms > MAX_TTL_MS {
+        return Err(Status::invalid_argument(format!(
+            "ttl_ms too large (max {MAX_TTL_MS} ms)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a path form `"<handler>:<normalizedPath>"`. Rejects the shapes that
+/// would silently break containment (no handler, non-rooted path, `//`, `.`/`..`
+/// segments, trailing slash on a non-root path) so a malformed path fails fast
+/// instead of locking a node that conflicts with nothing.
+fn check_path(path: &str) -> Result<(), Status> {
+    if path.is_empty() || path.len() > MAX_PATH_LEN {
+        return Err(Status::invalid_argument("path empty or too long"));
+    }
+    let colon = path.find(':').ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "path must be \"<handler>:<normalizedPath>\": {path}"
+        ))
+    })?;
+    let handler = &path[..colon];
+    let p = &path[colon + 1..];
+    if handler.is_empty() || handler.contains('/') {
+        return Err(Status::invalid_argument(format!(
+            "path has an empty or invalid handler: {path}"
+        )));
+    }
+    if !p.starts_with('/') {
+        return Err(Status::invalid_argument(format!(
+            "normalized path must start with '/': {path}"
+        )));
+    }
+    if p == "/" {
+        return Ok(()); // root
+    }
+    if p.ends_with('/') {
+        return Err(Status::invalid_argument(format!(
+            "normalized path must not end with '/': {path}"
+        )));
+    }
+    for seg in p[1..].split('/') {
+        if seg.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "normalized path has an empty segment ('//'): {path}"
+            )));
+        }
+        if seg == "." || seg == ".." {
+            return Err(Status::invalid_argument(format!(
+                "normalized path has a '.'/'..' segment: {path}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn to_mode(i: i32) -> engine::Mode {
     if i == proto::Mode::Read as i32 {
         engine::Mode::Read
@@ -72,6 +172,19 @@ impl PathLock for PathLockService {
         request: Request<AcquireRequest>,
     ) -> Result<Response<AcquireResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
+        check_ttl(req.ttl_ms)?;
+        if req.requests.len() + req.release_requests.len() > MAX_PATHS_PER_REQUEST {
+            return Err(Status::invalid_argument(format!(
+                "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
+            )));
+        }
+        for r in &req.requests {
+            check_path(&r.path)?;
+        }
+        for r in &req.release_requests {
+            check_path(&r.path)?;
+        }
         let requests: Vec<LockReq> = req
             .requests
             .iter()
@@ -99,7 +212,7 @@ impl PathLock for PathLockService {
             release_requests,
         };
 
-        let outcome = engine::acquire(&self.client, args).await.map_err(internal)?;
+        let outcome = engine::acquire(&self.client, args).await.map_err(engine_err)?;
         let resp = match outcome {
             AcquireOutcome::Ok => {
                 // RELEASED is published only when an inline release actually ran and
@@ -137,6 +250,15 @@ impl PathLock for PathLockService {
         request: Request<ReleaseLocksRequest>,
     ) -> Result<Response<ReleaseResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
+        if req.requests.len() > MAX_PATHS_PER_REQUEST {
+            return Err(Status::invalid_argument(format!(
+                "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
+            )));
+        }
+        for r in &req.requests {
+            check_path(&r.path)?;
+        }
         let reqs: Vec<RelReq> = req
             .requests
             .iter()
@@ -147,7 +269,7 @@ impl PathLock for PathLockService {
             .collect();
         engine::release(&self.client, &req.owner_id, &reqs, req.del_wait_key)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         // Release always publishes RELEASED for the owner.
         self.broadcaster.released(&req.owner_id);
         Ok(Response::new(ReleaseResponse {}))
@@ -158,18 +280,21 @@ impl PathLock for PathLockService {
         request: Request<ReleaseAllRequest>,
     ) -> Result<Response<ReleaseResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
         engine::release_all(&self.client, &req.owner_id, req.del_wait_key)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         self.broadcaster.released(&req.owner_id);
         Ok(Response::new(ReleaseResponse {}))
     }
 
     async fn renew(&self, request: Request<RenewRequest>) -> Result<Response<RenewResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
+        check_ttl(req.ttl_ms)?;
         let outcome = engine::renew(&self.client, &req.owner_id, req.ttl_ms)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         let resp = match outcome {
             RenewOutcome::Ok => RenewResponse {
                 status: RenewStatus::Ok as i32,
@@ -189,9 +314,10 @@ impl PathLock for PathLockService {
         request: Request<ForceReleaseRequest>,
     ) -> Result<Response<ForceReleaseResponse>, Status> {
         let req = request.into_inner();
+        check_id("victim_id", &req.victim_id)?;
         engine::force_release(&self.client, &req.victim_id)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         self.broadcaster.killed(&req.victim_id);
         Ok(Response::new(ForceReleaseResponse {}))
     }
@@ -201,9 +327,18 @@ impl PathLock for PathLockService {
         request: Request<AssertFencingRequest>,
     ) -> Result<Response<AssertFencingResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
+        if req.paths.len() > MAX_PATHS_PER_REQUEST {
+            return Err(Status::invalid_argument(format!(
+                "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
+            )));
+        }
+        for p in &req.paths {
+            check_path(p)?;
+        }
         let outcome = engine::assert_fencing(&self.client, &req.owner_id, req.fencing_token, &req.paths)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         let resp = match outcome {
             AssertOutcome::Ok => AssertFencingResponse {
                 status: AssertStatus::Ok as i32,
@@ -223,9 +358,11 @@ impl PathLock for PathLockService {
         request: Request<DetectCycleRequest>,
     ) -> Result<Response<DetectCycleResponse>, Status> {
         let req = request.into_inner();
-        let outcome = engine::detect_cycle(&self.client, &req.start_owner_id, req.max_depth)
+        check_id("start_owner_id", &req.start_owner_id)?;
+        let depth = req.max_depth.min(MAX_CYCLE_DEPTH);
+        let outcome = engine::detect_cycle(&self.client, &req.start_owner_id, depth)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         let resp = match outcome {
             CycleOutcome::None => DetectCycleResponse {
                 kind: CycleKind::None as i32,
@@ -248,9 +385,11 @@ impl PathLock for PathLockService {
         request: Request<IsBlockingRequest>,
     ) -> Result<Response<IsBlockingResponse>, Status> {
         let req = request.into_inner();
+        check_path(&req.conflict_path)?;
+        check_id("conflict_owner", &req.conflict_owner)?;
         let blocking = engine::is_blocking(&self.client, &req.conflict_path, &req.conflict_owner, &req.reason)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         Ok(Response::new(IsBlockingResponse { blocking }))
     }
 
@@ -258,7 +397,7 @@ impl PathLock for PathLockService {
         &self,
         _request: Request<IncrFencingTokenRequest>,
     ) -> Result<Response<IncrFencingTokenResponse>, Status> {
-        let token = engine::incr_fencing_token(&self.client).await.map_err(internal)?;
+        let token = engine::incr_fencing_token(&self.client).await.map_err(engine_err)?;
         Ok(Response::new(IncrFencingTokenResponse { token }))
     }
 
@@ -267,9 +406,12 @@ impl PathLock for PathLockService {
         request: Request<SetWaitEdgeRequest>,
     ) -> Result<Response<SetWaitEdgeResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
+        check_id("conflict_owner", &req.conflict_owner)?;
+        check_ttl(req.ttl_ms)?;
         engine::set_wait_edge(&self.client, &req.owner_id, &req.conflict_owner, req.ttl_ms)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         Ok(Response::new(SetWaitEdgeResponse {}))
     }
 
@@ -278,9 +420,10 @@ impl PathLock for PathLockService {
         request: Request<ClearWaitEdgeRequest>,
     ) -> Result<Response<ClearWaitEdgeResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
         engine::clear_wait_edge(&self.client, &req.owner_id)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         Ok(Response::new(ClearWaitEdgeResponse {}))
     }
 
@@ -289,9 +432,10 @@ impl PathLock for PathLockService {
         request: Request<IsOwnerAliveRequest>,
     ) -> Result<Response<IsOwnerAliveResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
         let alive = engine::is_owner_alive(&self.client, &req.owner_id)
             .await
-            .map_err(internal)?;
+            .map_err(engine_err)?;
         Ok(Response::new(IsOwnerAliveResponse { alive }))
     }
 
@@ -300,6 +444,7 @@ impl PathLock for PathLockService {
         request: Request<RequestRevokeRequest>,
     ) -> Result<Response<RequestRevokeResponse>, Status> {
         let req = request.into_inner();
+        check_id("owner_id", &req.owner_id)?;
         self.broadcaster.revoke(&req.owner_id);
         Ok(Response::new(RequestRevokeResponse {}))
     }
@@ -313,6 +458,7 @@ impl PathLock for PathLockService {
         // A subscription is bound to one owner id and receives only that owner's
         // events — a lock's channel carries only that lock's information.
         let owner = request.into_inner().owner_id;
+        check_id("owner_id", &owner)?;
         let rx = self.broadcaster.subscribe();
         let stream = BroadcastStream::new(rx).filter_map(move |item| {
             let owner = owner.clone();
@@ -502,5 +648,57 @@ impl PathLockDebug for DebugService {
             .await
             .map_err(internal)?;
         Ok(Response::new(OwnedPathsResponse { members, alive }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_invalid(r: Result<(), Status>) -> bool {
+        matches!(r, Err(ref e) if e.code() == tonic::Code::InvalidArgument)
+    }
+
+    #[test]
+    fn check_ttl_rejects_zero_and_huge() {
+        assert!(is_invalid(check_ttl(0))); // 0 = never expires
+        assert!(is_invalid(check_ttl(MAX_TTL_MS + 1)));
+        assert!(check_ttl(1).is_ok());
+        assert!(check_ttl(10_000).is_ok());
+        assert!(check_ttl(MAX_TTL_MS).is_ok());
+    }
+
+    #[test]
+    fn check_id_rejects_empty_and_overlong() {
+        assert!(is_invalid(check_id("owner_id", "")));
+        assert!(is_invalid(check_id("owner_id", &"x".repeat(MAX_ID_LEN + 1))));
+        assert!(check_id("owner_id", "owner-42").is_ok());
+    }
+
+    #[test]
+    fn check_path_accepts_normalized_forms() {
+        assert!(check_path("h:/").is_ok()); // root
+        assert!(check_path("h:/a").is_ok());
+        assert!(check_path("google_drive:/a/b/c").is_ok());
+    }
+
+    #[test]
+    fn check_path_rejects_unsafe_shapes() {
+        assert!(is_invalid(check_path(""))); // empty
+        assert!(is_invalid(check_path("noseparator"))); // no handler ':'
+        assert!(is_invalid(check_path(":/x"))); // empty handler
+        assert!(is_invalid(check_path("h:relative"))); // not rooted
+        assert!(is_invalid(check_path("h:/a/"))); // trailing slash (non-root)
+        assert!(is_invalid(check_path("h:/a//b"))); // empty segment
+        assert!(is_invalid(check_path("h:/a/../b"))); // dot-dot segment
+        assert!(is_invalid(check_path("h:/a/./b"))); // dot segment
+    }
+
+    #[test]
+    fn check_path_distinguishes_trailing_slash() {
+        // The footgun this guards: "h:/a" and "h:/a/" used to be distinct,
+        // non-conflicting lock nodes. Now the latter is rejected outright.
+        assert!(check_path("h:/a").is_ok());
+        assert!(is_invalid(check_path("h:/a/")));
     }
 }

@@ -19,7 +19,7 @@ All lock metadata lives under the `fslock:` prefix. A *path* is
 | `fslock:idx:wrdesc:<anc>` | `Set` of descendant paths | write locks somewhere under `<anc>` |
 | `fslock:idx:rddesc:<anc>` | `Set` of descendant paths | read locks somewhere under `<anc>` |
 | `fslock:fencing:counter` | `Counter` | the monotonic fencing-token source |
-| `pathlockd:__serialize__` | (lock only) | the global serialization key (never read as a value) |
+| `pathlockd:__serialize__:<handler>` | (lock only) | per-handler serialization key (never read as a value) |
 
 The descendant indexes (`idx:wrdesc` / `idx:rddesc`) are what make a write-lock's
 subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
@@ -29,14 +29,25 @@ subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
 
 ```rust
 enum Stored {
-    Str { v: String, exp: u64 },        // wr / fence / alive / wait
-    Set { m: BTreeSet<String>, exp: u64 }, // rd / own / idx:*
-    Counter { v: i64 },                 // fencing:counter (never expires)
+    Str { v: String, exp: u64 },          // wr / fence / alive / wait
+    Set { m: BTreeMap<String, u64> },     // rd / own / idx:*  (member -> exp)
+    Counter { v: i64 },                   // fencing:counter (never expires)
 }
 ```
 
 `exp` is an absolute expiry in epoch-ms; `exp == 0` means "no expiry". Values are
 bincode-encoded.
+
+**Set members expire individually.** A set keeps an expiry *per member*, not one
+for the whole set. This is a correctness requirement: read sets and descendant
+indexes aggregate entries with independent lifetimes, and a single set-wide
+expiry (last-writer-wins) could let a short-lived member shorten the set below a
+longer-lived one — making a still-held lock invisible to a conflict scan and
+allowing two writers into overlapping subtrees. With per-member expiry an entry
+stays visible exactly as long as the lock it mirrors. Adds are also *extend-only*
+(`merge_exp`), so re-adding a member can never shorten it, and rewriting a set
+drops already-expired members to bound growth. (Changing this encoding is why a
+keyspace from an older build must be flushed before upgrading.)
 
 ## Emulated TTL
 
@@ -53,18 +64,24 @@ bincode-encoded.
 Each primitive runs inside `Tx` (`store.rs`), an optimistic TiKV transaction
 created via `txn_retry!`:
 
-- `Tx::begin(client, serialize)` — when `serialize` is true the transaction
-  `put`s `MUTEX_KEY`. Two overlapping serialized transactions both write that key
-  → optimistic write-write conflict at commit → the loser retries with a fresh
-  snapshot. Net effect: multi-key mutations are serial cluster-wide.
+- `Tx::begin(client)` opens the optimistic transaction. A multi-key mutation
+  then calls `tx.serialize_handler(h)` for every handler it touches, `put`ting
+  `serialize_key(h)` (`pathlockd:__serialize__:<handler>`). Two transactions that
+  share a handler both write that key → optimistic write-write conflict at commit
+  → the loser retries with a fresh snapshot. Net effect: mutations are serial
+  *per handler*, parallel across handlers. Containment hazards never cross
+  handlers, so this is sufficient.
 - Reads use the transaction snapshot; the serialization key + retry guarantee a
   retrying transaction reads the latest committed state.
 - `Tx` exposes Redis-flavoured helpers — `get_str/set_str`, `sadd/srem/smembers/
   scard/sismember`, `incr` — each implemented as a value read-modify-write.
 
 `txn_retry!` retries only on transient TiKV errors (write conflict, region
-churn, …), bounded by `MAX_RETRY`. Logical outcomes (OK / CONFLICT / LOST) are
-*values*, never errors, so they commit normally.
+churn, …), bounded by `MAX_RETRY` (with jittered backoff). Logical outcomes
+(OK / CONFLICT / LOST) are *values*, never errors, so they commit normally. The
+`commit_if:` form additionally rolls back instead of committing when the outcome
+performed no durable mutation (e.g. an acquire that returns CONFLICT/LOST from
+read-only validation), so failed attempts neither serialize nor write.
 
 ## Transaction drop safety
 

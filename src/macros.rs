@@ -3,9 +3,12 @@
 ///
 /// Usage:
 /// ```ignore
-/// let outcome = txn_retry!(client, /*serialize=*/true, tx => {
-///     acquire_inner(&mut tx, &args).await
-/// })?;
+/// // Always commit on a logical Ok:
+/// let outcome = txn_retry!(client, tx => { release_inner(&mut tx, owner).await })?;
+///
+/// // Commit only when the outcome actually mutated state; roll back otherwise:
+/// let outcome = txn_retry!(client, commit_if: |o| matches!(o, AcquireOutcome::Ok),
+///     tx => { acquire_inner(&mut tx, &args).await })?;
 /// ```
 ///
 /// The body must evaluate to an `anyhow::Result<T>`; the *logical* outcomes of
@@ -13,30 +16,47 @@
 /// so they are committed normally. Only infrastructure errors trigger rollback
 /// and retry.
 ///
-/// `serialize` makes the transaction write the global serialization key, so any
-/// two overlapping multi-key mutations collide at commit (optimistic
-/// write-write conflict) and one retries with a fresh snapshot — giving
-/// single-threaded atomicity cluster-wide without pessimistic-lock lifecycle
-/// hazards. Single-key ops pass `false`.
+/// Serialization is opt-in *inside* the body: a multi-key mutation calls
+/// `tx.serialize_handler(handler)` for every handler it touches, so two
+/// mutations on the same handler collide at commit (optimistic write-write
+/// conflict) and the loser retries with a fresh snapshot — per-handler
+/// single-threaded atomicity without pessimistic-lock hazards. Single-key and
+/// advisory operations simply never call it.
+///
+/// `commit_if` lets an operation skip the commit (and therefore the
+/// serialization-key write) when the outcome performed no durable mutation —
+/// e.g. an acquire that returns CONFLICT/LOST from its read-only validation
+/// phase. Rolling those back avoids serializing failed attempts; a stale
+/// negative only makes the client retry, which is safe.
 #[macro_export]
 macro_rules! txn_retry {
-    ($client:expr, $serialize:expr, $tx:ident => $body:expr) => {{
+    ($client:expr, commit_if: $pred:expr, $tx:ident => $body:expr) => {{
         let mut __attempt: u32 = 0;
         loop {
-            let mut $tx = $crate::store::Tx::begin($client, $serialize).await?;
+            let mut $tx = $crate::store::Tx::begin($client).await?;
             let __res: ::anyhow::Result<_> = $body;
             match __res {
-                Ok(__v) => match $tx.commit().await {
-                    Ok(()) => break Ok(__v),
-                    Err(__e) => {
-                        if __attempt < $crate::store::MAX_RETRY && $crate::store::is_retryable(&__e) {
-                            __attempt += 1;
-                            $crate::store::backoff(__attempt).await;
-                            continue;
-                        }
-                        break Err(__e);
+                Ok(__v) => {
+                    if !$pred(&__v) {
+                        // No durable mutation in this outcome — roll back so we
+                        // neither serialize nor touch storage.
+                        let _ = $tx.rollback().await;
+                        break Ok(__v);
                     }
-                },
+                    match $tx.commit().await {
+                        Ok(()) => break Ok(__v),
+                        Err(__e) => {
+                            if __attempt < $crate::store::MAX_RETRY
+                                && $crate::store::is_retryable(&__e)
+                            {
+                                __attempt += 1;
+                                $crate::store::backoff(__attempt).await;
+                                continue;
+                            }
+                            break Err(__e);
+                        }
+                    }
+                }
                 Err(__e) => {
                     let _ = $tx.rollback().await;
                     if __attempt < $crate::store::MAX_RETRY && $crate::store::is_retryable(&__e) {
@@ -48,5 +68,8 @@ macro_rules! txn_retry {
                 }
             }
         }
+    }};
+    ($client:expr, $tx:ident => $body:expr) => {{
+        $crate::txn_retry!($client, commit_if: |_| true, $tx => $body)
     }};
 }

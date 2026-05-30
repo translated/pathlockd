@@ -11,7 +11,7 @@ use tikv_client::TransactionClient;
 use tracing::warn;
 
 use crate::store::{
-    alive_key, fence_key, own_key, rd_key, rddesc_key, wait_key, wr_key, wrdesc_key, Tx,
+    alive_key, fence_key, handler_of, own_key, rd_key, rddesc_key, wait_key, wr_key, wrdesc_key, Tx,
     FENCE_MIN_TTL_MS, FENCING_COUNTER_KEY,
 };
 
@@ -255,7 +255,13 @@ pub async fn acquire(
     client: &TransactionClient,
     args: AcquireArgs,
 ) -> anyhow::Result<AcquireOutcome> {
-    txn_retry!(client, true, tx => { acquire_inner(&mut tx, &args).await })
+    // Commit only a successful acquire. A CONFLICT/LOST outcome performed no
+    // durable mutation worth keeping (only snapshot reads + opportunistic
+    // pruning), so rolling it back avoids serializing failed attempts and
+    // discards any buffered writes from the defensive execution-phase guard.
+    txn_retry!(client, commit_if: |o: &AcquireOutcome| matches!(o, AcquireOutcome::Ok), tx => {
+        acquire_inner(&mut tx, &args).await
+    })
 }
 
 async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<AcquireOutcome> {
@@ -265,6 +271,23 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
     let token = args.fencing_token;
     let alive_k = alive_key(owner);
     let own_k = own_key(owner);
+
+    // A no-op call (nothing to acquire or release) must not stamp an orphan
+    // alive key with no owned paths; just succeed.
+    if args.requests.is_empty() && args.release_requests.is_empty() {
+        return Ok(AcquireOutcome::Ok);
+    }
+
+    // Join the serialization domain of every handler this call touches, so a
+    // concurrent mutation sharing a handler conflicts at commit. Containment
+    // hazards never cross handlers, so per-handler scope is sufficient. These
+    // writes are discarded by the rollback if the outcome is CONFLICT/LOST.
+    for r in &args.requests {
+        tx.serialize_handler(handler_of(&r.path)).await?;
+    }
+    for r in &args.release_requests {
+        tx.serialize_handler(handler_of(&r.path)).await?;
+    }
 
     let has_held = args.requests.iter().any(|r| r.state == State::Held);
     if has_held && !tx.exists_str(&alive_k).await? {
@@ -373,9 +396,15 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                         let current = tx.get_str(&wr_k).await?.unwrap_or_default();
                         if current == *owner {
                             tx.pexpire_str(&wr_k, ttl).await?;
-                            tx.pexpire_str(&fence_k, fence_ttl).await?;
+                            // Advance the fence to the (validated >= current)
+                            // token, matching the Held re-validation path.
+                            tx.set_str(&fence_k, &token.to_string(), fence_ttl).await?;
                             add_descendant_indexes(tx, Mode::Write, path, ttl).await?;
                         } else {
+                            // Unreachable: validation already proved this path is
+                            // absent or owned by us. Defensive only — and harmless,
+                            // since commit_if rolls back any buffered writes on a
+                            // non-Ok outcome rather than committing partial state.
                             return Ok(conflict(path, &current, "write_locked"));
                         }
                     }
@@ -431,7 +460,7 @@ pub async fn release(
     reqs: &[RelReq],
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => { release_inner(&mut tx, owner, reqs, del_wait_key).await })
+    txn_retry!(client, tx => { release_inner(&mut tx, owner, reqs, del_wait_key).await })
 }
 
 async fn release_inner(
@@ -442,6 +471,10 @@ async fn release_inner(
 ) -> anyhow::Result<()> {
     let own_k = own_key(owner);
     let alive_k = alive_key(owner);
+
+    for req in reqs {
+        tx.serialize_handler(handler_of(&req.path)).await?;
+    }
 
     for req in reqs {
         let path = &req.path;
@@ -485,7 +518,7 @@ pub async fn release_all(
     owner: &str,
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => { release_all_inner(&mut tx, owner, del_wait_key).await })
+    txn_retry!(client, tx => { release_all_inner(&mut tx, owner, del_wait_key).await })
 }
 
 async fn release_all_inner(
@@ -496,6 +529,12 @@ async fn release_all_inner(
     let own_k = own_key(owner);
     let alive_k = alive_key(owner);
     let held = tx.smembers(&own_k).await?;
+
+    for item in &held {
+        if let Some(sep) = item.find(':') {
+            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
+        }
+    }
 
     for item in held {
         match item.find(':') {
@@ -540,7 +579,7 @@ pub async fn renew(
     owner: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<RenewOutcome> {
-    txn_retry!(client, true, tx => { renew_inner(&mut tx, owner, ttl_ms).await })
+    txn_retry!(client, tx => { renew_inner(&mut tx, owner, ttl_ms).await })
 }
 
 async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<RenewOutcome> {
@@ -559,6 +598,13 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
     tx.pexpire_set(&own_k, ttl_ms).await?;
 
     let held = tx.smembers(&own_k).await?;
+
+    for item in &held {
+        if let Some(sep) = item.find(':') {
+            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
+        }
+    }
+
     let mut renewed = 0usize;
 
     for item in held {
@@ -589,7 +635,9 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
                         remove_descendant_indexes(tx, Mode::Read, &path).await?;
                     }
                     if owners.iter().any(|o| o == owner) {
-                        tx.pexpire_set(&rd, ttl_ms).await?;
+                        // Extend only this owner's membership (per-member expiry),
+                        // never the whole set — other readers keep their own leases.
+                        tx.sadd(&rd, owner, ttl_ms).await?;
                         add_descendant_indexes(tx, Mode::Read, &path, ttl_ms).await?;
                         renewed += 1;
                     } else {
@@ -613,12 +661,18 @@ async fn renew_inner(tx: &mut Tx, owner: &str, ttl_ms: u64) -> anyhow::Result<Re
 // ---------------------------------------------------------------------------
 
 pub async fn force_release(client: &TransactionClient, victim: &str) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => { force_release_inner(&mut tx, victim).await })
+    txn_retry!(client, tx => { force_release_inner(&mut tx, victim).await })
 }
 
 async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
     let own_k = own_key(victim);
     let held = tx.smembers(&own_k).await?;
+
+    for item in &held {
+        if let Some(sep) = item.find(':') {
+            tx.serialize_handler(handler_of(&item[sep + 1..])).await?;
+        }
+    }
 
     for item in held {
         match item.find(':') {
@@ -662,7 +716,7 @@ pub async fn assert_fencing(
     fencing_token: i64,
     paths: &[String],
 ) -> anyhow::Result<AssertOutcome> {
-    txn_retry!(client, false, tx => { assert_fencing_inner(&mut tx, owner, fencing_token, paths).await })
+    txn_retry!(client, tx => { assert_fencing_inner(&mut tx, owner, fencing_token, paths).await })
 }
 
 async fn assert_fencing_inner(
@@ -698,7 +752,10 @@ pub async fn detect_cycle(
     start: &str,
     max_depth: u32,
 ) -> anyhow::Result<CycleOutcome> {
-    txn_retry!(client, true, tx => { detect_cycle_inner(&mut tx, start, max_depth).await })
+    // Advisory walk: no serialization key. It only reads wait/alive edges and
+    // opportunistically GCs orphaned ones; a stale read at worst re-walks next
+    // round. Its own wait-key deletes still conflict per-key with set_wait_edge.
+    txn_retry!(client, tx => { detect_cycle_inner(&mut tx, start, max_depth).await })
 }
 
 async fn detect_cycle_inner(
@@ -748,7 +805,9 @@ pub async fn is_blocking(
     conflict_owner: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    txn_retry!(client, true, tx => { is_blocking_inner(&mut tx, conflict_path, conflict_owner, reason).await })
+    // Advisory check: no serialization key. A stale "blocking" just makes the
+    // caller wait/recheck; its dead-reader pruning conflicts per-key directly.
+    txn_retry!(client, tx => { is_blocking_inner(&mut tx, conflict_path, conflict_owner, reason).await })
 }
 
 async fn is_blocking_inner(
@@ -785,7 +844,7 @@ async fn is_blocking_inner(
 
 /// `INCR fslock:fencing:counter` — single key, no global mutex needed.
 pub async fn incr_fencing_token(client: &TransactionClient) -> anyhow::Result<i64> {
-    txn_retry!(client, false, tx => { tx.incr(FENCING_COUNTER_KEY).await })
+    txn_retry!(client, tx => { tx.incr(FENCING_COUNTER_KEY).await })
 }
 
 /// `SET fslock:wait:<owner> <conflict> PX ttl`.
@@ -795,17 +854,17 @@ pub async fn set_wait_edge(
     conflict_owner: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, false, tx => { tx.set_str(&wait_key(owner), conflict_owner, ttl_ms).await })
+    txn_retry!(client, tx => { tx.set_str(&wait_key(owner), conflict_owner, ttl_ms).await })
 }
 
 /// `DEL fslock:wait:<owner>`.
 pub async fn clear_wait_edge(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
-    txn_retry!(client, false, tx => { tx.del(&wait_key(owner)).await })
+    txn_retry!(client, tx => { tx.del(&wait_key(owner)).await })
 }
 
 /// `EXISTS fslock:alive:<owner>`.
 pub async fn is_owner_alive(client: &TransactionClient, owner: &str) -> anyhow::Result<bool> {
-    txn_retry!(client, false, tx => { tx.exists_str(&alive_key(owner)).await })
+    txn_retry!(client, tx => { tx.exists_str(&alive_key(owner)).await })
 }
 
 // ---------------------------------------------------------------------------
@@ -816,7 +875,7 @@ pub async fn is_owner_alive(client: &TransactionClient, owner: &str) -> anyhow::
 
 /// Simulate a dead owner (drop its alive + owner-set keys).
 pub async fn debug_expire_owner(client: &TransactionClient, owner: &str) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => {
+    txn_retry!(client, tx => {
         async {
             tx.del(&alive_key(owner)).await?;
             tx.del(&own_key(owner)).await?;
@@ -832,7 +891,7 @@ pub async fn debug_delete_lock_key(
     mode: Mode,
     owner: Option<String>,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => {
+    txn_retry!(client, tx => {
         async {
             match mode {
                 Mode::Write => tx.del(&wr_key(path)).await?,
@@ -852,14 +911,14 @@ pub async fn debug_set_write_owner(
     path: &str,
     owner: &str,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => { tx.set_str(&wr_key(path), owner, 0).await })
+    txn_retry!(client, tx => { tx.set_str(&wr_key(path), owner, 0).await })
 }
 
 pub async fn debug_get_write_owner(
     client: &TransactionClient,
     path: &str,
 ) -> anyhow::Result<Option<String>> {
-    txn_retry!(client, false, tx => { tx.get_str(&wr_key(path)).await })
+    txn_retry!(client, tx => { tx.get_str(&wr_key(path)).await })
 }
 
 /// Plant a fence value on a path.
@@ -868,25 +927,25 @@ pub async fn debug_set_fence(
     path: &str,
     value: i64,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, true, tx => { tx.set_str(&fence_key(path), &value.to_string(), 0).await })
+    txn_retry!(client, tx => { tx.set_str(&fence_key(path), &value.to_string(), 0).await })
 }
 
 pub async fn debug_get_fence(
     client: &TransactionClient,
     path: &str,
 ) -> anyhow::Result<Option<i64>> {
-    txn_retry!(client, false, tx => { Ok(parse_fence(tx.get_str(&fence_key(path)).await?)) })
+    txn_retry!(client, tx => { Ok(parse_fence(tx.get_str(&fence_key(path)).await?)) })
 }
 
 pub async fn debug_set_fencing_counter(
     client: &TransactionClient,
     value: i64,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, false, tx => { tx.set_counter(FENCING_COUNTER_KEY, value).await })
+    txn_retry!(client, tx => { tx.set_counter(FENCING_COUNTER_KEY, value).await })
 }
 
 pub async fn debug_get_fencing_counter(client: &TransactionClient) -> anyhow::Result<i64> {
-    txn_retry!(client, false, tx => { tx.get_counter(FENCING_COUNTER_KEY).await })
+    txn_retry!(client, tx => { tx.get_counter(FENCING_COUNTER_KEY).await })
 }
 
 /// Owner-set membership plus liveness (read-only inspection).
@@ -894,7 +953,7 @@ pub async fn debug_owned_paths(
     client: &TransactionClient,
     owner: &str,
 ) -> anyhow::Result<(Vec<String>, bool)> {
-    txn_retry!(client, false, tx => {
+    txn_retry!(client, tx => {
         async {
             let members = tx.smembers(&own_key(owner)).await?;
             let alive = tx.exists_str(&alive_key(owner)).await?;
@@ -930,5 +989,45 @@ fn renew_lost(path: &str, reason: &str) -> RenewOutcome {
     RenewOutcome::Lost {
         path: path.to_string(),
         reason: reason.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_ancestors_walks_up_to_root() {
+        assert_eq!(
+            get_ancestors("h:/a/b/c"),
+            vec!["h:/a/b".to_string(), "h:/a".to_string(), "h:/".to_string()]
+        );
+        assert_eq!(get_ancestors("h:/a/b"), vec!["h:/a".to_string(), "h:/".to_string()]);
+        assert_eq!(get_ancestors("h:/a"), vec!["h:/".to_string()]);
+    }
+
+    #[test]
+    fn get_ancestors_root_and_degenerate() {
+        assert!(get_ancestors("h:/").is_empty()); // root has no ancestors
+        assert!(get_ancestors("h:").is_empty()); // empty path
+        assert!(get_ancestors("nocolon").is_empty()); // no handler separator
+    }
+
+    #[test]
+    fn get_ancestors_share_handler_prefix() {
+        // Every ancestor lives under the same handler — the property that makes
+        // per-handler serialization sound for containment hazards.
+        for anc in get_ancestors("google_drive:/x/y/z") {
+            assert!(anc.starts_with("google_drive:"));
+        }
+    }
+
+    #[test]
+    fn parse_fence_only_accepts_integers() {
+        assert_eq!(parse_fence(Some("5".into())), Some(5));
+        assert_eq!(parse_fence(Some("-3".into())), Some(-3));
+        assert_eq!(parse_fence(Some("abc".into())), None);
+        assert_eq!(parse_fence(Some(String::new())), None);
+        assert_eq!(parse_fence(None), None);
     }
 }

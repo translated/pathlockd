@@ -42,6 +42,8 @@ transactions, not from process memory.
   `read_locked` → `descendant_write_locked` → `descendant_read_locked` →
   `stale_fencing_token`.
 - Fencing tokens are monotonic and never decrease for a path.
-- Every lock is a lease; nothing is held forever without renewal.
+- Every lock is a lease; nothing is held forever without renewal (`ttl_ms` must
+  be `> 0`, so a lock can never be created non-expiring).
 - A subscription only ever sees its own owner's events.
-- Multi-key mutations are atomic and serialized cluster-wide.
+- Multi-key mutations are atomic and serialized **per handler** (parallel across
+  handlers; containment hazards never cross a handler).

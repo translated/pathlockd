@@ -3,18 +3,26 @@ use std::time::Duration;
 
 use tikv_client::TransactionClient;
 use tonic::transport::Server;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use pathlockd::config::Config;
 use pathlockd::events::Broadcaster;
+use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::path_lock_debug_server::PathLockDebugServer;
 use pathlockd::proto::path_lock_server::PathLockServer;
+use pathlockd::proto::HealthRequest;
 use pathlockd::service::{DebugService, PathLockService};
 use pathlockd::store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cfg = Config::load()?;
+    let (cfg, health_check) = Config::load()?;
+
+    // One-shot health probe (container HEALTHCHECK): dial the local instance,
+    // call Health, exit 0/1. Kept quiet — no tracing, no server startup.
+    if health_check {
+        return health_probe(&cfg.listen).await;
+    }
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cfg.log_level.clone()));
@@ -59,17 +67,39 @@ async fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("invalid listen address {}: {e}", cfg.listen))?;
 
     let path_lock = PathLockService::new(client.clone(), broadcaster.clone());
-    let debug = DebugService::new(client.clone(), cfg.enable_debug);
+
+    // Only mount the debug service when explicitly enabled, so its
+    // fault-injection surface does not exist at all in production.
+    let mut router = Server::builder().add_service(PathLockServer::new(path_lock));
+    if cfg.enable_debug {
+        warn!("PathLockDebug service ENABLED (fault injection) — never do this in production");
+        let debug = DebugService::new(client.clone(), true);
+        router = router.add_service(PathLockDebugServer::new(debug));
+    }
 
     info!(%addr, "pathlockd listening");
-    Server::builder()
-        .add_service(PathLockServer::new(path_lock))
-        .add_service(PathLockDebugServer::new(debug))
-        .serve_with_shutdown(addr, shutdown_signal())
-        .await?;
+    router.serve_with_shutdown(addr, shutdown_signal()).await?;
 
     info!("pathlockd stopped");
     Ok(())
+}
+
+/// Connect to a locally-running instance and call the `Health` RPC. Returns
+/// `Ok` only when the server reports ready; any failure is an error so the
+/// process exits non-zero. The listen address's bind host (`0.0.0.0` / `[::]`)
+/// is mapped to loopback for dialing.
+async fn health_probe(listen: &str) -> anyhow::Result<()> {
+    let port = listen.rsplit(':').next().unwrap_or("50051");
+    let url = format!("http://127.0.0.1:{port}");
+    let mut client = PathLockClient::connect(url.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("health probe could not connect to {url}: {e}"))?;
+    let resp = client.health(HealthRequest {}).await?.into_inner();
+    if resp.ok {
+        Ok(())
+    } else {
+        anyhow::bail!("not ready: {}", resp.detail)
+    }
 }
 
 async fn shutdown_signal() {

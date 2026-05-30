@@ -30,13 +30,23 @@ clients ──gRPC──▶ pathlockd (N stateless replicas) ──▶ TiKV clus
 
 - Each Lua-style primitive is one TiKV transaction → atomic.
 - Multi-key mutations (`acquire`, `release`, `release_all`, `renew`,
-  `force_release`, `detect_cycle`, `is_blocking`) write `MUTEX_KEY`
-  (`pathlockd:__serialize__`). Under optimistic concurrency, any two that
-  overlap in time conflict on that key and one retries with a fresh snapshot —
-  so they are effectively serialized cluster-wide. This is the same guarantee a
-  single-threaded executor would give, without a single-process bottleneck.
+  `force_release`) call `tx.serialize_handler(h)` for every handler `h` they
+  touch, which `put`s `serialize_key(h)` (`pathlockd:__serialize__:<handler>`).
+  Under optimistic concurrency, any two that share a handler conflict on that
+  key and one retries with a fresh snapshot — so mutations are serialized **per
+  handler**. Containment hazards (ancestor/descendant/point conflicts) always
+  live inside a single handler, so per-handler scope is sufficient for
+  correctness, and mutations on disjoint handlers run in parallel (no single
+  global bottleneck). Throughput within one handler is still bounded by that
+  key's region/Raft leader.
+- `acquire` commits only a successful (OK) outcome; a CONFLICT/LOST result is
+  derived from read-only validation, so it rolls back — failed attempts neither
+  serialize nor write.
+- The deadlock/contention walks (`detect_cycle`, `is_blocking`) are advisory and
+  take **no** serialization key: they read a snapshot and at worst make the
+  client re-walk/recheck; their own edge/prune writes still conflict per key.
 - Single-key operations (`IncrFencingToken`, `SetWaitEdge`, `ClearWaitEdge`) and
-  read-only checks (`AssertFencing`, `IsOwnerAlive`) skip the serialization key;
+  read-only checks (`AssertFencing`, `IsOwnerAlive`) skip serialization too;
   TiKV already orders per-key access.
 
 ## Liveness without a heartbeat thread on the server

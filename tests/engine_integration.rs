@@ -89,11 +89,21 @@ fn rel_w(path: &str) -> RelReq {
 }
 
 async fn acq(c: &TransactionClient, owner: &str, requests: Vec<LockReq>, token: i64) -> AcquireOutcome {
+    acq_ttl(c, owner, TTL, requests, token).await
+}
+
+async fn acq_ttl(
+    c: &TransactionClient,
+    owner: &str,
+    ttl_ms: u64,
+    requests: Vec<LockReq>,
+    token: i64,
+) -> AcquireOutcome {
     engine::acquire(
         c,
         AcquireArgs {
             owner_id: owner.to_string(),
-            ttl_ms: TTL,
+            ttl_ms,
             requests,
             fencing_token: token,
             release_requests: vec![],
@@ -318,6 +328,98 @@ fn inline_release_shadow_transition() {
         assert_eq!(engine::debug_get_write_owner(c, &rp("/s")).await.unwrap().as_deref(), Some("o"));
         assert_eq!(engine::debug_get_write_owner(c, &rp("/s/a")).await.unwrap(), None);
         assert_eq!(engine::debug_get_write_owner(c, &rp("/s/b")).await.unwrap(), None);
+    });
+}
+
+// Regression: a short-lived sibling must not shorten an ancestor's descendant
+// index below a longer-lived member, which would make the live member invisible
+// to a conflict scan and let two writers hold overlapping subtrees. Per-member
+// expiry (store.rs) is what fixes this; against a single set-wide expiry this
+// test fails (the ancestor write wrongly succeeds).
+#[test]
+fn descendant_index_survives_short_lived_sibling() {
+    run(async {
+        let c = fresh().await;
+        // Long-lived write deep in the subtree.
+        assert_eq!(
+            acq_ttl(c, "B", 60_000, vec![w("/X/b", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        // Short-lived sibling under the same ancestor /X.
+        assert_eq!(
+            acq_ttl(c, "A", 1_000, vec![w("/X/a", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        // Let the short sibling's lease lapse.
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        // A write on the ancestor must still see B's live descendant write.
+        match acq(c, "W", vec![w("/X", State::New)], 3).await {
+            AcquireOutcome::Conflict { reason, .. } => assert_eq!(reason, "descendant_write_locked"),
+            o => panic!("expected descendant_write_locked (B still holds /X/b), got {o:?}"),
+        }
+    });
+}
+
+// Regression: the read set must outlive its longest-lived reader, not its most
+// recently added one. A short-lived reader lapsing must not erase a long-lived
+// reader and let a writer through (an R/W violation).
+#[test]
+fn read_set_survives_short_lived_reader() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq_ttl(c, "R1", 60_000, vec![r("/y", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            acq_ttl(c, "R2", 1_000, vec![r("/y", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        // R1 is still alive, so a writer on /y must conflict.
+        match acq(c, "W", vec![w("/y", State::New)], 3).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "read_locked");
+                assert_eq!(owner, "R1");
+            }
+            o => panic!("expected read_locked (R1 still holds a read), got {o:?}"),
+        }
+    });
+}
+
+// Disjoint handlers must not serialize against each other: acquiring in handler
+// `alpha` and handler `beta` both succeed and coexist (per-handler serialization
+// keys, not one global key).
+#[test]
+fn distinct_handlers_do_not_conflict() {
+    run(async {
+        let c = fresh().await;
+        let a = engine::acquire(
+            c,
+            AcquireArgs {
+                owner_id: "oa".into(),
+                ttl_ms: TTL,
+                requests: vec![LockReq { path: "alpha:/p".into(), mode: Mode::Write, state: State::New }],
+                fencing_token: 1,
+                release_requests: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(a, AcquireOutcome::Ok);
+        let b = engine::acquire(
+            c,
+            AcquireArgs {
+                owner_id: "ob".into(),
+                ttl_ms: TTL,
+                requests: vec![LockReq { path: "beta:/p".into(), mode: Mode::Write, state: State::New }],
+                fencing_token: 1,
+                release_requests: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(b, AcquireOutcome::Ok);
     });
 }
 

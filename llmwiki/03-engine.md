@@ -1,7 +1,10 @@
 # The engine (`src/engine.rs`)
 
 Each public function is one atomic primitive. They take a `&TransactionClient`
-and run inside `txn_retry!`. Logical outcomes are returned as values.
+and run inside `txn_retry!`. Logical outcomes are returned as values. Multi-key
+mutations call `tx.serialize_handler(h)` for each handler they touch (per-handler
+serialization); `acquire` uses the `commit_if:` form so a CONFLICT/LOST outcome
+rolls back rather than committing or serializing.
 
 ## Path helpers
 
@@ -28,7 +31,10 @@ inline `release_requests`.
      (`stale_fencing_token`). Reads are point-only — they do **not** scan
      descendants.
 3. **Execution.** Refresh `alive`; for each request add to `own:<owner>` and
-   write `wr`/`rd` + fence + descendant indexes (refreshing TTLs on re-acquire).
+   write `wr`/`rd` + fence + descendant indexes. Re-acquiring an owned path
+   refreshes its TTL and advances the fence to the (validated ≥) token. A call
+   with no requests and no releases is a no-op (it does not stamp an orphan
+   `alive`).
 4. **Inline release.** Any `release_requests` are applied in the same
    transaction (used for shadowing transitions: acquire the covering ancestor
    and drop now-redundant child keys atomically).
