@@ -19,7 +19,7 @@ ENV RUSTFLAGS=${RUSTFLAGS}
 RUN cargo build --release --locked
 
 # ---- runtime ----
-FROM gcr.io/distroless/base-debian13 AS runtime
+FROM gcr.io/distroless/cc-debian13 AS runtime
 
 COPY --from=builder /build/target/release/pathlockd /usr/local/bin/pathlockd
 
