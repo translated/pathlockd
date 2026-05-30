@@ -419,6 +419,34 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
 
     tx.pexpire_set(&own_k, ttl).await?;
 
+    // 2b. REFRESH THE REST OF THE LEASE.
+    let requested: std::collections::HashSet<String> = args
+        .requests
+        .iter()
+        .map(|r| format!("{}:{}", r.mode.as_str(), &r.path))
+        .collect();
+    for member in tx.smembers(&own_k).await? {
+        if requested.contains(&member) {
+            continue; // already refreshed above, with full New/Held handling
+        }
+        let Some(sep) = member.find(':') else { continue };
+        let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
+        if mode == "write" {
+            let wr_k = wr_key(&path);
+            if tx.get_str(&wr_k).await?.as_deref() == Some(owner.as_str()) {
+                tx.pexpire_str(&wr_k, ttl).await?;
+                tx.pexpire_str(&fence_key(&path), fence_ttl).await?;
+                add_descendant_indexes(tx, Mode::Write, &path, ttl).await?;
+            }
+        } else if mode == "read" {
+            let rd = rd_key(&path);
+            if tx.sismember(&rd, owner).await? {
+                tx.sadd(&rd, owner, ttl).await?;
+                add_descendant_indexes(tx, Mode::Read, &path, ttl).await?;
+            }
+        }
+    }
+
     // 3. INLINE RELEASE PHASE (shadowing transitions, atomic with the acquire)
     if !args.release_requests.is_empty() {
         for req in &args.release_requests {

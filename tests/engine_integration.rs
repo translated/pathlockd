@@ -543,6 +543,40 @@ fn read_set_survives_short_lived_reader() {
     });
 }
 
+// Regression: an Acquire pushes the owner's liveness and whole own-set out to
+// now+ttl, so every *still-held* path — including ones not re-listed in this
+// request — must have its lock key refreshed to the same horizon. Otherwise an
+// un-listed lock keeps its older expiry and lapses while the lease still claims
+// it, letting another owner take it with no LOST surfaced. Here O holds /old on a
+// short lease, then acquires an unrelated /new on a long lease without re-listing
+// /old; /old must outlive its original lease and stay O's.
+#[test]
+fn acquire_refreshes_unlisted_held_lease() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq_ttl(c, "O", 1_500, vec![w("/old", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        // Acquire an unrelated path on a long lease, WITHOUT re-listing /old.
+        assert_eq!(
+            acq_ttl(c, "O", 20_000, vec![w("/new", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        // ≈1.9s elapsed — past /old's original 1.5s lease. It must still be O's,
+        // because the second acquire refreshed it along with the rest of the lease.
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        match acq(c, "X", vec![w("/old", State::New)], 3).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "write_locked");
+                assert_eq!(owner, "O");
+            }
+            o => panic!("expected write_locked (the later acquire refreshed /old), got {o:?}"),
+        }
+    });
+}
+
 // Disjoint handlers must not serialize against each other: acquiring in handler
 // `alpha` and handler `beta` both succeed and coexist (per-handler serialization
 // keys, not one global key).

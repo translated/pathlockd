@@ -140,6 +140,29 @@ fn check_path(path: &str) -> Result<(), Status> {
     Ok(())
 }
 
+/// The conflict reasons `IsBlocking` knows how to re-check — the lock-held
+/// reasons a waiter blocks on. `is_blocking_inner` reads the two `*read_locked`
+/// reasons as a read re-check and the rest as a write re-check, so an
+/// unrecognized value would silently fall through to the write path; reject it.
+const BLOCKING_REASONS: [&str; 5] = [
+    "ancestor_locked",
+    "write_locked",
+    "read_locked",
+    "descendant_write_locked",
+    "descendant_read_locked",
+];
+
+#[allow(clippy::result_large_err)]
+fn check_blocking_reason(reason: &str) -> Result<(), Status> {
+    if BLOCKING_REASONS.contains(&reason) {
+        Ok(())
+    } else {
+        Err(Status::invalid_argument(format!(
+            "unknown is_blocking reason {reason:?} (expected one of {BLOCKING_REASONS:?})"
+        )))
+    }
+}
+
 fn to_mode(i: i32) -> engine::Mode {
     if i == proto::Mode::Read as i32 {
         engine::Mode::Read
@@ -404,6 +427,7 @@ impl PathLock for PathLockService {
         let req = request.into_inner();
         check_path(&req.conflict_path)?;
         check_id("conflict_owner", &req.conflict_owner)?;
+        check_blocking_reason(&req.reason)?;
         let blocking = engine::is_blocking(
             &self.client,
             &req.conflict_path,
@@ -730,5 +754,16 @@ mod tests {
         // non-conflicting lock nodes. Now the latter is rejected outright.
         assert!(check_path("h:/a").is_ok());
         assert!(is_invalid(check_path("h:/a/")));
+    }
+
+    #[test]
+    fn check_blocking_reason_accepts_known_rejects_unknown() {
+        for r in BLOCKING_REASONS {
+            assert!(check_blocking_reason(r).is_ok(), "{r} should be accepted");
+        }
+        // A real conflict reason that is not a "blocked on a held lock" condition.
+        assert!(is_invalid(check_blocking_reason("stale_fencing_token")));
+        assert!(is_invalid(check_blocking_reason("")));
+        assert!(is_invalid(check_blocking_reason("garbage")));
     }
 }

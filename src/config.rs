@@ -158,6 +158,12 @@ impl Config {
         if cfg.pd_endpoints.is_empty() {
             anyhow::bail!("pd_endpoints must not be empty");
         }
+        // A 0 page would make every GC scan return nothing and silently disable
+        // active reclamation. Disabling it is a job for gc_interval_secs = 0
+        // (which keeps lazy expiry); fail fast on the footgun instead.
+        if cfg.gc_interval_secs > 0 && cfg.gc_page == 0 {
+            anyhow::bail!("gc_page must be > 0 when gc is enabled (gc_interval_secs > 0)");
+        }
         Ok(cfg)
     }
 }

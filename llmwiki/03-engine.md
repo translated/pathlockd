@@ -32,9 +32,12 @@ inline `release_requests`.
      descendants.
 3. **Execution.** Refresh `alive`; for each request add to `own:<owner>` and
    write `wr`/`rd` + fence + descendant indexes. Re-acquiring an owned path
-   refreshes its TTL and advances the fence to the (validated ≥) token. A call
-   with no requests and no releases is a no-op (it does not stamp an orphan
-   `alive`).
+   refreshes its TTL and advances the fence to the (validated ≥) token. Since the
+   call advances `alive` and the whole `own` set to `now+ttl`, it then refreshes
+   every *other* still-held path to the same horizon too, so the single owner
+   lease never outlives the keys backing it (a vanished key is left for `renew` to
+   report `LOST`). A call with no requests and no releases is a no-op (it does not
+   stamp an orphan `alive`).
 4. **Inline release.** Any `release_requests` are applied in the same
    transaction (used for shadowing transitions: acquire the covering ancestor
    and drop now-redundant child keys atomically).

@@ -463,7 +463,7 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     let now = now_ms();
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec(); // ':' + 1, exclusive upper bound of the prefix
-    let mut candidates: Vec<Vec<u8>> = Vec::new();
+    let mut deleted: u64 = 0;
 
     loop {
         let mut scan_txn = begin_warn(client).await?;
@@ -477,6 +477,9 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         }
         let got = pairs.len();
         let mut last_key: Vec<u8> = Vec::new();
+        // Hold only the *current page's* expired keys, not the whole keyspace's:
+        // the sweep stays O(page) in memory no matter how many keys have lapsed.
+        let mut candidates: Vec<Vec<u8>> = Vec::new();
         for p in &pairs {
             let kb: Vec<u8> = p.key().clone().into();
             last_key = kb.clone();
@@ -486,40 +489,39 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
                 }
             }
         }
+
+        // Delete this page's expired keys under a fresh re-check so a key a
+        // concurrent refresh re-wrote is never reclaimed. Best-effort: if our
+        // delete loses the write-write race the chunk is retried next sweep, and
+        // lazy expiry keeps correctness regardless.
+        for chunk in candidates.chunks(256) {
+            let recheck = now_ms();
+            let mut txn = begin_warn(client).await?;
+            let mut chunk_deleted: u64 = 0;
+            for kb in chunk {
+                if let Some(v) = txn.get(kb.clone()).await? {
+                    if let Ok(s) = decode(&v) {
+                        if expired(s.exp(), recheck) {
+                            txn.delete(kb.clone()).await?;
+                            chunk_deleted += 1;
+                        }
+                    }
+                }
+            }
+            if txn.commit().await.is_ok() {
+                deleted += chunk_deleted;
+            }
+        }
+
         if got < page as usize {
             break;
         }
-        // Advance the cursor past the last key seen (exclusive lower bound).
+        // Advance the cursor past the last key seen (exclusive lower bound). The
+        // keys just deleted sit behind it, so the next page never re-scans them.
         cursor = last_key;
         cursor.push(0);
     }
 
-    if candidates.is_empty() {
-        return Ok(0);
-    }
-
-    let mut deleted: u64 = 0;
-    for chunk in candidates.chunks(256) {
-        let recheck = now_ms();
-        let mut txn = begin_warn(client).await?;
-        let mut chunk_deleted: u64 = 0;
-        for kb in chunk {
-            if let Some(v) = txn.get(kb.clone()).await? {
-                if let Ok(s) = decode(&v) {
-                    if expired(s.exp(), recheck) {
-                        txn.delete(kb.clone()).await?;
-                        chunk_deleted += 1;
-                    }
-                }
-            }
-        }
-        // Best-effort: if a concurrent refresh re-wrote one of these keys, our
-        // delete loses the write-write race and the whole chunk is retried next
-        // sweep. Lazy expiry keeps correctness regardless.
-        if txn.commit().await.is_ok() {
-            deleted += chunk_deleted;
-        }
-    }
     Ok(deleted)
 }
 
