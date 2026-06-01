@@ -893,6 +893,34 @@ mod tests {
     }
 
     #[test]
+    fn txn_not_found_key_error_is_retryable() {
+        use tikv_client::{Error, ProtoKeyError};
+
+        // A KeyError whose only populated field is `txn_not_found` — exactly how
+        // TiKV surfaced the GC-sweep / lock-resolve failure that used to be
+        // misclassified as a fatal INTERNAL instead of a retryable condition.
+        let key_err = || {
+            Error::KeyError(Box::new(ProtoKeyError {
+                txn_not_found: Some(Default::default()),
+                ..Default::default()
+            }))
+        };
+
+        assert!(tikv_error_retryable(&key_err()));
+        // TiKV wraps it in MultipleKeyErrors on commit / lock-resolve.
+        assert!(tikv_error_retryable(&Error::MultipleKeyErrors(vec![key_err()])));
+        // And through the public, anyhow-based entry point used by `txn_retry!`.
+        assert!(is_retryable(&anyhow::Error::new(Error::MultipleKeyErrors(
+            vec![key_err()]
+        ))));
+
+        // Sanity: an otherwise-empty KeyError stays non-retryable.
+        assert!(!tikv_error_retryable(&Error::KeyError(Box::new(
+            ProtoKeyError::default()
+        ))));
+    }
+
+    #[test]
     fn handler_of_extracts_prefix() {
         assert_eq!(handler_of("google_drive:/a/b"), "google_drive");
         assert_eq!(handler_of("local:/x"), "local");
