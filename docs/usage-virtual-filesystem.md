@@ -77,6 +77,8 @@ Key rules:
 - **Pick `ttl_ms > 0`** (a `0` TTL is rejected — it would never expire) and
   `≤ 7 days`. Typical leases are seconds to a few minutes. Renew at roughly
   `ttl_ms / 3`.
+- **Use a positive fencing token for every write.** Read-only acquires can pass
+  `0`; write acquires and non-empty `AssertFencing` calls cannot.
 - **Never touch the backing store after a `LOST` renew or a `KILLED` event** —
   your lease is gone and another worker may now own the subtree.
 - **Always release** when done (or rely on lease expiry if you crash).
@@ -142,7 +144,8 @@ politely and detect deadlocks, register a wait edge and poll:
 
 ```text
 on CONFLICT{path, owner: blocker, reason}:
-    SetWaitEdge(owner=me, conflict_owner=blocker, ttl_ms=lease)   # "I wait for blocker"
+    SetWaitEdge(owner=me, conflict_owner=blocker, ttl_ms=lease,
+                conflict_path=path, reason=reason)   # "I wait for blocker on this conflict"
     repeat with backoff (e.g. 50ms → 1s):
         if not IsBlocking(conflict_path=path, conflict_owner=blocker, reason=reason):
             break                              # blocker let go → retry Acquire
@@ -158,7 +161,8 @@ on CONFLICT{path, owner: blocker, reason}:
 - `DetectCycle(start=me)` walks `me → blocker → …`. It reports a cycle only if it
   comes back to **you**, so every participant that probes from its own id will
   find a shared deadlock. A wait edge pointing at a dead owner is GC'd during the
-  walk.
+  walk; when the edge includes `conflict_path` + `reason`, a live-but-stale edge
+  is also discarded before it can create a false cycle.
 - Always `ClearWaitEdge` once you stop waiting (or fold it into the release with
   `del_wait_key: true`).
 
@@ -382,7 +386,7 @@ loop:
     if r.status == OK: break
     if r.status == LOST: token = IncrFencingToken(); continue
     # CONFLICT:
-    SetWaitEdge(owner, r.owner, 30000)
+    SetWaitEdge(owner, r.owner, 30000, conflict_path=r.path, reason=r.reason)
     until not IsBlocking(r.path, r.owner, r.reason):
         if DetectCycle(owner, 64).kind == FOUND:
             v = pick_victim(...)

@@ -61,7 +61,7 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 | **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
 | **TTL lease + renewal** | Every lock is a lease. The holder renews it; if the holder dies, the lease expires and the subtree frees itself — no orphaned locks. |
 | **Liveness & pruning** | Read sets self-heal: members whose owner lease has lapsed are pruned on the next touch. |
-| **Deadlock detection** | Wait edges (`owner → blocker`) form a wait-for graph. `DetectCycle` walks it; a client that finds a cycle resolves it with a cooperative revoke, then a forced release if the victim doesn't yield. |
+| **Deadlock detection** | Wait edges (`owner → blocker`, plus the path/reason being waited on) form a wait-for graph. `DetectCycle` walks it and drops stale edges; a client that finds a cycle resolves it with a cooperative revoke, then a forced release if the victim doesn't yield. |
 | **Per-owner event stream** | A `Subscribe` stream bound to one owner delivers only that owner's lifecycle events (`released` / `killed` / `revoke`). A lock's channel carries only that lock's information. |
 
 ## Architecture
@@ -87,12 +87,13 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
   survives node loss, and scales horizontally as you add TiKV nodes (PD
   rebalances regions). There is no single Redis-style SPOF.
 - **Atomicity.** Each multi-key operation runs as one optimistic TiKV
-  transaction that writes a **per-handler** serialization key, so any two
+  transaction that writes a **per-handler** serialization tombstone, so any two
   overlapping mutations *on the same handler* conflict at commit and one retries
   — giving single-threaded correctness within a handler while letting disjoint
-  handlers commit in parallel. Containment hazards never cross handlers, so this
-  is sufficient. Read-mostly and advisory checks (`AssertFencing`, `IsBlocking`,
-  `DetectCycle`) run lock-free.
+  handlers commit in parallel, without accumulating live marker keys.
+  Containment hazards never cross handlers, so this is sufficient. Read-mostly
+  and advisory checks (`AssertFencing`, `IsBlocking`, `DetectCycle`) run
+  lock-free.
 - **TTL is emulated** on top of TiKV: writes stamp an absolute expiry; reads
   treat elapsed entries as absent (correctness), and a background sweep reclaims
   them (housekeeping, runs every second by default). Set entries (read sets,

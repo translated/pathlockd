@@ -15,11 +15,11 @@ All lock metadata lives under the `fslock:` prefix. A *path* is
 | `fslock:fence:<path>` | `Str` = token | highest fencing token seen for `<path>` |
 | `fslock:alive:<owner>` | `Str` = "1" | the owner's lease (liveness) |
 | `fslock:own:<owner>` | `Set` of `"mode:path"` | everything the owner holds |
-| `fslock:wait:<owner>` | `Str` = blocker owner | a wait-for edge for deadlock detection |
+| `fslock:wait:<owner>` | `Str` = blocker owner plus optional conflict metadata | a wait-for edge for deadlock detection |
 | `fslock:idx:wrdesc:<anc>` | `Set` of descendant paths | write locks somewhere under `<anc>` |
 | `fslock:idx:rddesc:<anc>` | `Set` of descendant paths | read locks somewhere under `<anc>` |
 | `fslock:fencing:counter` | `Counter` | the monotonic fencing-token source |
-| `pathlockd:__serialize__:<handler>` | (lock only) | per-handler serialization key (never read as a value) |
+| `pathlockd:__serialize__:<handler>` | (tombstone only) | per-handler serialization key (never read as a value) |
 
 The descendant indexes (`idx:wrdesc` / `idx:rddesc`) are what make a write-lock's
 subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
@@ -65,12 +65,13 @@ Each primitive runs inside `Tx` (`store.rs`), an optimistic TiKV transaction
 created via `txn_retry!`:
 
 - `Tx::begin(client)` opens the optimistic transaction. A multi-key mutation
-  then calls `tx.serialize_handler(h)` for every handler it touches, `put`ting
-  `serialize_key(h)` (`pathlockd:__serialize__:<handler>`). Two transactions that
-  share a handler both write that key → optimistic write-write conflict at commit
-  → the loser retries with a fresh snapshot. Net effect: mutations are serial
-  *per handler*, parallel across handlers. Containment hazards never cross
-  handlers, so this is sufficient.
+  then calls `tx.serialize_handler(h)` for every handler it touches, deleting
+  `serialize_key(h)` (`pathlockd:__serialize__:<handler>`). A delete still writes
+  an MVCC tombstone, so two transactions that share a handler both write that
+  key → optimistic write-write conflict at commit → the loser retries with a
+  fresh snapshot. Net effect: mutations are serial *per handler*, parallel
+  across handlers, without accumulating a live key for every handler ever seen.
+  Containment hazards never cross handlers, so this is sufficient.
 - Reads use the transaction snapshot; the serialization key + retry guarantee a
   retrying transaction reads the latest committed state.
 - `Tx` exposes Redis-flavoured helpers — `get_str/set_str`, `sadd/srem/smembers/

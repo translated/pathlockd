@@ -148,7 +148,7 @@ impl Config {
         if let Some(v) = env_list("PATHLOCKD_PEERS") {
             cfg.peers = v;
         }
-        if let Some(v) = env_bool("PATHLOCKD_ENABLE_DEBUG") {
+        if let Some(v) = env_bool("PATHLOCKD_ENABLE_DEBUG")? {
             cfg.enable_debug = v;
         }
         if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
@@ -194,6 +194,38 @@ where
     }
 }
 
-fn env_bool(key: &str) -> Option<bool> {
-    env_string(key).map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+fn env_bool(key: &str) -> anyhow::Result<Option<bool>> {
+    env_string(key).map(|s| parse_bool_env(key, &s)).transpose()
+}
+
+fn parse_bool_env(key: &str, value: &str) -> anyhow::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => anyhow::bail!("invalid {key}={value}: expected one of 1,true,yes,on,0,false,no,off"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_bool_env_accepts_explicit_values() {
+        assert!(parse_bool_env("X", "1").unwrap());
+        assert!(parse_bool_env("X", "true").unwrap());
+        assert!(parse_bool_env("X", "YES").unwrap());
+        assert!(parse_bool_env("X", " on ").unwrap());
+
+        assert!(!parse_bool_env("X", "0").unwrap());
+        assert!(!parse_bool_env("X", "false").unwrap());
+        assert!(!parse_bool_env("X", "NO").unwrap());
+        assert!(!parse_bool_env("X", " off ").unwrap());
+    }
+
+    #[test]
+    fn parse_bool_env_rejects_ambiguous_values() {
+        let err = parse_bool_env("PATHLOCKD_ENABLE_DEBUG", "definitely").unwrap_err();
+        assert!(err.to_string().contains("PATHLOCKD_ENABLE_DEBUG"));
+    }
 }

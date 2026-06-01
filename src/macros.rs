@@ -1,5 +1,5 @@
 /// Run a transactional body against TiKV with bounded retry on transient
-/// errors (write conflicts, region churn).
+/// errors (write conflicts, region churn), including transaction begin errors.
 ///
 /// Usage:
 /// ```ignore
@@ -33,7 +33,19 @@ macro_rules! txn_retry {
     ($client:expr, commit_if: $pred:expr, $tx:ident => $body:expr) => {{
         let mut __attempt: u32 = 0;
         loop {
-            let mut $tx = $crate::store::Tx::begin($client).await?;
+            let mut $tx = match $crate::store::Tx::begin($client).await {
+                Ok(__tx) => __tx,
+                Err(__e) => {
+                    if __attempt < $crate::store::MAX_RETRY
+                        && $crate::store::is_retryable(&__e)
+                    {
+                        __attempt += 1;
+                        $crate::store::backoff(__attempt).await;
+                        continue;
+                    }
+                    break Err(__e);
+                }
+            };
             let __res: ::anyhow::Result<_> = $body;
             match __res {
                 Ok(__v) => {

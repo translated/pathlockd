@@ -99,6 +99,20 @@ pub enum CycleOutcome {
     Truncated(Vec<String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitEdgeMetadata {
+    pub conflict_path: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WaitEdge {
+    conflict_owner: String,
+    metadata: Option<WaitEdgeMetadata>,
+}
+
+const WAIT_EDGE_V1_PREFIX: &str = "v1:";
+
 // ---------------------------------------------------------------------------
 // get_ancestors
 // ---------------------------------------------------------------------------
@@ -160,6 +174,19 @@ async fn prune_dead_read_owners(tx: &mut Tx, rd: &str) -> anyhow::Result<Vec<Str
     Ok(alive)
 }
 
+async fn get_live_write_owner(tx: &mut Tx, path: &str) -> anyhow::Result<Option<String>> {
+    let Some(owner) = tx.get_str(&wr_key(path)).await? else {
+        return Ok(None);
+    };
+    if owner_alive(tx, &owner).await? {
+        return Ok(Some(owner));
+    }
+
+    tx.del(&wr_key(path)).await?;
+    remove_descendant_indexes(tx, Mode::Write, path).await?;
+    Ok(None)
+}
+
 async fn add_descendant_indexes(
     tx: &mut Tx,
     mode: Mode,
@@ -200,7 +227,7 @@ async fn find_descendant_write_conflict(
         warn!(key = %idx, count = card, "fslock: large wrdesc scan");
     }
     for candidate in tx.smembers(&idx).await? {
-        match tx.get_str(&wr_key(&candidate)).await? {
+        match get_live_write_owner(tx, &candidate).await? {
             None => {
                 tx.srem(&idx, &candidate).await?;
                 remove_descendant_indexes(tx, Mode::Write, &candidate).await?;
@@ -320,14 +347,14 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
             State::New => {
                 // A. ancestors checked for WRITE locks (top-down blocking)
                 for anc in get_ancestors(path) {
-                    if let Some(anc_owner) = tx.get_str(&wr_key(&anc)).await? {
+                    if let Some(anc_owner) = get_live_write_owner(tx, &anc).await? {
                         if anc_owner != *owner {
                             return Ok(conflict(&anc, &anc_owner, "ancestor_locked"));
                         }
                     }
                 }
                 // B. self direct conflict
-                if let Some(wr_owner) = tx.get_str(&wr_key(path)).await? {
+                if let Some(wr_owner) = get_live_write_owner(tx, path).await? {
                     if wr_owner != *owner {
                         return Ok(conflict(path, &wr_owner, "write_locked"));
                     }
@@ -435,17 +462,29 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
         let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
         if mode == "write" {
             let wr_k = wr_key(&path);
-            if tx.get_str(&wr_k).await?.as_deref() == Some(owner.as_str()) {
-                tx.pexpire_str(&wr_k, ttl).await?;
-                tx.pexpire_str(&fence_key(&path), fence_ttl).await?;
-                add_descendant_indexes(tx, Mode::Write, &path, ttl).await?;
+            if tx.get_str(&wr_k).await?.as_deref() != Some(owner.as_str()) {
+                return Ok(lost(&path, "missing_write"));
             }
+            tx.pexpire_str(&wr_k, ttl).await?;
+            match parse_fence(tx.get_str(&fence_key(&path)).await?) {
+                None => return Ok(lost(&path, "missing_fence")),
+                Some(cur) if token > 0 && cur > token => {
+                    return Ok(conflict(&path, &cur.to_string(), "stale_fencing_token"));
+                }
+                Some(cur) => {
+                    let refreshed = if token > 0 { token.max(cur) } else { cur };
+                    tx.set_str(&fence_key(&path), &refreshed.to_string(), fence_ttl)
+                        .await?;
+                }
+            }
+            add_descendant_indexes(tx, Mode::Write, &path, ttl).await?;
         } else if mode == "read" {
             let rd = rd_key(&path);
-            if tx.sismember(&rd, owner).await? {
-                tx.sadd(&rd, owner, ttl).await?;
-                add_descendant_indexes(tx, Mode::Read, &path, ttl).await?;
+            if !tx.sismember(&rd, owner).await? {
+                return Ok(lost(&path, "missing_read"));
             }
+            tx.sadd(&rd, owner, ttl).await?;
+            add_descendant_indexes(tx, Mode::Read, &path, ttl).await?;
         }
     }
 
@@ -776,6 +815,82 @@ async fn assert_fencing_inner(
     Ok(AssertOutcome::Ok)
 }
 
+fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata>) -> String {
+    let Some(metadata) = metadata else {
+        return conflict_owner.to_string();
+    };
+
+    format!(
+        "{WAIT_EDGE_V1_PREFIX}{}:{}:{}:{}{}{}",
+        conflict_owner.len(),
+        metadata.conflict_path.len(),
+        metadata.reason.len(),
+        conflict_owner,
+        metadata.conflict_path,
+        metadata.reason
+    )
+}
+
+fn parse_wait_edge(raw: String) -> WaitEdge {
+    let Some(rest) = raw.strip_prefix(WAIT_EDGE_V1_PREFIX) else {
+        return WaitEdge {
+            conflict_owner: raw,
+            metadata: None,
+        };
+    };
+
+    let Some((owner_len, rest)) = parse_len_field(rest) else {
+        return legacy_wait_edge(raw);
+    };
+    let Some((path_len, rest)) = parse_len_field(rest) else {
+        return legacy_wait_edge(raw);
+    };
+    let Some((reason_len, payload)) = parse_len_field(rest) else {
+        return legacy_wait_edge(raw);
+    };
+
+    let total_len = owner_len
+        .checked_add(path_len)
+        .and_then(|v| v.checked_add(reason_len));
+    if total_len != Some(payload.len()) {
+        return legacy_wait_edge(raw);
+    }
+
+    let owner_end = owner_len;
+    let path_end = owner_end + path_len;
+    let Some(conflict_owner) = payload.get(..owner_end) else {
+        return legacy_wait_edge(raw);
+    };
+    let Some(conflict_path) = payload.get(owner_end..path_end) else {
+        return legacy_wait_edge(raw);
+    };
+    let Some(reason) = payload.get(path_end..) else {
+        return legacy_wait_edge(raw);
+    };
+    WaitEdge {
+        conflict_owner: conflict_owner.to_string(),
+        metadata: Some(WaitEdgeMetadata {
+            conflict_path: conflict_path.to_string(),
+            reason: reason.to_string(),
+        }),
+    }
+}
+
+fn parse_len_field(input: &str) -> Option<(usize, &str)> {
+    let (len, rest) = input.split_once(':')?;
+    if len.is_empty() {
+        return None;
+    }
+    Some((len.parse::<usize>().ok()?, rest))
+}
+
+fn legacy_wait_edge(raw: String) -> WaitEdge {
+    WaitEdge {
+        conflict_owner: raw,
+        metadata: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DETECT_CYCLE
 // ---------------------------------------------------------------------------
@@ -807,10 +922,11 @@ async fn detect_cycle_inner(
         visited.insert(current.clone());
         chain.push(current.clone());
 
-        let next = match tx.get_str(&wait_key(&current)).await? {
+        let edge = match tx.get_str(&wait_key(&current)).await? {
             None => return Ok(CycleOutcome::None), // end of wait chain
-            Some(n) => n,
+            Some(raw) => parse_wait_edge(raw),
         };
+        let next = edge.conflict_owner;
 
         // Opportunistic stale-edge GC: a next node with no alive key is dead, so
         // its outgoing edge is orphaned — delete both and stop.
@@ -818,6 +934,16 @@ async fn detect_cycle_inner(
             tx.del(&wait_key(&current)).await?;
             tx.del(&wait_key(&next)).await?;
             return Ok(CycleOutcome::None);
+        }
+
+        // New wait edges carry the exact conflict that created the edge. If the
+        // blocker is still alive but no longer blocks that path/reason, the edge
+        // is stale; delete it and avoid reporting a false deadlock.
+        if let Some(meta) = edge.metadata {
+            if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason).await? {
+                tx.del(&wait_key(&current)).await?;
+                return Ok(CycleOutcome::None);
+            }
         }
 
         if next == start {
@@ -839,7 +965,7 @@ pub async fn is_blocking(
     reason: &str,
 ) -> anyhow::Result<bool> {
     // Advisory check: no serialization key. A stale "blocking" just makes the
-    // caller wait/recheck; its dead-reader pruning conflicts per-key directly.
+    // caller wait/recheck; dead-owner pruning conflicts per-key directly.
     txn_retry!(client, tx => { is_blocking_inner(&mut tx, conflict_path, conflict_owner, reason).await })
 }
 
@@ -868,7 +994,7 @@ async fn is_blocking_inner(
         return Ok(false);
     }
 
-    Ok(tx.get_str(&wr_key(conflict_path)).await?.as_deref() == Some(conflict_owner))
+    Ok(get_live_write_owner(tx, conflict_path).await?.as_deref() == Some(conflict_owner))
 }
 
 // ---------------------------------------------------------------------------
@@ -880,14 +1006,16 @@ pub async fn incr_fencing_token(client: &TransactionClient) -> anyhow::Result<i6
     txn_retry!(client, tx => { tx.incr(FENCING_COUNTER_KEY).await })
 }
 
-/// `SET fslock:wait:<owner> <conflict> PX ttl`.
+/// `SET fslock:wait:<owner> <conflict>[+metadata] PX ttl`.
 pub async fn set_wait_edge(
     client: &TransactionClient,
     owner: &str,
     conflict_owner: &str,
     ttl_ms: u64,
+    metadata: Option<&WaitEdgeMetadata>,
 ) -> anyhow::Result<()> {
-    txn_retry!(client, tx => { tx.set_str(&wait_key(owner), conflict_owner, ttl_ms).await })
+    let edge = encode_wait_edge(conflict_owner, metadata);
+    txn_retry!(client, tx => { tx.set_str(&wait_key(owner), &edge, ttl_ms).await })
 }
 
 /// `DEL fslock:wait:<owner>`.
@@ -1065,5 +1193,31 @@ mod tests {
         assert_eq!(parse_fence(Some("abc".into())), None);
         assert_eq!(parse_fence(Some(String::new())), None);
         assert_eq!(parse_fence(None), None);
+    }
+
+    #[test]
+    fn wait_edge_encoding_round_trips_metadata() {
+        let edge = parse_wait_edge(encode_wait_edge(
+            "owner:with:colons",
+            Some(&WaitEdgeMetadata {
+                conflict_path: "h:/a/b".into(),
+                reason: "descendant_write_locked".into(),
+            }),
+        ));
+        assert_eq!(edge.conflict_owner, "owner:with:colons");
+        assert_eq!(
+            edge.metadata,
+            Some(WaitEdgeMetadata {
+                conflict_path: "h:/a/b".into(),
+                reason: "descendant_write_locked".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn wait_edge_parser_keeps_legacy_values() {
+        let edge = parse_wait_edge("plain-owner".into());
+        assert_eq!(edge.conflict_owner, "plain-owner");
+        assert_eq!(edge.metadata, None);
     }
 }

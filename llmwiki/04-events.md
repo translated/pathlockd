@@ -28,10 +28,12 @@ result in the blocker's keys disappearing, which the waiter's next recheck sees.
 
 ## Deadlock resolution (client policy)
 
-1. A waiter records a wait edge: `SetWaitEdge(self → blocker)`.
+1. A waiter records a wait edge:
+   `SetWaitEdge(self → blocker, conflict_path, reason)`.
 2. The "leader" of a conflicting pair (lower owner id, by convention) calls
    `DetectCycle(blocker)`. If the returned chain comes back to the leader, it's
-   a cycle.
+   a cycle. Edges carrying conflict metadata are re-checked while walking, so a
+   live owner with a stale wait edge cannot create a false deadlock.
 3. The leader resolves it: `RequestRevoke(victim)` and waits a grace period for
    the victim to yield; if the victim is still blocking and still alive, one more
    grace round; then `ForceRelease(victim)` as a last resort.

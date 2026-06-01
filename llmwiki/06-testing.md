@@ -27,7 +27,7 @@ ancestor walking, fence parsing, expiry math). They don't touch TiKV.
 
 Exercise the primitives against a **real** TiKV cluster: hierarchical conflict
 precedence, point-only reads, fencing (assert + stale owner + stale token),
-lock-loss on held/renew, dead-reader pruning, deadlock cycle detection,
+lock-loss on held/renew, dead-owner pruning, deadlock cycle detection,
 is-blocking, inline shadowing release, and release-all.
 
 They flush the whole keyspace between tests and share one runtime + client, so

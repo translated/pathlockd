@@ -52,6 +52,7 @@ message AcquireRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
   repeated LockRequest requests = 3;
+  // Required to be > 0 when any request is MODE_WRITE. Reads ignore it.
   int64 fencing_token = 4;
   // Releases folded into the same atomic transaction (shadowing transitions).
   repeated ReleaseRequest release_requests = 5;
@@ -133,6 +134,7 @@ message ForceReleaseResponse {}
 
 message AssertFencingRequest {
   string owner_id = 1;
+  // Required to be > 0 when paths is non-empty.
   int64 fencing_token = 2;
   repeated string paths = 3; // path form "<handlerType>:<normalizedPath>"
 }
@@ -200,6 +202,12 @@ message SetWaitEdgeRequest {
   string owner_id = 1;
   string conflict_owner = 2;
   uint64 ttl_ms = 3;
+  // Optional metadata for the blocking edge. New clients populate these so
+  // DetectCycle can discard stale live-owner edges before reporting a cycle.
+  // Older clients may leave them empty; the daemon keeps legacy best-effort
+  // behaviour for those edges.
+  string conflict_path = 4;
+  string reason = 5;
 }
 
 message SetWaitEdgeResponse {}

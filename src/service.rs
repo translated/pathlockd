@@ -164,6 +164,30 @@ fn check_blocking_reason(reason: &str) -> Result<(), Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn check_write_fencing_token(fencing_token: i64) -> Result<(), Status> {
+    if fencing_token <= 0 {
+        return Err(Status::invalid_argument(
+            "fencing_token must be > 0 for write locks",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn check_event(ev: &Event) -> Result<(), Status> {
+    check_id("event.owner_id", &ev.owner_id)?;
+    match proto::EventType::try_from(ev.r#type) {
+        Ok(proto::EventType::Released | proto::EventType::Killed | proto::EventType::Revoke) => {
+            Ok(())
+        }
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid event type value {}",
+            ev.r#type
+        ))),
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn to_mode(i: i32) -> Result<engine::Mode, Status> {
     match proto::Mode::try_from(i) {
         Ok(proto::Mode::Read) => Ok(engine::Mode::Read),
@@ -222,6 +246,13 @@ impl PathLock for PathLockService {
         }
         for r in &req.release_requests {
             check_path(&r.path)?;
+        }
+        if req
+            .requests
+            .iter()
+            .any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write))
+        {
+            check_write_fencing_token(req.fencing_token)?;
         }
         let requests: Vec<LockReq> = req
             .requests
@@ -385,6 +416,9 @@ impl PathLock for PathLockService {
         for p in &req.paths {
             check_path(p)?;
         }
+        if !req.paths.is_empty() {
+            check_write_fencing_token(req.fencing_token)?;
+        }
         let outcome =
             engine::assert_fencing(&self.client, &req.owner_id, req.fencing_token, &req.paths)
                 .await
@@ -467,9 +501,29 @@ impl PathLock for PathLockService {
         check_id("owner_id", &req.owner_id)?;
         check_id("conflict_owner", &req.conflict_owner)?;
         check_ttl(req.ttl_ms)?;
-        engine::set_wait_edge(&self.client, &req.owner_id, &req.conflict_owner, req.ttl_ms)
-            .await
-            .map_err(engine_err)?;
+        let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
+            None
+        } else if req.conflict_path.is_empty() || req.reason.is_empty() {
+            return Err(Status::invalid_argument(
+                "conflict_path and reason must be provided together",
+            ));
+        } else {
+            check_path(&req.conflict_path)?;
+            check_blocking_reason(&req.reason)?;
+            Some(engine::WaitEdgeMetadata {
+                conflict_path: req.conflict_path,
+                reason: req.reason,
+            })
+        };
+        engine::set_wait_edge(
+            &self.client,
+            &req.owner_id,
+            &req.conflict_owner,
+            req.ttl_ms,
+            metadata.as_ref(),
+        )
+        .await
+        .map_err(engine_err)?;
         Ok(Response::new(SetWaitEdgeResponse {}))
     }
 
@@ -537,9 +591,12 @@ impl PathLock for PathLockService {
         &self,
         request: Request<PublishEventRequest>,
     ) -> Result<Response<PublishEventResponse>, Status> {
-        if let Some(ev) = request.into_inner().event {
-            self.broadcaster.publish_from_peer(ev);
-        }
+        let ev = request
+            .into_inner()
+            .event
+            .ok_or_else(|| Status::invalid_argument("event is required"))?;
+        check_event(&ev)?;
+        self.broadcaster.publish_from_peer(ev);
         Ok(Response::new(PublishEventResponse {}))
     }
 
@@ -775,6 +832,40 @@ mod tests {
         assert!(is_invalid(check_blocking_reason("stale_fencing_token")));
         assert!(is_invalid(check_blocking_reason("")));
         assert!(is_invalid(check_blocking_reason("garbage")));
+    }
+
+    #[test]
+    fn check_write_fencing_token_rejects_non_positive() {
+        assert!(is_invalid(check_write_fencing_token(0)));
+        assert!(is_invalid(check_write_fencing_token(-1)));
+        assert!(check_write_fencing_token(1).is_ok());
+    }
+
+    #[test]
+    fn check_event_accepts_known_types_and_owner() {
+        for kind in [
+            proto::EventType::Released,
+            proto::EventType::Killed,
+            proto::EventType::Revoke,
+        ] {
+            assert!(check_event(&Event {
+                r#type: kind as i32,
+                owner_id: "owner-42".into(),
+            })
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn check_event_rejects_empty_owner_and_unknown_type() {
+        assert!(is_invalid(check_event(&Event {
+            r#type: proto::EventType::Released as i32,
+            owner_id: String::new(),
+        })));
+        assert!(is_invalid(check_event(&Event {
+            r#type: 99,
+            owner_id: "owner-42".into(),
+        })));
     }
 
     #[test]

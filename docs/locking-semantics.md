@@ -110,6 +110,8 @@ to reject a stale writer:
 - An acquire whose token is **older** than the path's persisted fence is rejected
   with `stale_fencing_token` (whether the request is `New` or `Held`). The holder
   is expected to fetch a fresh token and retry.
+- Write acquires and non-empty `AssertFencing` calls require a positive token;
+  read-only acquires may pass `0`.
 - `AssertFencing(owner, token, paths)` re-verifies, just before an external side
   effect, that for each path the owner **still** holds the write lock
   (`stale_owner` otherwise) **and** the persisted fence **still** equals the token
@@ -139,27 +141,31 @@ lost owner's liveness is not accidentally refreshed.
 
 ## Liveness and dead-owner pruning
 
-Each owner has a **liveness** key tied to the same lease. Read sets are
-self-healing: a read owner whose liveness has lapsed is pruned from the set the
-next time the set is touched (during a conflict scan, a renew, or an
-`is_blocking` check). So a crashed reader cannot block a writer past its TTL even
-though read sets hold many owners. A writer that finds a path read-locked only by
-dead owners proceeds.
+Each owner has a **liveness** key tied to the same lease. Lock metadata is
+self-healing: an owner whose liveness has lapsed is pruned the next time the
+path is touched (during a conflict scan, a renew, or an `is_blocking` check).
+So a crashed reader or writer cannot block another owner past its TTL even
+though read sets hold many owners and write keys are single-owner records. A
+writer that finds a path locked only by dead owners proceeds.
 
 ## Deadlock detection and resolution
 
-Waiters record a **wait-for edge** `owner → blocker`. `DetectCycle(start)` walks
-these edges:
+Waiters record a **wait-for edge** `owner → blocker`, preferably with the
+`conflict_path` and `reason` from the `CONFLICT` response that made the owner
+wait. `DetectCycle(start)` walks these edges:
 
 - returns `cycle(chain)` if the walk returns to `start` (a real deadlock),
 - `none` if the chain ends or revisits a node off the cycle,
 - `truncated(chain)` at the depth limit.
 
 Edges pointing at a dead owner are deleted during the walk (the graph
-self-heals). When a client detects a cycle it resolves it by preempting the
-victim: a cooperative **revoke** first, escalating to a **forced release** if the
-victim does not yield. `ForceRelease(victim)` drops all the victim's keys and
-emits a `KILLED` event for it, which unblocks anyone waiting on those paths.
+self-heals). Edges carrying conflict metadata are also re-checked; if the
+blocker is alive but no longer holds the specific blocking lock, the edge is
+deleted and no cycle is reported. When a client detects a cycle it resolves it
+by preempting the victim: a cooperative **revoke** first, escalating to a
+**forced release** if the victim does not yield. `ForceRelease(victim)` drops all
+the victim's keys and emits a `KILLED` event for it, which unblocks anyone
+waiting on those paths.
 
 ## Outcomes at a glance
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tikv_client::TransactionClient;
-use tonic::transport::Server;
+use tonic::transport::{Endpoint, Server};
 use tracing::{error, info, warn};
 
 use pathlockd::config::Config;
@@ -13,6 +13,8 @@ use pathlockd::proto::path_lock_server::PathLockServer;
 use pathlockd::proto::HealthRequest;
 use pathlockd::service::{DebugService, PathLockService};
 use pathlockd::store;
+
+const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -49,6 +51,7 @@ async fn main() -> anyhow::Result<()> {
         let page = cfg.gc_page;
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(interval));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
@@ -91,9 +94,15 @@ async fn main() -> anyhow::Result<()> {
 async fn health_probe(listen: &str) -> anyhow::Result<()> {
     let port = listen.rsplit(':').next().unwrap_or("50051");
     let url = format!("http://127.0.0.1:{port}");
-    let mut client = PathLockClient::connect(url.clone())
+    let endpoint = Endpoint::from_shared(url.clone())
+        .map_err(|e| anyhow::anyhow!("invalid health probe endpoint {url}: {e}"))?
+        .connect_timeout(HEALTH_PROBE_TIMEOUT)
+        .timeout(HEALTH_PROBE_TIMEOUT);
+    let channel = endpoint
+        .connect()
         .await
         .map_err(|e| anyhow::anyhow!("health probe could not connect to {url}: {e}"))?;
+    let mut client = PathLockClient::new(channel);
     let resp = client.health(HealthRequest {}).await?.into_inner();
     if resp.ok {
         Ok(())

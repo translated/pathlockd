@@ -25,7 +25,8 @@
 - Keys are defined by the `*_key` builders in `store.rs`. New per-owner or
   per-path data should follow the `fslock:<kind>:<...>` convention so GC/flush
   (range `fslock:`) cover it, and so it is isolated from the serialization keys
-  (`pathlockd:__serialize__:<handler>`, deliberately outside that range).
+  (`pathlockd:__serialize__:<handler>`, deliberately outside that range and used
+  only as MVCC tombstones).
 - New values extend the `Stored` enum. Anything that should expire needs an
   `exp` and must be read through the expiry-aware helpers. For set-like data with
   members of independent lifetimes, keep the per-member expiry model — never a

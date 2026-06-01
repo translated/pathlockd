@@ -2,7 +2,7 @@
 //!
 //! These pin down the lock contract at the level of the primitives pathlockd
 //! exposes — the read/write conflict matrix and its hierarchical precedence,
-//! point-only reads, same-owner re-entrancy, fencing, lock-loss, dead-reader
+//! point-only reads, same-owner re-entrancy, fencing, lock-loss, dead-owner
 //! pruning, deadlock cycle detection, is-blocking, inline shadowing release and
 //! release-all. The behaviours asserted here are specified in
 //! `docs/locking-semantics.md`.
@@ -364,6 +364,31 @@ fn prune_dead_read_owners_unblocks_writer() {
 }
 
 #[test]
+fn prune_dead_write_owner_unblocks_writer() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "dead-writer", vec![w("/dead-write", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+
+        engine::debug_expire_owner(c, "dead-writer").await.unwrap();
+
+        assert_eq!(
+            acq(c, "live-writer", vec![w("/dead-write", State::New)], 2).await,
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            engine::debug_get_write_owner(c, &rp("/dead-write"))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("live-writer")
+        );
+    });
+}
+
+#[test]
 fn detect_cycle_ab_ba() {
     run(async {
         let c = fresh().await;
@@ -375,8 +400,8 @@ fn detect_cycle_ab_ba() {
             acq(c, "B", vec![w("/b", State::New)], 2).await,
             AcquireOutcome::Ok
         );
-        engine::set_wait_edge(c, "A", "B", TTL).await.unwrap();
-        engine::set_wait_edge(c, "B", "A", TTL).await.unwrap();
+        engine::set_wait_edge(c, "A", "B", TTL, None).await.unwrap();
+        engine::set_wait_edge(c, "B", "A", TTL, None).await.unwrap();
         match engine::detect_cycle(c, "A", 64).await.unwrap() {
             CycleOutcome::Cycle(chain) => {
                 assert_eq!(chain, vec!["A".to_string(), "B".to_string()]);
@@ -391,7 +416,7 @@ fn detect_cycle_stale_edge_returns_none() {
     run(async {
         let c = fresh().await;
         // edge points at a dead owner (no alive key) → walk self-heals to None.
-        engine::set_wait_edge(c, "waiter", "dead-owner", TTL)
+        engine::set_wait_edge(c, "waiter", "dead-owner", TTL, None)
             .await
             .unwrap();
         assert_eq!(
@@ -573,6 +598,69 @@ fn acquire_refreshes_unlisted_held_lease() {
                 assert_eq!(owner, "O");
             }
             o => panic!("expected write_locked (the later acquire refreshed /old), got {o:?}"),
+        }
+    });
+}
+
+#[test]
+fn read_only_acquire_refreshes_unlisted_write_without_new_token() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq_ttl(c, "O", 1_500, vec![w("/write", State::New)], 7).await,
+            AcquireOutcome::Ok
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+        let outcome = engine::acquire(
+            c,
+            AcquireArgs {
+                owner_id: "O".into(),
+                ttl_ms: 20_000,
+                requests: vec![r("/read", State::New)],
+                fencing_token: 0,
+                release_requests: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Ok);
+
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+        assert_eq!(
+            engine::assert_fencing(c, "O", 7, &[rp("/write")])
+                .await
+                .unwrap(),
+            AssertOutcome::Ok
+        );
+        match acq(c, "X", vec![w("/write", State::New)], 8).await {
+            AcquireOutcome::Conflict { reason, owner, .. } => {
+                assert_eq!(reason, "write_locked");
+                assert_eq!(owner, "O");
+            }
+            o => panic!("expected write_locked (read-only acquire refreshed /write), got {o:?}"),
+        }
+    });
+}
+
+#[test]
+fn acquire_reports_lost_for_unlisted_missing_held_lease() {
+    run(async {
+        let c = fresh().await;
+        assert_eq!(
+            acq(c, "O", vec![w("/old", State::New)], 1).await,
+            AcquireOutcome::Ok
+        );
+        engine::debug_delete_lock_key(c, &rp("/old"), Mode::Write, None)
+            .await
+            .unwrap();
+
+        match acq(c, "O", vec![w("/new", State::New)], 2).await {
+            AcquireOutcome::Lost { path, reason } => {
+                assert_eq!(path, rp("/old"));
+                assert_eq!(reason, "missing_write");
+            }
+            o => panic!("expected LOST for missing unlisted held write, got {o:?}"),
         }
     });
 }

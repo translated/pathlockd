@@ -26,10 +26,11 @@
 //!   ([`merge_exp`]) so re-adding a member can never shorten it.
 //! * **Atomicity** comes from running each primitive as one optimistic TiKV
 //!   transaction. Multi-key mutations additionally write a per-handler
-//!   serialization key ([`serialize_key`]), so any two that touch the same
+//!   serialization tombstone ([`serialize_key`]), so any two that touch the same
 //!   handler collide at commit (optimistic write-write conflict) and one retries
 //!   with a fresh snapshot — making them effectively serial *within that
-//!   handler* while still running in parallel across independent handlers.
+//!   handler* while still running in parallel across independent handlers,
+//!   without leaving a live marker for every handler ever seen.
 //!   Single-key operations (the fencing INCR, a wait-edge set/clear) and the
 //!   advisory walks (`detect_cycle`, `is_blocking`) skip it — TiKV already
 //!   serializes per key, and those walks are best-effort.
@@ -42,16 +43,17 @@ use tikv_client::{CheckLevel, Key, Transaction, TransactionClient, TransactionOp
 
 /// Shared key prefix for all lock metadata.
 pub const PREFIX: &str = "fslock:";
-/// Prefix for the per-handler serialization keys. A multi-key mutation `put`s
+/// Prefix for the per-handler serialization keys. A multi-key mutation deletes
 /// `serialize_key(<handler>)` for every handler it touches, so two mutations
 /// that share a handler collide at commit (optimistic write-write conflict) and
-/// the loser retries — making mutations serial *per handler*. Containment
-/// hazards (ancestor/descendant/point conflicts) always live inside one handler,
-/// so this is sufficient for cluster-wide correctness while letting disjoint
-/// handlers proceed in parallel.
+/// the loser retries — making mutations serial *per handler*. A delete is still
+/// a write in TiKV's MVCC conflict detector, but it leaves no live marker behind
+/// for dynamic handlers. Containment hazards (ancestor/descendant/point
+/// conflicts) always live inside one handler, so this is sufficient for
+/// cluster-wide correctness while letting disjoint handlers proceed in parallel.
 ///
-/// These keys live OUTSIDE the `fslock:` data range so GC/flush never touch
-/// them.
+/// These keys live OUTSIDE the `fslock:` data range; only their MVCC tombstones
+/// matter.
 pub const SERIALIZE_PREFIX: &str = "pathlockd:__serialize__:";
 /// Monotonic fencing-token counter (`INCR fslock:fencing:counter`).
 pub const FENCING_COUNTER_KEY: &str = "fslock:fencing:counter";
@@ -131,6 +133,14 @@ impl Stored {
             Stored::Counter { .. } => 0,
         }
     }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Stored::Str { .. } => "string",
+            Stored::Set { .. } => "set",
+            Stored::Counter { .. } => "counter",
+        }
+    }
 }
 
 /// Derived whole-set expiry for GC: `0` (never) if any member never expires,
@@ -199,6 +209,12 @@ fn decode(b: &[u8]) -> anyhow::Result<Stored> {
     Ok(v)
 }
 
+fn parse_counter_string(key: &str, value: &str) -> anyhow::Result<i64> {
+    value
+        .parse::<i64>()
+        .map_err(|e| anyhow::anyhow!("key {key} has invalid counter value {value:?}: {e}"))
+}
+
 /// Retry transient TiKV errors only. Logic outcomes are values, not errors, so
 /// the only `Err`s reaching here are infrastructure (write conflict, deadlock,
 /// region not-leader, …) — all worth a bounded retry — or a decode bug, which
@@ -256,16 +272,15 @@ impl Tx {
         })
     }
 
-    /// Join the serialization domain for `handler`: buffers a write of
+    /// Join the serialization domain for `handler`: buffers a delete of
     /// `serialize_key(handler)` so any concurrent mutation touching the same
     /// handler conflicts with this one at commit. Idempotent within a
-    /// transaction. A bare write is enough — optimistic conflict detection keys
-    /// on the version, not the value.
+    /// transaction. A delete is enough — optimistic conflict detection keys on
+    /// the MVCC write, not on a live value, and using a tombstone avoids
+    /// accumulating one visible key for every handler ever seen.
     pub async fn serialize_handler(&mut self, handler: &str) -> anyhow::Result<()> {
         if self.serialized.insert(handler.to_string()) {
-            self.txn
-                .put(serialize_key(handler).into_bytes(), vec![1u8])
-                .await?;
+            self.txn.delete(serialize_key(handler).into_bytes()).await?;
         }
         Ok(())
     }
@@ -307,7 +322,10 @@ impl Tx {
     pub async fn get_str(&mut self, key: &str) -> anyhow::Result<Option<String>> {
         match self.raw_get(key).await? {
             Some(Stored::Str { v, exp }) if !expired(exp, self.now) => Ok(Some(v)),
-            _ => Ok(None),
+            Some(Stored::Str { .. }) | None => Ok(None),
+            Some(other) => {
+                anyhow::bail!("key {key} has type {}, expected string", other.kind())
+            }
         }
     }
 
@@ -343,8 +361,11 @@ impl Tx {
     pub async fn incr(&mut self, key: &str) -> anyhow::Result<i64> {
         let cur = match self.raw_get(key).await? {
             Some(Stored::Counter { v }) => v,
-            Some(Stored::Str { v, .. }) => v.parse::<i64>().unwrap_or(0),
-            _ => 0,
+            Some(Stored::Str { v, .. }) => parse_counter_string(key, &v)?,
+            Some(other) => {
+                anyhow::bail!("key {key} has type {}, expected counter", other.kind())
+            }
+            None => 0,
         };
         let next = cur
             .checked_add(1)
@@ -356,8 +377,11 @@ impl Tx {
     pub async fn get_counter(&mut self, key: &str) -> anyhow::Result<i64> {
         Ok(match self.raw_get(key).await? {
             Some(Stored::Counter { v }) => v,
-            Some(Stored::Str { v, .. }) => v.parse::<i64>().unwrap_or(0),
-            _ => 0,
+            Some(Stored::Str { v, .. }) => parse_counter_string(key, &v)?,
+            Some(other) => {
+                anyhow::bail!("key {key} has type {}, expected counter", other.kind())
+            }
+            None => 0,
         })
     }
 
@@ -381,7 +405,8 @@ impl Tx {
                     Ok(Some(live))
                 }
             }
-            _ => Ok(None),
+            None => Ok(None),
+            Some(other) => anyhow::bail!("key {key} has type {}, expected set", other.kind()),
         }
     }
 
@@ -582,6 +607,13 @@ mod tests {
         assert_eq!(merge_exp(Some(70), 50), 70); // never shortens
         assert_eq!(merge_exp(Some(50), 0), 0); // infinite wins
         assert_eq!(merge_exp(Some(0), 50), 0); // already infinite stays
+    }
+
+    #[test]
+    fn parse_counter_string_fails_closed_on_bad_values() {
+        assert_eq!(parse_counter_string("k", "42").unwrap(), 42);
+        let err = parse_counter_string("fslock:fencing:counter", "not-a-number").unwrap_err();
+        assert!(err.to_string().contains("fslock:fencing:counter"));
     }
 
     #[test]

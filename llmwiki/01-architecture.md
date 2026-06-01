@@ -21,8 +21,8 @@ clients ──gRPC──▶ pathlockd (N stateless replicas) ──▶ TiKV clus
    `engine::acquire`.
 3. `engine::acquire` runs one TiKV transaction (`txn_retry!` in `macros.rs`):
    it reads the relevant keys, decides OK / CONFLICT / LOST, applies writes, and
-   commits. Multi-key operations also write the serialization key so concurrent
-   mutations collide and retry.
+   commits. Multi-key operations also write a serialization tombstone so
+   concurrent mutations collide and retry.
 4. The outcome maps back to a proto response. If an inline release happened and
    the caller asked for it, a `RELEASED` event is published.
 
@@ -31,14 +31,15 @@ clients ──gRPC──▶ pathlockd (N stateless replicas) ──▶ TiKV clus
 - Each Lua-style primitive is one TiKV transaction → atomic.
 - Multi-key mutations (`acquire`, `release`, `release_all`, `renew`,
   `force_release`) call `tx.serialize_handler(h)` for every handler `h` they
-  touch, which `put`s `serialize_key(h)` (`pathlockd:__serialize__:<handler>`).
-  Under optimistic concurrency, any two that share a handler conflict on that
-  key and one retries with a fresh snapshot — so mutations are serialized **per
-  handler**. Containment hazards (ancestor/descendant/point conflicts) always
-  live inside a single handler, so per-handler scope is sufficient for
-  correctness, and mutations on disjoint handlers run in parallel (no single
-  global bottleneck). Throughput within one handler is still bounded by that
-  key's region/Raft leader.
+  touch, which deletes `serialize_key(h)`
+  (`pathlockd:__serialize__:<handler>`). Under optimistic concurrency, any two
+  that share a handler conflict on that key's MVCC tombstone and one retries
+  with a fresh snapshot — so mutations are serialized **per handler** without
+  accumulating a live key for every handler ever seen. Containment hazards
+  (ancestor/descendant/point conflicts) always live inside a single handler, so
+  per-handler scope is sufficient for correctness, and mutations on disjoint
+  handlers run in parallel (no single global bottleneck). Throughput within one
+  handler is still bounded by that key's region/Raft leader.
 - `acquire` commits only a successful (OK) outcome; a CONFLICT/LOST result is
   derived from read-only validation, so it rolls back — failed attempts neither
   serialize nor write.
