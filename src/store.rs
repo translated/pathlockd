@@ -407,16 +407,15 @@ impl Tx {
         })
     }
 
-    /// Join the serialization domain for `handler`: buffers a delete of
-    /// `serialize_key(handler)` so any concurrent mutation touching the same
-    /// handler conflicts with this one at commit. Idempotent within a
-    /// transaction. A delete is enough — optimistic conflict detection keys on
-    /// the MVCC write, not on a live value, and using a tombstone avoids
-    /// accumulating one visible key for every handler ever seen.
+    /// Join the serialization domain for `handler`. The actual tombstone write
+    /// is flushed just before commit so the transaction primary stays on the
+    /// real lock metadata whenever this transaction has ordinary mutations.
+    /// Idempotent within a transaction. A delete is enough — optimistic conflict
+    /// detection keys on the MVCC write, not on a live value, and using a
+    /// tombstone avoids accumulating one visible key for every handler ever
+    /// seen.
     pub async fn serialize_handler(&mut self, handler: &str) -> anyhow::Result<()> {
-        if self.serialized.insert(handler.to_string()) {
-            self.txn.delete(serialize_key(handler).into_bytes()).await?;
-        }
+        self.serialized.insert(handler.to_string());
         Ok(())
     }
 
@@ -425,6 +424,10 @@ impl Tx {
     }
 
     pub async fn commit(&mut self) -> anyhow::Result<()> {
+        if let Err(e) = self.flush_serialization().await {
+            let _ = self.rollback().await;
+            return Err(e);
+        }
         self.txn.commit().await?;
         Ok(())
     }
@@ -439,6 +442,17 @@ impl Tx {
             None => Ok(None),
             Some(b) => Ok(Some(decode(&b)?)),
         }
+    }
+
+    async fn flush_serialization(&mut self) -> anyhow::Result<()> {
+        let mut handlers: Vec<String> = self.serialized.drain().collect();
+        handlers.sort();
+        for handler in handlers {
+            self.txn
+                .delete(serialize_key(&handler).into_bytes())
+                .await?;
+        }
+        Ok(())
     }
 
     async fn raw_put(&mut self, key: &str, v: &Stored) -> anyhow::Result<()> {
@@ -719,6 +733,65 @@ async fn begin_warn(client: &TransactionClient) -> anyhow::Result<Transaction> {
         .await?)
 }
 
+async fn gc_retry_or_skip(
+    err: anyhow::Error,
+    attempt: &mut u32,
+    op: &'static str,
+) -> anyhow::Result<bool> {
+    if !is_retryable(&err) {
+        return Err(err);
+    }
+
+    if *attempt < MAX_RETRY {
+        *attempt += 1;
+        tracing::debug!(op, attempt = *attempt, error = %err, "gc retrying transient TiKV error");
+        backoff(*attempt).await;
+        return Ok(true);
+    }
+
+    tracing::debug!(
+        op,
+        attempts = *attempt,
+        error = %err,
+        "gc skipped after transient TiKV error"
+    );
+    Ok(false)
+}
+
+async fn gc_scan_page(
+    client: &TransactionClient,
+    cursor: &[u8],
+    end: &[u8],
+    page: u32,
+) -> anyhow::Result<Option<Vec<tikv_client::KvPair>>> {
+    let mut attempt = 0;
+    loop {
+        let mut scan_txn = match begin_warn(client).await {
+            Ok(txn) => txn,
+            Err(e) => {
+                if gc_retry_or_skip(e, &mut attempt, "begin scan").await? {
+                    continue;
+                }
+                return Ok(None);
+            }
+        };
+        let start = Key::from(cursor.to_vec());
+        let upper = Key::from(end.to_vec());
+        let pairs = scan_txn.scan(start..upper, page).await;
+        let _ = scan_txn.rollback().await;
+
+        match pairs {
+            Ok(s) => return Ok(Some(s.collect())),
+            Err(e) => {
+                if gc_retry_or_skip(e.into(), &mut attempt, "scan page").await? {
+                    continue;
+                }
+                return Ok(None);
+            }
+        }
+    }
+}
+
 pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u64> {
     let now = cluster_now_ms(client).await?;
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
@@ -726,17 +799,9 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     let mut deleted: u64 = 0;
 
     loop {
-        let mut scan_txn = begin_warn(client).await?;
-        let start = Key::from(cursor.clone());
-        let upper = Key::from(end.clone());
-        let pairs: Vec<tikv_client::KvPair> = match scan_txn.scan(start..upper, page).await {
-            Ok(s) => s.collect(),
-            Err(e) => {
-                let _ = scan_txn.rollback().await;
-                return Err(e.into());
-            }
+        let Some(pairs) = gc_scan_page(client, &cursor, &end, page).await? else {
+            break;
         };
-        let _ = scan_txn.rollback().await;
 
         if pairs.is_empty() {
             break;
@@ -792,11 +857,18 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
             }
 
             if chunk_deleted > 0 {
-                if txn.commit().await.is_ok() {
-                    deleted += chunk_deleted;
-                } else {
-                    // Explicitly roll back if commit fails to appease the client drop checker
-                    let _ = txn.rollback().await;
+                match txn.commit().await {
+                    Ok(_) => deleted += chunk_deleted,
+                    Err(e) => {
+                        let err: anyhow::Error = e.into();
+                        if !is_retryable(&err) {
+                            let _ = txn.rollback().await;
+                            return Err(err);
+                        }
+                        tracing::debug!(error = %err, "gc skipped expired-key chunk after transient commit error");
+                        // Explicitly roll back if commit fails to appease the client drop checker.
+                        let _ = txn.rollback().await;
+                    }
                 }
             } else {
                 // Explicitly clean up empty transactions
@@ -908,7 +980,9 @@ mod tests {
 
         assert!(tikv_error_retryable(&key_err()));
         // TiKV wraps it in MultipleKeyErrors on commit / lock-resolve.
-        assert!(tikv_error_retryable(&Error::MultipleKeyErrors(vec![key_err()])));
+        assert!(tikv_error_retryable(&Error::MultipleKeyErrors(vec![
+            key_err()
+        ])));
         // And through the public, anyhow-based entry point used by `txn_retry!`.
         assert!(is_retryable(&anyhow::Error::new(Error::MultipleKeyErrors(
             vec![key_err()]
@@ -918,6 +992,24 @@ mod tests {
         assert!(!tikv_error_retryable(&Error::KeyError(Box::new(
             ProtoKeyError::default()
         ))));
+    }
+
+    #[tokio::test]
+    async fn gc_retryable_error_is_skipped_after_budget() {
+        use tikv_client::{Error, ProtoKeyError};
+
+        let mut attempt = MAX_RETRY;
+        let err = anyhow::Error::new(Error::MultipleKeyErrors(vec![Error::KeyError(Box::new(
+            ProtoKeyError {
+                txn_not_found: Some(Default::default()),
+                ..Default::default()
+            },
+        ))]));
+
+        let retry = gc_retry_or_skip(err, &mut attempt, "test").await.unwrap();
+
+        assert!(!retry);
+        assert_eq!(attempt, MAX_RETRY);
     }
 
     #[test]
