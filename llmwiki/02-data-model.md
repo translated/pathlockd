@@ -20,6 +20,7 @@ All lock metadata lives under the `fslock:` prefix. A *path* is
 | `fslock:idx:rddesc:<anc>` | `Set` of descendant paths | read locks somewhere under `<anc>` |
 | `fslock:fencing:counter` | `Counter` | the monotonic fencing-token source |
 | `pathlockd:__serialize__:<handler>` | (tombstone only) | per-handler serialization key (never read as a value) |
+| `pathlockd:gc:<name>` | `Str` = replica id | short background-GC coordination lease |
 
 The descendant indexes (`idx:wrdesc` / `idx:rddesc`) are what make a write-lock's
 subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
@@ -29,8 +30,7 @@ subtree conflict check O(subtree) instead of O(keyspace): a write at `/a` reads
 
 ```rust
 enum Stored {
-    Str { v: String, exp: u64 },          // wr / fence / alive / wait
-    Set { m: BTreeMap<String, u64> },     // rd / own / idx:*  (member -> exp)
+    Str { v: String, exp: u64 },          // wr / fence / alive / wait / set member
     Counter { v: i64 },                   // fencing:counter (never expires)
 }
 ```
@@ -58,6 +58,12 @@ keyspace from an older build must be flushed before upgrading.)
 - **Active expiry (housekeeping):** `gc_once` periodically scans the `fslock:`
   range and deletes elapsed entries to reclaim space. Default interval: 1s. It is
   best-effort and never required for correctness.
+- **TiKV MVCC GC (storage housekeeping):** `mvcc_gc_once` periodically advances
+  TiKV's transactional safepoint behind PD time. This reclaims old MVCC
+  versions/tombstones from transactions; it is separate from deleting expired
+  logical `fslock:` keys.
+- **Replica coordination:** logical and MVCC GC loops first acquire a short
+  `pathlockd:gc:*` lease, so scaled pathlockd replicas do not all sweep at once.
 
 ## Atomicity & serialization
 

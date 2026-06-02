@@ -10,8 +10,7 @@
 //!   `fslock:rd:...`, `fslock:own:...`, `fslock:idx:wrdesc:...`, etc.) so the
 //!   ancestor walk is a pure string operation.
 //! * Values are a tagged [`Stored`] enum: a `Str` (with an absolute expiry) or a
-//!   non-expiring `Counter`. Older deployments may still contain legacy `Set`
-//!   values; mutating set operations migrate those to the member-key layout.
+//!   non-expiring `Counter`.
 //! * **TTL is emulated**: writers stamp an absolute `expires_at` (ms since
 //!   epoch). Reads treat an elapsed entry as absent (*lazy expiry*, which gives
 //!   correctness), and a background [`gc_once`] sweep reclaims the bytes
@@ -38,7 +37,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tikv_client::{CheckLevel, Key, Transaction, TransactionClient, TransactionOptions};
+use tikv_client::{CheckLevel, Key, Timestamp, Transaction, TransactionClient, TransactionOptions};
 
 /// Shared key prefix for all lock metadata.
 pub const PREFIX: &str = "fslock:";
@@ -54,7 +53,8 @@ pub const PREFIX: &str = "fslock:";
 /// These keys live OUTSIDE the `fslock:` data range; only their MVCC tombstones
 /// matter.
 pub const SERIALIZE_PREFIX: &str = "pathlockd:__serialize__:";
-/// Legacy/debug fencing-token counter key. Public token issuance now uses PD TSO.
+const GC_LEASE_PREFIX: &str = "pathlockd:gc:";
+/// Debug fencing-token counter key. Public token issuance uses PD TSO.
 pub const FENCING_COUNTER_KEY: &str = "fslock:fencing:counter";
 
 /// Fence keys live far longer than lock keys so a stale token is still
@@ -106,6 +106,10 @@ pub fn serialize_key(handler: &str) -> String {
     format!("{SERIALIZE_PREFIX}{handler}")
 }
 
+fn gc_lease_key(name: &str) -> String {
+    format!("{GC_LEASE_PREFIX}{name}")
+}
+
 /// The handler segment of a path form `"<handler>:<path>"` (everything before
 /// the first `:`); the whole string if there is no `:`.
 pub fn handler_of(path: &str) -> &str {
@@ -115,30 +119,18 @@ pub fn handler_of(path: &str) -> &str {
     }
 }
 
-/// A stored value. Set members each carry their own absolute expiry.
+/// A stored value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Stored {
-    Str {
-        v: String,
-        exp: u64,
-    },
-    /// Legacy set value from pre-member-key storage; mutating set operations
-    /// migrate it to `fslock:setm:*` keys.
-    Set {
-        m: BTreeMap<String, u64>,
-    },
-    Counter {
-        v: i64,
-    },
+    Str { v: String, exp: u64 },
+    Counter { v: i64 },
 }
 
 impl Stored {
-    /// The expiry used by the GC sweep to decide reclamation. A set is
-    /// reclaimable only once *every* member has elapsed.
+    /// The expiry used by the GC sweep to decide reclamation.
     fn exp(&self) -> u64 {
         match self {
             Stored::Str { exp, .. } => *exp,
-            Stored::Set { m } => set_exp(m),
             Stored::Counter { .. } => 0,
         }
     }
@@ -146,27 +138,9 @@ impl Stored {
     fn kind(&self) -> &'static str {
         match self {
             Stored::Str { .. } => "string",
-            Stored::Set { .. } => "set",
             Stored::Counter { .. } => "counter",
         }
     }
-}
-
-/// Derived whole-set expiry for GC: `0` (never) if any member never expires,
-/// the max member expiry otherwise, and `1` (always-elapsed) for an empty set so
-/// a stray empty set still gets reclaimed.
-fn set_exp(m: &BTreeMap<String, u64>) -> u64 {
-    if m.is_empty() {
-        return 1;
-    }
-    let mut max = 0u64;
-    for &e in m.values() {
-        if e == 0 {
-            return 0;
-        }
-        max = max.max(e);
-    }
-    max
 }
 
 /// Extend-only merge of an existing member expiry with a new one. `0` means
@@ -228,12 +202,6 @@ fn encode(s: &Stored) -> Vec<u8> {
 fn decode(b: &[u8]) -> anyhow::Result<Stored> {
     let (v, _) = bincode::serde::decode_from_slice(b, bincode::config::standard())?;
     Ok(v)
-}
-
-fn parse_counter_string(key: &str, value: &str) -> anyhow::Result<i64> {
-    value
-        .parse::<i64>()
-        .map_err(|e| anyhow::anyhow!("key {key} has invalid counter value {value:?}: {e}"))
 }
 
 /// Retry transient TiKV errors only. Logic outcomes are values, not errors, so
@@ -510,7 +478,6 @@ impl Tx {
     pub async fn incr(&mut self, key: &str) -> anyhow::Result<i64> {
         let cur = match self.raw_get(key).await? {
             Some(Stored::Counter { v }) => v,
-            Some(Stored::Str { v, .. }) => parse_counter_string(key, &v)?,
             Some(other) => {
                 anyhow::bail!("key {key} has type {}, expected counter", other.kind())
             }
@@ -526,7 +493,6 @@ impl Tx {
     pub async fn get_counter(&mut self, key: &str) -> anyhow::Result<i64> {
         Ok(match self.raw_get(key).await? {
             Some(Stored::Counter { v }) => v,
-            Some(Stored::Str { v, .. }) => parse_counter_string(key, &v)?,
             Some(other) => {
                 anyhow::bail!("key {key} has type {}, expected counter", other.kind())
             }
@@ -539,26 +505,6 @@ impl Tx {
     }
 
     // --- set ops (rd / own / idx:wrdesc / idx:rddesc) ---
-
-    async fn load_legacy_set(
-        &mut self,
-        key: &str,
-    ) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-        match self.raw_get(key).await? {
-            Some(Stored::Set { m }) => {
-                let now = self.now;
-                let live: BTreeMap<String, u64> =
-                    m.into_iter().filter(|(_, e)| !expired(*e, now)).collect();
-                if live.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(live))
-                }
-            }
-            None => Ok(None),
-            Some(other) => anyhow::bail!("key {key} has type {}, expected set", other.kind()),
-        }
-    }
 
     async fn scan_set_members(&mut self, key: &str) -> anyhow::Result<BTreeMap<String, u64>> {
         let prefix = set_member_prefix(key);
@@ -610,40 +556,10 @@ impl Tx {
         Ok(live)
     }
 
-    async fn migrate_legacy_set(&mut self, key: &str) -> anyhow::Result<()> {
-        let legacy = match self.raw_get(key).await? {
-            Some(Stored::Set { m }) => m,
-            None => return Ok(()),
-            Some(other) => anyhow::bail!("key {key} has type {}, expected set", other.kind()),
-        };
-
-        for (member, exp) in legacy {
-            if !expired(exp, self.now) {
-                let mk = set_member_key(key, &member);
-                self.raw_put(
-                    &mk,
-                    &Stored::Str {
-                        v: "1".to_string(),
-                        exp,
-                    },
-                )
-                .await?;
-            }
-        }
-        self.del(key).await?;
-        Ok(())
-    }
-
     /// Load the *live* members of a set (expired members filtered out). Returns
     /// `None` when the key is absent or has no live members.
     async fn load_set(&mut self, key: &str) -> anyhow::Result<Option<BTreeMap<String, u64>>> {
-        let mut live = self.scan_set_members(key).await?;
-        if let Some(legacy) = self.load_legacy_set(key).await? {
-            for (member, exp) in legacy {
-                let merged = merge_exp(live.get(&member).copied(), exp);
-                live.insert(member, merged);
-            }
-        }
+        let live = self.scan_set_members(key).await?;
         if live.is_empty() {
             Ok(None)
         } else {
@@ -655,7 +571,6 @@ impl Tx {
     /// re-adding is extend-only (never shortens). Rewriting also drops any
     /// already-expired members, bounding set growth.
     pub async fn sadd(&mut self, key: &str, member: &str, ttl_ms: u64) -> anyhow::Result<()> {
-        self.migrate_legacy_set(key).await?;
         let mk = set_member_key(key, member);
         let new = expiry_at(self.now, ttl_ms);
         let existing = match self.raw_get(&mk).await? {
@@ -676,8 +591,44 @@ impl Tx {
 
     /// `SREM key member`.
     pub async fn srem(&mut self, key: &str, member: &str) -> anyhow::Result<()> {
-        self.migrate_legacy_set(key).await?;
         self.del(&set_member_key(key, member)).await?;
+        Ok(())
+    }
+
+    /// Delete a whole logical set by removing every per-member key.
+    pub async fn del_set(&mut self, key: &str) -> anyhow::Result<()> {
+        let prefix = set_member_prefix(key);
+        let upper = set_member_upper(&prefix);
+        let mut cursor = prefix.as_bytes().to_vec();
+
+        loop {
+            let pairs: Vec<tikv_client::KvPair> = self
+                .txn
+                .scan(
+                    Key::from(cursor.clone())..Key::from(upper.clone()),
+                    SET_SCAN_PAGE,
+                )
+                .await?
+                .collect();
+            if pairs.is_empty() {
+                break;
+            }
+
+            let got = pairs.len();
+            let mut last_key = Vec::new();
+            for pair in pairs {
+                let kb: Vec<u8> = pair.key().clone().into();
+                last_key = kb.clone();
+                self.txn.delete(kb).await?;
+            }
+
+            if got < SET_SCAN_PAGE as usize {
+                break;
+            }
+            cursor = last_key;
+            cursor.push(0);
+        }
+
         Ok(())
     }
 
@@ -705,7 +656,6 @@ impl Tx {
     /// only for the owner set, whose members all share that owner's single
     /// lease.
     pub async fn pexpire_set(&mut self, key: &str, ttl_ms: u64) -> anyhow::Result<()> {
-        self.migrate_legacy_set(key).await?;
         let members = self.scan_set_members(key).await?;
         let exp = expiry_at(self.now, ttl_ms);
         for member in members.into_keys() {
@@ -733,7 +683,7 @@ async fn begin_warn(client: &TransactionClient) -> anyhow::Result<Transaction> {
         .await?)
 }
 
-async fn gc_retry_or_skip(
+async fn gc_retry_or_fail(
     err: anyhow::Error,
     attempt: &mut u32,
     op: &'static str,
@@ -753,9 +703,9 @@ async fn gc_retry_or_skip(
         op,
         attempts = *attempt,
         error = %err,
-        "gc skipped after transient TiKV error"
+        "gc retry budget exhausted after transient TiKV error"
     );
-    Ok(false)
+    Err(err)
 }
 
 async fn gc_scan_page(
@@ -763,16 +713,16 @@ async fn gc_scan_page(
     cursor: &[u8],
     end: &[u8],
     page: u32,
-) -> anyhow::Result<Option<Vec<tikv_client::KvPair>>> {
+) -> anyhow::Result<Vec<tikv_client::KvPair>> {
     let mut attempt = 0;
     loop {
         let mut scan_txn = match begin_warn(client).await {
             Ok(txn) => txn,
             Err(e) => {
-                if gc_retry_or_skip(e, &mut attempt, "begin scan").await? {
+                if gc_retry_or_fail(e, &mut attempt, "begin scan").await? {
                     continue;
                 }
-                return Ok(None);
+                unreachable!("gc_retry_or_fail either retries or returns Err");
             }
         };
         let start = Key::from(cursor.to_vec());
@@ -781,12 +731,83 @@ async fn gc_scan_page(
         let _ = scan_txn.rollback().await;
 
         match pairs {
-            Ok(s) => return Ok(Some(s.collect())),
+            Ok(s) => return Ok(s.collect()),
             Err(e) => {
-                if gc_retry_or_skip(e.into(), &mut attempt, "scan page").await? {
+                if gc_retry_or_fail(e.into(), &mut attempt, "scan page").await? {
                     continue;
                 }
-                return Ok(None);
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        }
+    }
+}
+
+async fn gc_delete_chunk(client: &TransactionClient, chunk: &[Vec<u8>]) -> anyhow::Result<u64> {
+    let mut attempt = 0;
+
+    'retry: loop {
+        let recheck = match cluster_now_ms(client).await {
+            Ok(now) => now,
+            Err(e) => {
+                if gc_retry_or_fail(e, &mut attempt, "timestamp expired chunk").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        };
+        let mut txn = match begin_warn(client).await {
+            Ok(txn) => txn,
+            Err(e) => {
+                if gc_retry_or_fail(e, &mut attempt, "begin expired chunk").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        };
+        let mut chunk_deleted: u64 = 0;
+
+        for kb in chunk {
+            match txn.get(kb.clone()).await {
+                Ok(Some(v)) => {
+                    if let Ok(s) = decode(&v) {
+                        if expired(s.exp(), recheck) {
+                            if let Err(e) = txn.delete(kb.clone()).await {
+                                let _ = txn.rollback().await;
+                                if gc_retry_or_fail(e.into(), &mut attempt, "delete expired key")
+                                    .await?
+                                {
+                                    continue 'retry;
+                                }
+                                unreachable!("gc_retry_or_fail either retries or returns Err");
+                            }
+                            chunk_deleted += 1;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    if gc_retry_or_fail(e.into(), &mut attempt, "recheck expired key").await? {
+                        continue 'retry;
+                    }
+                    unreachable!("gc_retry_or_fail either retries or returns Err");
+                }
+            }
+        }
+
+        if chunk_deleted == 0 {
+            let _ = txn.rollback().await;
+            return Ok(0);
+        }
+
+        match txn.commit().await {
+            Ok(_) => return Ok(chunk_deleted),
+            Err(e) => {
+                let _ = txn.rollback().await;
+                if gc_retry_or_fail(e.into(), &mut attempt, "commit expired chunk").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
             }
         }
     }
@@ -799,9 +820,7 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     let mut deleted: u64 = 0;
 
     loop {
-        let Some(pairs) = gc_scan_page(client, &cursor, &end, page).await? else {
-            break;
-        };
+        let pairs = gc_scan_page(client, &cursor, &end, page).await?;
 
         if pairs.is_empty() {
             break;
@@ -822,58 +841,7 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
         // Delete this page's expired keys under a fresh re-check so a key a
         // concurrent refresh re-wrote is never reclaimed.
         for chunk in candidates.chunks(256) {
-            let recheck = cluster_now_ms(client).await?;
-            let mut txn = begin_warn(client).await?;
-            let mut chunk_deleted: u64 = 0;
-            let mut chunk_failed = false;
-
-            for kb in chunk {
-                // Catch errors on individual keys instead of short-circuiting with `?`
-                match txn.get(kb.clone()).await {
-                    Ok(Some(v)) => {
-                        if let Ok(s) = decode(&v) {
-                            if expired(s.exp(), recheck) {
-                                if let Err(e) = txn.delete(kb.clone()).await {
-                                    tracing::warn!(error = %e, "gc delete failed, skipping chunk");
-                                    chunk_failed = true;
-                                    break;
-                                }
-                                chunk_deleted += 1;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        // Log unresolvable locks (like TxnNotFound) as debug info
-                        // and skip this specific key so it doesn't crash the entire sweep.
-                        tracing::debug!(error = %e, "gc skipped unresolvable key lock");
-                    }
-                }
-            }
-
-            if chunk_failed {
-                let _ = txn.rollback().await;
-                continue;
-            }
-
-            if chunk_deleted > 0 {
-                match txn.commit().await {
-                    Ok(_) => deleted += chunk_deleted,
-                    Err(e) => {
-                        let err: anyhow::Error = e.into();
-                        if !is_retryable(&err) {
-                            let _ = txn.rollback().await;
-                            return Err(err);
-                        }
-                        tracing::debug!(error = %err, "gc skipped expired-key chunk after transient commit error");
-                        // Explicitly roll back if commit fails to appease the client drop checker.
-                        let _ = txn.rollback().await;
-                    }
-                }
-            } else {
-                // Explicitly clean up empty transactions
-                let _ = txn.rollback().await;
-            }
+            deleted += gc_delete_chunk(client, chunk).await?;
         }
 
         if got < page as usize {
@@ -886,29 +854,174 @@ pub async fn gc_once(client: &TransactionClient, page: u32) -> anyhow::Result<u6
     Ok(deleted)
 }
 
+fn mvcc_gc_safepoint(current: Timestamp, retention_ms: u64) -> Option<Timestamp> {
+    let retention_ms = i64::try_from(retention_ms).unwrap_or(i64::MAX);
+    if current.physical <= retention_ms {
+        return None;
+    }
+    Some(Timestamp {
+        physical: current.physical - retention_ms,
+        logical: 0,
+        ..Default::default()
+    })
+}
+
+/// Advance TiKV's transactional MVCC GC safepoint.
+///
+/// [`gc_once`] removes expired logical lock keys. This function asks TiKV to
+/// reclaim old MVCC versions/tombstones below a safepoint derived from PD time.
+/// The retention window must exceed any in-flight transaction age.
+pub async fn mvcc_gc_once(
+    client: &TransactionClient,
+    safe_point_retention_ms: u64,
+) -> anyhow::Result<bool> {
+    if safe_point_retention_ms == 0 {
+        anyhow::bail!("mvcc gc retention must be > 0");
+    }
+
+    let current = client.current_timestamp().await?;
+    let Some(safepoint) = mvcc_gc_safepoint(current, safe_point_retention_ms) else {
+        return Ok(false);
+    };
+
+    let mut attempt = 0;
+    loop {
+        match client.gc(safepoint.clone()).await {
+            Ok(updated) => return Ok(updated),
+            Err(e) => {
+                if gc_retry_or_fail(e.into(), &mut attempt, "tikv mvcc gc").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        }
+    }
+}
+
+/// Try to acquire or refresh a cluster-wide background-job lease.
+///
+/// This keeps every pathlockd replica from running expensive cluster-wide
+/// housekeeping at once. The lease is deliberately outside `fslock:` so it is not
+/// user lock state and is not counted/flushed with test lock data.
+pub async fn try_acquire_gc_lease(
+    client: &TransactionClient,
+    name: &str,
+    owner: &str,
+    ttl_ms: u64,
+) -> anyhow::Result<bool> {
+    if name.is_empty() {
+        anyhow::bail!("gc lease name must not be empty");
+    }
+    if owner.is_empty() {
+        anyhow::bail!("gc lease owner must not be empty");
+    }
+    if ttl_ms == 0 {
+        anyhow::bail!("gc lease ttl must be > 0");
+    }
+
+    let key = gc_lease_key(name);
+    txn_retry!(client, tx => {
+        async {
+            match tx.get_str(&key).await? {
+                Some(current) if current != owner => Ok(false),
+                _ => {
+                    tx.set_str(&key, owner, ttl_ms).await?;
+                    Ok(true)
+                }
+            }
+        }
+        .await
+    })
+}
+
+async fn flush_delete_keys(client: &TransactionClient, keys: &[Vec<u8>]) -> anyhow::Result<u64> {
+    let mut attempt = 0;
+
+    'retry: loop {
+        let mut txn = match begin_warn(client).await {
+            Ok(txn) => txn,
+            Err(e) => {
+                if gc_retry_or_fail(e, &mut attempt, "begin flush chunk").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        };
+
+        for kb in keys {
+            if let Err(e) = txn.delete(kb.clone()).await {
+                let _ = txn.rollback().await;
+                if gc_retry_or_fail(e.into(), &mut attempt, "delete flush key").await? {
+                    continue 'retry;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        }
+
+        match txn.commit().await {
+            Ok(_) => return Ok(keys.len() as u64),
+            Err(e) => {
+                let _ = txn.rollback().await;
+                if gc_retry_or_fail(e.into(), &mut attempt, "commit flush chunk").await? {
+                    continue;
+                }
+                unreachable!("gc_retry_or_fail either retries or returns Err");
+            }
+        }
+    }
+}
+
+async fn unsafe_destroy_lock_range(client: &TransactionClient) -> anyhow::Result<()> {
+    let start = Key::from(PREFIX.as_bytes().to_vec());
+    let end = Key::from(b"fslock;".to_vec());
+    client.unsafe_destroy_range(start..end).await?;
+    Ok(())
+}
+
+async fn flush_fallback_destroy(
+    client: &TransactionClient,
+    deleted: u64,
+    err: anyhow::Error,
+) -> anyhow::Result<u64> {
+    let original = err.to_string();
+    tracing::warn!(
+        deleted,
+        error = %original,
+        "transactional flush failed after retries; destroying fslock range"
+    );
+    unsafe_destroy_lock_range(client).await.map_err(|destroy_err| {
+        anyhow::anyhow!(
+            "transactional flush failed after retries ({original}); fslock range destroy failed: {destroy_err}"
+        )
+    })?;
+    Ok(deleted)
+}
+
 /// Delete every `fslock:` key (used by the debug `Flush` RPC for test isolation).
 pub async fn flush_all(client: &TransactionClient) -> anyhow::Result<u64> {
     let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
     let end: Vec<u8> = b"fslock;".to_vec();
     let mut deleted: u64 = 0;
     loop {
-        let mut txn = begin_warn(client).await?;
-        let start = Key::from(cursor.clone());
-        let upper = Key::from(end.clone());
-        let pairs: Vec<tikv_client::KvPair> = txn.scan(start..upper, 512).await?.collect();
+        let pairs = match gc_scan_page(client, &cursor, &end, 512).await {
+            Ok(pairs) => pairs,
+            Err(e) => return flush_fallback_destroy(client, deleted, e).await,
+        };
         if pairs.is_empty() {
-            let _ = txn.rollback().await;
             break;
         }
         let got = pairs.len();
         let mut last_key: Vec<u8> = Vec::new();
-        for p in &pairs {
+        let mut keys = Vec::with_capacity(pairs.len());
+        for p in pairs {
             let kb: Vec<u8> = p.key().clone().into();
             last_key = kb.clone();
-            txn.delete(kb).await?;
-            deleted += 1;
+            keys.push(kb);
         }
-        txn.commit().await?;
+        match flush_delete_keys(client, &keys).await {
+            Ok(n) => deleted += n,
+            Err(e) => return flush_fallback_destroy(client, deleted, e).await,
+        }
         if got < 512 {
             break;
         }
@@ -916,6 +1029,31 @@ pub async fn flush_all(client: &TransactionClient) -> anyhow::Result<u64> {
         cursor.push(0);
     }
     Ok(deleted)
+}
+
+/// Count visible live keys under the `fslock:` prefix.
+pub async fn count_all(client: &TransactionClient) -> anyhow::Result<u64> {
+    let mut cursor: Vec<u8> = PREFIX.as_bytes().to_vec();
+    let end: Vec<u8> = b"fslock;".to_vec();
+    let mut count: u64 = 0;
+    loop {
+        let pairs = gc_scan_page(client, &cursor, &end, 512).await?;
+        if pairs.is_empty() {
+            break;
+        }
+        let got = pairs.len();
+        let mut last_key: Vec<u8> = Vec::new();
+        for p in &pairs {
+            last_key = p.key().clone().into();
+            count += 1;
+        }
+        if got < 512 {
+            break;
+        }
+        cursor = last_key;
+        cursor.push(0);
+    }
+    Ok(count)
 }
 
 #[cfg(test)]
@@ -944,24 +1082,6 @@ mod tests {
         assert_eq!(merge_exp(Some(70), 50), 70); // never shortens
         assert_eq!(merge_exp(Some(50), 0), 0); // infinite wins
         assert_eq!(merge_exp(Some(0), 50), 0); // already infinite stays
-    }
-
-    #[test]
-    fn parse_counter_string_fails_closed_on_bad_values() {
-        assert_eq!(parse_counter_string("k", "42").unwrap(), 42);
-        let err = parse_counter_string("fslock:fencing:counter", "not-a-number").unwrap_err();
-        assert!(err.to_string().contains("fslock:fencing:counter"));
-    }
-
-    #[test]
-    fn set_exp_reclaimable_only_when_all_dead() {
-        let mut m = BTreeMap::new();
-        assert_eq!(set_exp(&m), 1); // empty → reclaim
-        m.insert("a".into(), 100);
-        m.insert("b".into(), 300);
-        assert_eq!(set_exp(&m), 300); // max member
-        m.insert("c".into(), 0);
-        assert_eq!(set_exp(&m), 0); // an immortal member → never reclaim
     }
 
     #[test]
@@ -995,7 +1115,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gc_retryable_error_is_skipped_after_budget() {
+    async fn gc_retryable_error_fails_after_budget() {
         use tikv_client::{Error, ProtoKeyError};
 
         let mut attempt = MAX_RETRY;
@@ -1006,10 +1126,33 @@ mod tests {
             },
         ))]));
 
-        let retry = gc_retry_or_skip(err, &mut attempt, "test").await.unwrap();
+        let out = gc_retry_or_fail(err, &mut attempt, "test").await;
 
-        assert!(!retry);
+        assert!(out.is_err());
         assert_eq!(attempt, MAX_RETRY);
+    }
+
+    #[test]
+    fn mvcc_gc_safepoint_keeps_retention_window() {
+        let current = Timestamp {
+            physical: 10_000,
+            logical: 42,
+            ..Default::default()
+        };
+
+        let safepoint = mvcc_gc_safepoint(current, 2_500).unwrap();
+
+        assert_eq!(safepoint.physical, 7_500);
+        assert_eq!(safepoint.logical, 0);
+        assert!(mvcc_gc_safepoint(
+            Timestamp {
+                physical: 1_000,
+                logical: 1,
+                ..Default::default()
+            },
+            2_500
+        )
+        .is_none());
     }
 
     #[test]

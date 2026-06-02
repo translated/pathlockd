@@ -180,7 +180,7 @@ async fn prune_dead_read_owners(tx: &mut Tx, rd: &str) -> anyhow::Result<Vec<Str
         }
     }
     if tx.scard(rd).await? == 0 {
-        tx.del(rd).await?;
+        tx.del_set(rd).await?;
     }
     Ok(alive)
 }
@@ -289,7 +289,7 @@ async fn find_descendant_write_conflict(
         }
     }
     if tx.scard(&idx).await? == 0 {
-        tx.del(&idx).await?;
+        tx.del_set(&idx).await?;
     }
     Ok(None)
 }
@@ -319,7 +319,7 @@ async fn find_descendant_read_conflict(
         }
     }
     if tx.scard(&idx).await? == 0 {
-        tx.del(&idx).await?;
+        tx.del_set(&idx).await?;
     }
     Ok(None)
 }
@@ -570,14 +570,14 @@ async fn acquire_inner(tx: &mut Tx, args: &AcquireArgs) -> anyhow::Result<Acquir
                 let rd = rd_key(path);
                 tx.srem(&rd, owner).await?;
                 if tx.scard(&rd).await? == 0 {
-                    tx.del(&rd).await?;
+                    tx.del_set(&rd).await?;
                     remove_descendant_indexes(tx, Mode::Read, path).await?;
                 }
             }
         }
 
         if tx.scard(&own_k).await? == 0 {
-            tx.del(&own_k).await?;
+            tx.del_set(&own_k).await?;
             tx.del(&alive_k).await?;
         }
     }
@@ -626,14 +626,14 @@ async fn release_inner(
             let rd = rd_key(path);
             tx.srem(&rd, owner).await?;
             if tx.scard(&rd).await? == 0 {
-                tx.del(&rd).await?;
+                tx.del_set(&rd).await?;
                 remove_descendant_indexes(tx, Mode::Read, path).await?;
             }
         }
     }
 
     if tx.scard(&own_k).await? == 0 {
-        tx.del(&own_k).await?;
+        tx.del_set(&own_k).await?;
         tx.del(&alive_k).await?;
     }
 
@@ -685,7 +685,7 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
                     let rd = rd_key(path);
                     tx.srem(&rd, owner).await?;
                     if tx.scard(&rd).await? == 0 {
-                        tx.del(&rd).await?;
+                        tx.del_set(&rd).await?;
                         remove_descendant_indexes(tx, Mode::Read, path).await?;
                     }
                 }
@@ -693,7 +693,7 @@ async fn release_all_inner(tx: &mut Tx, owner: &str, del_wait_key: bool) -> anyh
         }
     }
 
-    tx.del(&own_k).await?;
+    tx.del_set(&own_k).await?;
     tx.del(&alive_k).await?;
     if del_wait_key {
         tx.del(&wait_key(owner)).await?;
@@ -829,7 +829,7 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
                     let rd = rd_key(path);
                     tx.srem(&rd, victim).await?;
                     if tx.scard(&rd).await? == 0 {
-                        tx.del(&rd).await?;
+                        tx.del_set(&rd).await?;
                         remove_descendant_indexes(tx, Mode::Read, path).await?;
                     }
                 }
@@ -837,7 +837,7 @@ async fn force_release_inner(tx: &mut Tx, victim: &str) -> anyhow::Result<()> {
         }
     }
 
-    tx.del(&own_k).await?;
+    tx.del_set(&own_k).await?;
     tx.del(&alive_key(victim)).await?;
     tx.del(&wait_key(victim)).await?;
     Ok(())
@@ -896,49 +896,46 @@ fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata>) -
     )
 }
 
-fn parse_wait_edge(raw: String) -> WaitEdge {
+fn parse_wait_edge(raw: String) -> anyhow::Result<WaitEdge> {
     let Some(rest) = raw.strip_prefix(WAIT_EDGE_V1_PREFIX) else {
-        return WaitEdge {
+        return Ok(WaitEdge {
             conflict_owner: raw,
             metadata: None,
-        };
+        });
     };
 
-    let Some((owner_len, rest)) = parse_len_field(rest) else {
-        return legacy_wait_edge(raw);
-    };
-    let Some((path_len, rest)) = parse_len_field(rest) else {
-        return legacy_wait_edge(raw);
-    };
-    let Some((reason_len, payload)) = parse_len_field(rest) else {
-        return legacy_wait_edge(raw);
-    };
+    let (owner_len, rest) = parse_len_field(rest)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: missing owner length"))?;
+    let (path_len, rest) = parse_len_field(rest)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: missing path length"))?;
+    let (reason_len, payload) = parse_len_field(rest)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: missing reason length"))?;
 
     let total_len = owner_len
         .checked_add(path_len)
         .and_then(|v| v.checked_add(reason_len));
     if total_len != Some(payload.len()) {
-        return legacy_wait_edge(raw);
+        anyhow::bail!("malformed wait edge: payload length mismatch");
     }
 
     let owner_end = owner_len;
     let path_end = owner_end + path_len;
-    let Some(conflict_owner) = payload.get(..owner_end) else {
-        return legacy_wait_edge(raw);
-    };
-    let Some(conflict_path) = payload.get(owner_end..path_end) else {
-        return legacy_wait_edge(raw);
-    };
-    let Some(reason) = payload.get(path_end..) else {
-        return legacy_wait_edge(raw);
-    };
-    WaitEdge {
+    let conflict_owner = payload
+        .get(..owner_end)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: owner slice out of bounds"))?;
+    let conflict_path = payload
+        .get(owner_end..path_end)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: path slice out of bounds"))?;
+    let reason = payload
+        .get(path_end..)
+        .ok_or_else(|| anyhow::anyhow!("malformed wait edge: reason slice out of bounds"))?;
+    Ok(WaitEdge {
         conflict_owner: conflict_owner.to_string(),
         metadata: Some(WaitEdgeMetadata {
             conflict_path: conflict_path.to_string(),
             reason: reason.to_string(),
         }),
-    }
+    })
 }
 
 fn parse_len_field(input: &str) -> Option<(usize, &str)> {
@@ -947,13 +944,6 @@ fn parse_len_field(input: &str) -> Option<(usize, &str)> {
         return None;
     }
     Some((len.parse::<usize>().ok()?, rest))
-}
-
-fn legacy_wait_edge(raw: String) -> WaitEdge {
-    WaitEdge {
-        conflict_owner: raw,
-        metadata: None,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -989,7 +979,7 @@ async fn detect_cycle_inner(
 
         let edge = match tx.get_str(&wait_key(&current)).await? {
             None => return Ok(CycleOutcome::None), // end of wait chain
-            Some(raw) => parse_wait_edge(raw),
+            Some(raw) => parse_wait_edge(raw)?,
         };
         let next = edge.conflict_owner;
 
@@ -1062,7 +1052,7 @@ async fn is_blocking_inner(
         // Owner is dead: prune so future acquires don't see it.
         tx.srem(&rd, conflict_owner).await?;
         if tx.scard(&rd).await? == 0 {
-            tx.del(&rd).await?;
+            tx.del_set(&rd).await?;
             remove_descendant_indexes(tx, Mode::Read, conflict_path).await?;
         }
         return Ok(false);
@@ -1158,7 +1148,7 @@ pub async fn debug_expire_owner(client: &TransactionClient, owner: &str) -> anyh
     txn_retry!(client, tx => {
         async {
             tx.del(&alive_key(owner)).await?;
-            tx.del(&own_key(owner)).await?;
+            tx.del_set(&own_key(owner)).await?;
             Ok::<(), anyhow::Error>(())
         }.await
     })
@@ -1177,7 +1167,7 @@ pub async fn debug_delete_lock_key(
                 Mode::Write => tx.del(&wr_key(path)).await?,
                 Mode::Read => match &owner {
                     Some(o) => tx.srem(&rd_key(path), o).await?,
-                    None => tx.del(&rd_key(path)).await?,
+                    None => tx.del_set(&rd_key(path)).await?,
                 },
             }
             Ok::<(), anyhow::Error>(())
@@ -1322,7 +1312,8 @@ mod tests {
                 conflict_path: "h:/a/b".into(),
                 reason: "descendant_write_locked".into(),
             }),
-        ));
+        ))
+        .unwrap();
         assert_eq!(edge.conflict_owner, "owner:with:colons");
         assert_eq!(
             edge.metadata,
@@ -1334,9 +1325,15 @@ mod tests {
     }
 
     #[test]
-    fn wait_edge_parser_keeps_legacy_values() {
-        let edge = parse_wait_edge("plain-owner".into());
+    fn wait_edge_parser_keeps_bare_owner_values() {
+        let edge = parse_wait_edge("plain-owner".into()).unwrap();
         assert_eq!(edge.conflict_owner, "plain-owner");
         assert_eq!(edge.metadata, None);
+    }
+
+    #[test]
+    fn wait_edge_parser_rejects_malformed_versioned_values() {
+        let err = parse_wait_edge(format!("{WAIT_EDGE_V1_PREFIX}3:1:1:too-short")).unwrap_err();
+        assert!(err.to_string().contains("malformed wait edge"));
     }
 }

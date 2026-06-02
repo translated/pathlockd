@@ -49,6 +49,11 @@ clients ──gRPC──▶ pathlockd (N stateless replicas) ──▶ TiKV clus
 - Single-key operations (`IncrFencingToken`, `SetWaitEdge`, `ClearWaitEdge`) and
   read-only checks (`AssertFencing`, `IsOwnerAlive`) skip serialization too;
   TiKV already orders per-key access.
+- Cluster-wide housekeeping is lease-coordinated in TiKV. Every replica may wake
+  its logical-GC / MVCC-GC loop, but only the holder of the short
+  `pathlockd:gc:*` lease runs a sweep on that tick. This avoids N replicas
+  repeatedly scanning the same keyspace while preserving failover when the holder
+  exits.
 
 ## Liveness without a heartbeat thread on the server
 

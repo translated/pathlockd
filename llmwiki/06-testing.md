@@ -9,10 +9,12 @@ volumes for fast reruns.
 | --- | --- |
 | `scripts/test-unit.sh` | `cargo test --lib --bins` in a container — the in-source `#[cfg(test)]` modules. No cluster needed. |
 | `scripts/test-integration.sh` | brings up PD + TiKV (via `infra.sh`) and runs the engine integration tests in a container joined to the dev network. |
+| `scripts/test-e2e-stress.sh` | brings up PD + TiKV, starts the daemon from the compiled test binary, drives gRPC load, and verifies GC drain. |
 | `scripts/infra.sh` | lifecycle for the local TiKV cluster: `up` / `wait` / `status` / `logs` / `down` / `reset`. |
 
-Both test scripts forward extra args to the test (e.g. a name filter):
-`scripts/test-unit.sh handler_of`, `scripts/test-integration.sh fencing`.
+Test scripts forward extra args to the test (e.g. a name filter):
+`scripts/test-unit.sh handler_of`, `scripts/test-integration.sh fencing`,
+`scripts/test-e2e-stress.sh daemon_gc`.
 
 ## Unit tests (in-source `#[cfg(test)]`)
 
@@ -51,6 +53,21 @@ with the cargo registry/target cached in volumes for fast reruns.
 On a native-Linux host you can instead publish PD/TiKV ports and run
 `PATHLOCKD_PD_ENDPOINTS=127.0.0.1:2379 cargo test --test engine_integration --
 --test-threads=1` directly.
+
+## Daemon e2e stress (`tests/e2e_stress.rs`)
+
+Starts multiple peered `pathlockd` replicas with debug enabled, logical GC at
+1s, TiKV MVCC GC at 1s, checks cross-replica release-event fan-out, then creates
+many short-lived read locks over gRPC. The test waits for the logical `fslock:`
+keyspace to drain without resetting TiKV volumes.
+
+```bash
+./scripts/test-e2e-stress.sh
+PATHLOCKD_E2E_STRESS_REPLICAS=3 ./scripts/test-e2e-stress.sh
+PATHLOCKD_E2E_STRESS_WORKERS=32 PATHLOCKD_E2E_STRESS_OPS_PER_WORKER=1000 \
+  ./scripts/test-e2e-stress.sh
+PATHLOCKD_E2E_STRESS_HANDLERS=1 ./scripts/test-e2e-stress.sh  # one hot handler
+```
 
 ## Manual smoke
 

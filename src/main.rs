@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use tikv_client::TransactionClient;
 use tonic::transport::{Endpoint, Server};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use pathlockd::config::Config;
 use pathlockd::events::Broadcaster;
@@ -15,6 +15,7 @@ use pathlockd::service::{DebugService, PathLockService};
 use pathlockd::{otel, store};
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const GC_COORDINATION_LEASE_MS: u64 = 30_000;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,6 +33,9 @@ async fn main() -> anyhow::Result<()> {
         listen = %cfg.listen,
         pd_endpoints = ?cfg.pd_endpoints,
         peers = ?cfg.peers,
+        gc_interval_secs = cfg.gc_interval_secs,
+        mvcc_gc_interval_secs = cfg.mvcc_gc_interval_secs,
+        mvcc_gc_safe_point_retention_secs = cfg.mvcc_gc_safe_point_retention_secs,
         request_timeout_ms = cfg.request_timeout_ms,
         max_concurrent_requests_per_connection = cfg.max_concurrent_requests_per_connection,
         debug = cfg.enable_debug,
@@ -45,10 +49,12 @@ async fn main() -> anyhow::Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("connecting to TiKV PD {:?}: {e}", cfg.pd_endpoints))?,
     );
+    let instance_id = runtime_instance_id(&cfg.listen);
     let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
 
     if cfg.gc_interval_secs > 0 {
         let gc_client = client.clone();
+        let gc_instance = instance_id.clone();
         let interval = cfg.gc_interval_secs;
         let page = cfg.gc_page;
         tokio::spawn(async move {
@@ -57,6 +63,25 @@ async fn main() -> anyhow::Result<()> {
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
+                match store::try_acquire_gc_lease(
+                    &gc_client,
+                    "logical",
+                    &gc_instance,
+                    GC_COORDINATION_LEASE_MS,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!("logical gc skipped; another replica holds the gc lease");
+                        continue;
+                    }
+                    Err(e) => {
+                        otel::record_gc_sweep(0, Duration::ZERO, false);
+                        error!(error = %e, "logical gc lease acquisition failed");
+                        continue;
+                    }
+                }
                 let started = Instant::now();
                 match store::gc_once(&gc_client, page).await {
                     Ok(n) if n > 0 => {
@@ -69,6 +94,52 @@ async fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         otel::record_gc_sweep(0, started.elapsed(), false);
                         error!(error = %e, "gc sweep failed");
+                    }
+                }
+            }
+        });
+    }
+    if cfg.mvcc_gc_interval_secs > 0 {
+        let gc_client = client.clone();
+        let gc_instance = instance_id.clone();
+        let interval = cfg.mvcc_gc_interval_secs;
+        let retention_ms = cfg.mvcc_gc_safe_point_retention_secs.saturating_mul(1000);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(interval));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                match store::try_acquire_gc_lease(
+                    &gc_client,
+                    "mvcc",
+                    &gc_instance,
+                    GC_COORDINATION_LEASE_MS,
+                )
+                .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        debug!("tikv mvcc gc skipped; another replica holds the gc lease");
+                        continue;
+                    }
+                    Err(e) => {
+                        error!(error = %e, "tikv mvcc gc lease acquisition failed");
+                        continue;
+                    }
+                }
+                let started = Instant::now();
+                match store::mvcc_gc_once(&gc_client, retention_ms).await {
+                    Ok(updated) => {
+                        info!(
+                            updated,
+                            retention_ms,
+                            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                            "tikv mvcc gc sweep"
+                        );
+                    }
+                    Err(e) => {
+                        error!(error = %e, "tikv mvcc gc sweep failed");
                     }
                 }
             }
@@ -108,6 +179,13 @@ async fn main() -> anyhow::Result<()> {
 
     serve_result?;
     Ok(())
+}
+
+fn runtime_instance_id(listen: &str) -> String {
+    let host = std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("HOST"))
+        .unwrap_or_else(|_| "unknown-host".to_string());
+    format!("{host}:{}:{listen}", std::process::id())
 }
 
 /// Connect to a locally-running instance and call the `Health` RPC. Returns

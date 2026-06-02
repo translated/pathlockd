@@ -10,8 +10,10 @@
 //! listen           = "0.0.0.0:50051"
 //! pd_endpoints     = ["pd0:2379", "pd1:2379", "pd2:2379"]
 //! peers            = ["http://pathlockd-1:50051", "http://pathlockd-2:50051"]
-//! gc_interval_secs = 60
+//! gc_interval_secs = 1
 //! gc_page          = 256
+//! mvcc_gc_interval_secs = 300
+//! mvcc_gc_safe_point_retention_secs = 600
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
@@ -34,6 +36,11 @@ pub struct Config {
     pub gc_interval_secs: u64,
     /// Keys scanned per GC page.
     pub gc_page: u32,
+    /// TiKV transactional MVCC GC interval (0 disables; use this when another
+    /// TiDB/GC coordinator already advances the cluster safepoint).
+    pub mvcc_gc_interval_secs: u64,
+    /// How far behind PD's current timestamp TiKV MVCC GC may advance.
+    pub mvcc_gc_safe_point_retention_secs: u64,
     /// Per-subscriber event queue depth. Each `Subscribe` stream gets its own
     /// bounded queue of this size carrying only its owner's events; an overflow
     /// drops (the client recheck is the backstop).
@@ -55,8 +62,10 @@ impl Default for Config {
         Config {
             listen: "0.0.0.0:50051".to_string(),
             pd_endpoints: vec!["127.0.0.1:2379".to_string()],
-            gc_interval_secs: 60,
+            gc_interval_secs: 1,
             gc_page: 1024,
+            mvcc_gc_interval_secs: 300,
+            mvcc_gc_safe_point_retention_secs: 600,
             event_buffer: 8192,
             peers: Vec::new(),
             request_timeout_ms: 30_000,
@@ -74,6 +83,8 @@ struct FileConfig {
     pd_endpoints: Option<Vec<String>>,
     gc_interval_secs: Option<u64>,
     gc_page: Option<u32>,
+    mvcc_gc_interval_secs: Option<u64>,
+    mvcc_gc_safe_point_retention_secs: Option<u64>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
     request_timeout_ms: Option<u64>,
@@ -127,6 +138,12 @@ impl Config {
             if let Some(v) = file.gc_page {
                 cfg.gc_page = v;
             }
+            if let Some(v) = file.mvcc_gc_interval_secs {
+                cfg.mvcc_gc_interval_secs = v;
+            }
+            if let Some(v) = file.mvcc_gc_safe_point_retention_secs {
+                cfg.mvcc_gc_safe_point_retention_secs = v;
+            }
             if let Some(v) = file.event_buffer {
                 cfg.event_buffer = v;
             }
@@ -160,6 +177,12 @@ impl Config {
         if let Some(v) = env_parse::<u32>("PATHLOCKD_GC_PAGE")? {
             cfg.gc_page = v;
         }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_MVCC_GC_INTERVAL_SECS")? {
+            cfg.mvcc_gc_interval_secs = v;
+        }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS")? {
+            cfg.mvcc_gc_safe_point_retention_secs = v;
+        }
         if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? {
             cfg.event_buffer = v;
         }
@@ -182,17 +205,30 @@ impl Config {
         if cfg.pd_endpoints.is_empty() {
             anyhow::bail!("pd_endpoints must not be empty");
         }
+        if cfg.request_timeout_ms == 0 {
+            anyhow::bail!("request_timeout_ms must be > 0");
+        }
+        if cfg.max_concurrent_requests_per_connection == 0 {
+            anyhow::bail!("max_concurrent_requests_per_connection must be > 0");
+        }
         // A 0 page would make every GC scan return nothing and silently disable
         // active reclamation. Disabling it is a job for gc_interval_secs = 0
         // (which keeps lazy expiry); fail fast on the footgun instead.
         if cfg.gc_interval_secs > 0 && cfg.gc_page == 0 {
             anyhow::bail!("gc_page must be > 0 when gc is enabled (gc_interval_secs > 0)");
         }
-        if cfg.request_timeout_ms == 0 {
-            anyhow::bail!("request_timeout_ms must be > 0");
-        }
-        if cfg.max_concurrent_requests_per_connection == 0 {
-            anyhow::bail!("max_concurrent_requests_per_connection must be > 0");
+        if cfg.mvcc_gc_interval_secs > 0 {
+            if cfg.mvcc_gc_safe_point_retention_secs == 0 {
+                anyhow::bail!(
+                    "mvcc_gc_safe_point_retention_secs must be > 0 when mvcc gc is enabled"
+                );
+            }
+            let retention_ms = cfg.mvcc_gc_safe_point_retention_secs.saturating_mul(1000);
+            if retention_ms < cfg.request_timeout_ms.saturating_mul(2) {
+                anyhow::bail!(
+                    "mvcc_gc_safe_point_retention_secs must be at least 2x request_timeout_ms"
+                );
+            }
         }
         Ok(cfg)
     }

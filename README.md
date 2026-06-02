@@ -262,6 +262,8 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `peers` | `PATHLOCKD_PEERS` | `[]` | sibling pathlockd endpoints for cross-instance event fan-out |
 | `gc_interval_secs` | `PATHLOCKD_GC_INTERVAL_SECS` | `1` | active expiry sweep interval (0 disables; lazy expiry still applies) |
 | `gc_page` | `PATHLOCKD_GC_PAGE` | `1024` | keys scanned per GC page |
+| `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | TiKV transactional MVCC GC interval (0 disables) |
+| `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag behind PD time; must be at least 2x request timeout |
 | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
 | `enable_debug` | `PATHLOCKD_ENABLE_DEBUG` | `false` | enable the test-only `PathLockDebug` service |
 | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
@@ -329,6 +331,7 @@ cargo/protoc/clang). The first run builds a small cached builder image.
 ```bash
 ./scripts/test-unit.sh           # crate unit tests (no cluster needed)
 ./scripts/test-integration.sh    # brings up TiKV (PD + TiKV) and runs the integration tests
+./scripts/test-e2e-stress.sh     # starts peered replicas, checks cross-replica events, runs GC stress
 ```
 
 The cluster used by the integration tests is managed on its own:

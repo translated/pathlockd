@@ -710,6 +710,41 @@ fn distinct_handlers_do_not_conflict() {
 }
 
 #[test]
+fn gc_coordination_lease_is_exclusive_and_expires() {
+    run(async {
+        let c = fresh().await;
+        let lease = format!("integration-{}", store::now_ms());
+
+        assert!(
+            store::try_acquire_gc_lease(c, &lease, "replica-a", 150)
+                .await
+                .unwrap(),
+            "first replica should acquire the gc lease"
+        );
+        assert!(
+            !store::try_acquire_gc_lease(c, &lease, "replica-b", 150)
+                .await
+                .unwrap(),
+            "second replica must not acquire a live lease"
+        );
+        assert!(
+            store::try_acquire_gc_lease(c, &lease, "replica-a", 150)
+                .await
+                .unwrap(),
+            "current holder should refresh its own lease"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            store::try_acquire_gc_lease(c, &lease, "replica-b", 150)
+                .await
+                .unwrap(),
+            "another replica should acquire after lease expiry"
+        );
+    });
+}
+
+#[test]
 fn release_all_clears_everything() {
     run(async {
         let c = fresh().await;

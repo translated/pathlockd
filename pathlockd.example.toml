@@ -19,6 +19,13 @@ peers = []
 gc_interval_secs = 1
 gc_page = 1024
 
+# TiKV transactional MVCC GC. Keep this enabled for standalone TiKV clusters
+# where no TiDB/GC coordinator advances PD's safe point. The retention window
+# must cover the oldest possible in-flight transaction; pathlockd requires at
+# least 2x request_timeout_ms.
+mvcc_gc_interval_secs = 300
+mvcc_gc_safe_point_retention_secs = 600
+
 # In-process event broadcast channel capacity.
 event_buffer = 8192
 

@@ -13,6 +13,8 @@ Resolution order, lowest to highest precedence:
 | peers | `peers` | `PATHLOCKD_PEERS` | `[]` | sibling replica endpoints for event fan-out |
 | GC interval | `gc_interval_secs` | `PATHLOCKD_GC_INTERVAL_SECS` | `1` | 0 disables active sweep (lazy expiry still applies) |
 | GC page | `gc_page` | `PATHLOCKD_GC_PAGE` | `1024` | keys scanned per GC page |
+| TiKV MVCC GC interval | `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | 0 disables pathlockd-driven TiKV safepoint GC |
+| TiKV MVCC retention | `mvcc_gc_safe_point_retention_secs` | `PATHLOCKD_MVCC_GC_SAFE_POINT_RETENTION_SECS` | `600` | safepoint lag; must be at least 2x request timeout |
 | event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process broadcast capacity |
 | debug | `enable_debug` | `PATHLOCKD_ENABLE_DEBUG` | `false` | enables `PathLockDebug`; never in prod |
 | log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
@@ -36,8 +38,12 @@ export stays off and normal tracing logs still initialize.
 
 ## Operational notes
 
-- **Clocks:** lease expiry uses wall-clock time; run replicas under NTP.
+- **Clocks:** lease expiry uses PD's timestamp oracle so replicas share one time
+  source.
 - **GC at 1s** reclaims expired keys promptly. On a very large keyspace the
   periodic full-range sweep can get expensive — raise the interval; correctness
   does not depend on it (lazy expiry handles that).
+- **TiKV MVCC GC** is separate from logical expiry. Keep
+  `mvcc_gc_interval_secs` enabled for standalone TiKV; disable it if another
+  TiDB/GC coordinator owns the cluster safepoint.
 - **Debug service** must stay disabled in production; it can flush all state.
