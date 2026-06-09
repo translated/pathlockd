@@ -405,7 +405,43 @@ async fn e2e_is_owner_alive() {
 async fn e2e_detect_cycle() {
     let mut daemon = start_daemon().await;
 
-    // Set up A -> B -> A cycle
+    // "b" holds write lock on "h:/x"; "a" holds write lock on "h:/y".
+    // This makes both owners alive and both is_blocking checks pass.
+    daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "b".into(),
+            ttl_ms: 30000,
+            fencing_token: 1,
+            requests: vec![pathlockd::proto::LockRequest {
+                path: "h:/x".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            emit_release: false,
+        })
+        .await
+        .unwrap();
+
+    daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "a".into(),
+            ttl_ms: 30000,
+            fencing_token: 1,
+            requests: vec![pathlockd::proto::LockRequest {
+                path: "h:/y".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            emit_release: false,
+        })
+        .await
+        .unwrap();
+
+    // A -> B -> A deadlock: a waits for b's lock on h:/x; b waits for a's lock on h:/y.
     daemon
         .client
         .set_wait_edge(SetWaitEdgeRequest {
