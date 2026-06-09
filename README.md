@@ -129,12 +129,6 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 The following are **not yet implemented** and are planned for the final `1.0.0`
 release:
 
-- [ ] **Prometheus scrape endpoint** — OTLP tracing/metrics export is available;
-  a local `/metrics` endpoint is not yet exposed.
-- [ ] **CI** — no continuous-integration pipeline yet (build, clippy, unit +
-  engine tests on every push/PR). Container images are published via
-  [`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml)
-  on every `v*` tag.
 - [ ] **Authentication & authorization, TLS** — the gRPC surface is currently
   unauthenticated and in plaintext; until then, run pathlockd only on a trusted
   network or behind a TLS-terminating, authenticating proxy.
