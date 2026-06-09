@@ -57,8 +57,23 @@ pub struct Config {
     /// bounded queue of this size carrying only its owner's events; an overflow
     /// drops (the client recheck is the backstop).
     pub event_buffer: usize,
-    /// Peer pathlockd endpoints for cross-instance event fan-out (optional).
+    /// Peer pathlockd endpoints for cross-instance event fan-out (optional,
+    /// static list). Usually empty in favour of `peer_discovery_dns`.
     pub peers: Vec<String>,
+    /// A `host:port` DNS name that resolves to the addresses of every pathlockd
+    /// replica — in Kubernetes, the headless Service fronting the StatefulSet
+    /// (e.g. `pathlockd-headless:50051`). The daemon periodically resolves it and
+    /// forwards events to each resolved peer, so cross-instance fan-out tracks
+    /// replica membership as it scales. Empty disables dynamic discovery.
+    pub peer_discovery_dns: Option<String>,
+    /// This instance's own IP, used to exclude itself from the discovered peer
+    /// set (in Kubernetes, wire from the downward API `status.podIP`). When unset,
+    /// the instance may forward an event to itself — harmless (it is also
+    /// delivered locally) but a wasted RPC.
+    pub self_ip: Option<String>,
+    /// How often to re-resolve `peer_discovery_dns` (seconds). Ignored when
+    /// discovery is disabled.
+    pub peer_refresh_secs: u64,
     /// Server-side deadline applied to each unary/stream setup RPC.
     pub request_timeout_ms: u64,
     /// Per-HTTP/2-connection request concurrency limit.
@@ -80,6 +95,9 @@ impl Default for Config {
             stale_lock_grace_secs: 60,
             event_buffer: 8192,
             peers: Vec::new(),
+            peer_discovery_dns: None,
+            self_ip: None,
+            peer_refresh_secs: 10,
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
             log_level: "info".to_string(),
@@ -100,6 +118,9 @@ struct FileConfig {
     stale_lock_grace_secs: Option<u64>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
+    peer_discovery_dns: Option<String>,
+    self_ip: Option<String>,
+    peer_refresh_secs: Option<u64>,
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
     log_level: Option<String>,
@@ -168,6 +189,15 @@ impl Config {
             if let Some(v) = file.peers {
                 cfg.peers = v;
             }
+            if let Some(v) = file.peer_discovery_dns {
+                cfg.peer_discovery_dns = Some(v);
+            }
+            if let Some(v) = file.self_ip {
+                cfg.self_ip = Some(v);
+            }
+            if let Some(v) = file.peer_refresh_secs {
+                cfg.peer_refresh_secs = v;
+            }
             if let Some(v) = file.request_timeout_ms {
                 cfg.request_timeout_ms = v;
             }
@@ -209,6 +239,15 @@ impl Config {
         }
         if let Some(v) = env_list("PATHLOCKD_PEERS") {
             cfg.peers = v;
+        }
+        if let Some(v) = env_string("PATHLOCKD_PEER_DISCOVERY_DNS") {
+            cfg.peer_discovery_dns = Some(v);
+        }
+        if let Some(v) = env_string("PATHLOCKD_SELF_IP") {
+            cfg.self_ip = Some(v);
+        }
+        if let Some(v) = env_parse::<u64>("PATHLOCKD_PEER_REFRESH_SECS")? {
+            cfg.peer_refresh_secs = v;
         }
         if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? {
             cfg.request_timeout_ms = v;
@@ -269,8 +308,27 @@ impl Config {
                 );
             }
         }
+        if let Some(dns) = &cfg.peer_discovery_dns {
+            // Must be `host:port` so it resolves to addressable replica endpoints;
+            // a bare host (no port) cannot be turned into a gRPC endpoint.
+            if !is_host_port(dns) {
+                anyhow::bail!(
+                    "peer_discovery_dns must be \"host:port\" (e.g. pathlockd-headless:50051): {dns}"
+                );
+            }
+            if cfg.peer_refresh_secs == 0 {
+                anyhow::bail!("peer_refresh_secs must be > 0 when peer_discovery_dns is set");
+            }
+        }
         Ok(cfg)
     }
+}
+
+/// Whether `s` is a `host:port` pair with a non-empty host and a port in
+/// `1..=65535`. The host is a DNS name (no colons), so the last `:` splits it.
+fn is_host_port(s: &str) -> bool {
+    s.rsplit_once(':')
+        .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
 }
 
 fn env_string(key: &str) -> Option<String> {
@@ -296,5 +354,26 @@ where
             .parse::<T>()
             .map(Some)
             .map_err(|e| anyhow::anyhow!("invalid {key}={s}: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_host_port_accepts_dns_and_port() {
+        assert!(is_host_port("pathlockd-headless:50051"));
+        assert!(is_host_port("pathlockd.default.svc.cluster.local:50051"));
+        assert!(is_host_port("10.0.0.1:50051"));
+    }
+
+    #[test]
+    fn is_host_port_rejects_bad_forms() {
+        assert!(!is_host_port("pathlockd-headless")); // no port
+        assert!(!is_host_port(":50051")); // empty host
+        assert!(!is_host_port("host:0")); // zero port
+        assert!(!is_host_port("host:70000")); // out of u16 range
+        assert!(!is_host_port("host:grpc")); // non-numeric port
     }
 }

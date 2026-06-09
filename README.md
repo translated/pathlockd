@@ -223,27 +223,62 @@ pathlockd is two tiers: a TiKV cluster (the source of truth) and a fleet of
 stateless pathlockd replicas.
 
 1. **Run a real TiKV cluster.** For HA use ≥3 PD and ≥3 TiKV nodes (TiUP,
-   `tikv-operator` on Kubernetes, or your own orchestration). Give pathlockd the
-   PD endpoints.
-2. **Run multiple pathlockd replicas** behind a load balancer / service VIP,
-   pointing at the PD endpoints:
+   `tikv-operator` on Kubernetes, or your own orchestration). Give pathlockd
+   **all** the PD endpoints (comma-separated) so startup does not depend on one
+   specific PD node being reachable.
+2. **A single instance runs on any container runtime:**
 
    ```bash
    docker run -d --restart=unless-stopped -p 50051:50051 \
      -e PATHLOCKD_PD_ENDPOINTS="pd0:2379,pd1:2379,pd2:2379" \
      -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
-     ghcr.io/alexpacio/pathlockd:0.2.2
+     ghcr.io/alexpacio/pathlockd:0.4.4
    ```
 
-3. **Cross-instance events (optional).** A lifecycle event is raised on the
-   instance that handled the request. If your clients are sticky to one replica
-   per owner (recommended — one lock keeps one connection), no extra config is
-   needed. Otherwise list sibling replicas in `PATHLOCKD_PEERS` so events are
-   forwarded; the client-side recheck is always the correctness backstop.
-4. **Clocks.** Lease expiry uses each instance's wall clock — run pathlockd
-   replicas with NTP-synced clocks.
-A Docker Swarm example (single-node TiKV + replicated pathlockd) ships as part
-of the downstream deployments; the same shape works on Kubernetes.
+3. **Run it replicated (HA) on Kubernetes.** Running *multiple* pathlockd
+   replicas with working cross-instance event delivery is supported on
+   **Kubernetes only**, deployed as a **StatefulSet behind a headless Service**.
+   Ready-to-apply manifests (StatefulSet, headless + client Services, PDB) are in
+   [`deploy/kubernetes/`](deploy/kubernetes/). See
+   [Why replication needs Kubernetes](#why-replication-needs-kubernetes) for the
+   rationale.
+
+> **Clocks.** Lease expiry is computed from **PD's timestamp oracle (cluster
+> time)**, not the host wall clock, so pathlockd replicas do **not** need their
+> clocks mutually NTP-synced for lease correctness; fencing tokens are likewise
+> PD-ordered and monotonic cluster-wide. (Keep PD/TiKV nodes time-synced as any
+> TiKV deployment requires.)
+
+### Why replication needs Kubernetes
+
+All lock state lives in TiKV, so any replica can serve any request behind any
+load balancer — that part is platform-agnostic. The constraint is the **per-owner
+event stream** (`Subscribe` → `released` / `killed` / `revoke`): an event is
+raised on whichever replica handled the call, which is frequently a *different*
+replica than the one holding the subscriber (a deadlock `RequestRevoke` or an
+admin `ForceRelease` targets *another* owner). To deliver it, the originating
+replica must forward to the **specific** replica holding that subscription — so
+every replica must be individually addressable *and* know its current peers.
+
+- A **single load-balanced VIP** — a plain Deployment + ClusterIP, or a Docker
+  Swarm replicated service reached through its VIP / `tasks.` DNS — can't do
+  this: a forwarded event load-balances to *one* replica instead of fanning out
+  to all, so the subscriber usually misses it.
+- A **StatefulSet + headless Service** gives every pod stable identity and a DNS
+  name that resolves to *all* pod IPs. pathlockd resolves that name
+  (`PATHLOCKD_PEER_DISCOVERY_DNS`), refreshes it as replicas come and go, and
+  runs one forwarder per peer, so an event reaches every replica and tracks
+  scaling automatically.
+
+Cross-instance fan-out is best-effort — the client-side recheck poll is always
+the correctness backstop, so misconfigured fan-out only costs wakeup *latency*,
+never safety. On a single-VIP platform pathlockd still runs and stays correct;
+it just degrades to poll-latency wakeups. Kubernetes is what makes the
+low-latency event path work across replicas.
+
+For a fixed replica count you can instead set a static peer list
+(`PATHLOCKD_PEERS`) of individually-addressable replica endpoints; DNS discovery
+is the elastic, scaling-aware version of the same fan-out.
 
 ## Configuration
 
@@ -255,7 +290,10 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | --- | --- | --- | --- |
 | `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC listen address |
 | `pd_endpoints` | `PATHLOCKD_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints (comma-separated in env) |
-| `peers` | `PATHLOCKD_PEERS` | `[]` | sibling pathlockd endpoints for cross-instance event fan-out |
+| `peers` | `PATHLOCKD_PEERS` | `[]` | static sibling pathlockd endpoints for cross-instance event fan-out (fixed replica count) |
+| `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | `host:port` of a headless Service that resolves to every replica; enables elastic peer fan-out (K8s) |
+| `self_ip` | `PATHLOCKD_SELF_IP` | none | this instance's own IP, to exclude itself from discovered peers (wire from the downward API `status.podIP`) |
+| `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | how often to re-resolve `peer_discovery_dns` |
 | `gc_interval_secs` | `PATHLOCKD_GC_INTERVAL_SECS` | `1` | active expiry sweep interval (0 disables; lazy expiry still applies) |
 | `gc_page` | `PATHLOCKD_GC_PAGE` | `1024` | keys scanned per GC page |
 | `mvcc_gc_interval_secs` | `PATHLOCKD_MVCC_GC_INTERVAL_SECS` | `300` | TiKV transactional MVCC GC interval (0 disables) |

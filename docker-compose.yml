@@ -43,9 +43,12 @@ services:
       PATHLOCKD_LISTEN: "0.0.0.0:50051"
       PATHLOCKD_PD_ENDPOINTS: "pd:2379"
       PATHLOCKD_LOG_LEVEL: "info"
-      # Cross-instance fan-out: list sibling pathlockd endpoints here when you
-      # scale to multiple replicas, e.g. "http://pathlockd-2:50051".
-      # PATHLOCKD_PEERS: ""
+      # This compose file runs a SINGLE pathlockd instance for local use.
+      # Replicated/HA deployment with working cross-instance event fan-out is
+      # supported on Kubernetes (StatefulSet + headless Service) — see
+      # deploy/kubernetes/. A single load-balanced VIP (Swarm/compose scale)
+      # cannot fan events out to all replicas; locks stay correct (client
+      # recheck is the backstop) but event wakeups degrade to poll latency.
     ports:
       - "50051:50051"
     depends_on:

@@ -1,0 +1,14 @@
+# Keep a quorum of pathlockd replicas during voluntary disruptions (node drains,
+# rolling node upgrades). With replicas: 3, minAvailable: 2 means a drain never
+# takes more than one pod at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pathlockd
+  labels:
+    app: pathlockd
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: pathlockd

@@ -1,0 +1,45 @@
+# Two Services back the pathlockd StatefulSet:
+#
+#  * pathlockd-headless — a headless Service (clusterIP: None). It does two
+#    jobs: it gives the StatefulSet stable per-pod DNS
+#    (pathlockd-0.pathlockd-headless, pathlockd-1.pathlockd-headless, ...) AND
+#    its A record resolves to *every* ready pod IP. pathlockd resolves this name
+#    (PATHLOCKD_PEER_DISCOVERY_DNS) to discover its peers for cross-instance
+#    event fan-out. This is the piece a single load-balanced VIP cannot provide,
+#    and the reason replicated fan-out needs Kubernetes (or another platform that
+#    exposes individually-addressable replicas).
+#
+#  * pathlockd — a normal ClusterIP Service for client traffic. A client gRPC
+#    channel is one TCP connection, so kube-proxy pins it (and any long-lived
+#    Subscribe stream on it) to one pod for the connection's lifetime.
+apiVersion: v1
+kind: Service
+metadata:
+  name: pathlockd-headless
+  labels:
+    app: pathlockd
+spec:
+  clusterIP: None
+  # Only ready pods are returned, so peers never forward to a pod that cannot
+  # serve. A starting/draining pod is picked up / dropped on the next refresh.
+  selector:
+    app: pathlockd
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pathlockd
+  labels:
+    app: pathlockd
+spec:
+  type: ClusterIP
+  selector:
+    app: pathlockd
+  ports:
+    - name: grpc
+      port: 50051
+      targetPort: grpc

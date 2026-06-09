@@ -21,6 +21,14 @@ use pathlockd::{otel, store};
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const GC_COORDINATION_LEASE_MS: u64 = 30_000;
+/// HTTP/2 keepalive ping interval for inbound client connections. Long-lived
+/// `Subscribe` streams are otherwise idle whenever no events flow; a load
+/// balancer / conntrack table in front of the daemon can silently reap such an
+/// idle stream, so the server pings to keep it live (and to detect a dead client
+/// promptly). The companion ack timeout and TCP-level keepalive back it up.
+const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -88,10 +96,28 @@ async fn main() -> anyhow::Result<()> {
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid listen address {}: {e}", cfg.listen))?;
 
+    // Cross-instance event fan-out to dynamically discovered replicas (a
+    // Kubernetes headless Service that resolves to every pod). Static `peers`
+    // and discovery are unioned; discovery is the path that tracks replica
+    // membership as the StatefulSet scales.
+    if let Some(dns) = cfg.peer_discovery_dns.clone() {
+        let self_ip = parse_self_ip(cfg.self_ip.as_deref());
+        info!(
+            %dns,
+            refresh_secs = cfg.peer_refresh_secs,
+            self_ip = ?self_ip,
+            "peer discovery enabled"
+        );
+        spawn_peer_discovery(broadcaster.clone(), dns, self_ip, cfg.peer_refresh_secs);
+    }
+
     let path_lock = PathLockService::new(client.clone(), broadcaster.clone());
     let router = Server::builder()
         .timeout(Duration::from_millis(cfg.request_timeout_ms))
         .concurrency_limit_per_connection(cfg.max_concurrent_requests_per_connection)
+        .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+        .tcp_keepalive(Some(TCP_KEEPALIVE))
         .load_shed(true)
         .add_service(PathLockServer::new(path_lock));
 
@@ -311,6 +337,77 @@ async fn stale_lock_resolve_pass(client: &TransactionClient, instance_id: &str, 
     }
 }
 
+/// Parse this instance's own IP (from `self_ip`) so it can be excluded from the
+/// discovered peer set. An unparseable value is non-fatal: we log and proceed
+/// without self-exclusion (forwarding to self is harmless, just a wasted RPC).
+fn parse_self_ip(self_ip: Option<&str>) -> Option<IpAddr> {
+    let raw = self_ip?;
+    match raw.parse::<IpAddr>() {
+        Ok(ip) => Some(ip),
+        Err(e) => {
+            warn!(self_ip = %raw, error = %e, "ignoring unparseable self_ip; events may be forwarded to self");
+            None
+        }
+    }
+}
+
+/// Periodically resolve `dns` to the current set of replica addresses and hand
+/// them to the broadcaster, which adds/drops forwarders to match. The first tick
+/// fires immediately so fan-out is live shortly after startup; a transient
+/// resolution failure is logged and leaves the current peer set in place.
+fn spawn_peer_discovery(
+    broadcaster: Broadcaster,
+    dns: String,
+    self_ip: Option<IpAddr>,
+    refresh_secs: u64,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(refresh_secs));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await; // first tick is immediate
+            match resolve_peers(&dns, self_ip).await {
+                Ok(peers) => {
+                    debug!(dns = %dns, count = peers.len(), ?peers, "resolved pathlockd peers");
+                    broadcaster.reconcile_dynamic_peers(&peers);
+                }
+                Err(e) => {
+                    warn!(
+                        dns = %dns,
+                        error = %e,
+                        "peer discovery resolution failed; keeping current peer set"
+                    );
+                }
+            }
+        }
+    });
+}
+
+/// Resolve a `host:port` DNS name to a deduplicated, self-excluded list of
+/// `http://<ip>:<port>` peer endpoint URLs.
+async fn resolve_peers(dns: &str, self_ip: Option<IpAddr>) -> anyhow::Result<Vec<String>> {
+    let addrs = tokio::net::lookup_host(dns)
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving peer discovery dns {dns}: {e}"))?;
+    // BTreeSet: dedupe repeated A records and give the reconcile a stable order.
+    let mut peers = std::collections::BTreeSet::new();
+    for addr in addrs {
+        if Some(addr.ip()) == self_ip {
+            continue; // never forward to ourselves
+        }
+        peers.insert(peer_url(addr));
+    }
+    Ok(peers.into_iter().collect())
+}
+
+/// Format a resolved socket address as a gRPC endpoint URL, bracketing IPv6.
+fn peer_url(addr: SocketAddr) -> String {
+    match addr.ip() {
+        IpAddr::V4(ip) => format!("http://{ip}:{}", addr.port()),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{}", addr.port()),
+    }
+}
+
 async fn run_background_step<F>(name: &'static str, step: F)
 where
     F: Future<Output = ()>,
@@ -383,5 +480,44 @@ mod tests {
     #[test]
     fn health_probe_url_rejects_invalid_listen_address() {
         assert!(health_probe_url("not-a-socket").is_err());
+    }
+
+    #[test]
+    fn peer_url_brackets_ipv6() {
+        assert_eq!(
+            peer_url(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+                50051
+            )),
+            "http://10.0.0.1:50051"
+        );
+        assert_eq!(
+            peer_url(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50051)),
+            "http://[::1]:50051"
+        );
+    }
+
+    #[test]
+    fn parse_self_ip_handles_valid_and_invalid() {
+        assert_eq!(parse_self_ip(None), None);
+        assert_eq!(
+            parse_self_ip(Some("10.0.0.5")),
+            Some("10.0.0.5".parse().unwrap())
+        );
+        assert_eq!(parse_self_ip(Some("not-an-ip")), None);
+    }
+
+    #[tokio::test]
+    async fn resolve_peers_excludes_self_and_dedupes() {
+        // A numeric host:port resolves without touching DNS.
+        let peers = resolve_peers("10.0.0.1:50051", None).await.unwrap();
+        assert_eq!(peers, vec!["http://10.0.0.1:50051".to_string()]);
+
+        // Excluding self yields an empty set.
+        let self_ip = "10.0.0.1".parse().unwrap();
+        let peers = resolve_peers("10.0.0.1:50051", Some(self_ip))
+            .await
+            .unwrap();
+        assert!(peers.is_empty());
     }
 }

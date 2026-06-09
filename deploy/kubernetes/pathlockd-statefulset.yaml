@@ -1,0 +1,112 @@
+# pathlockd as a replicated, HA StatefulSet.
+#
+# Why a StatefulSet and not a Deployment: replicated cross-instance event
+# fan-out needs each replica to be individually addressable so an event raised
+# on one pod can be forwarded to the specific pod holding a subscriber. A
+# Deployment behind a ClusterIP only gives a single load-balanced VIP, which
+# cannot fan out to all replicas. A StatefulSet + headless Service gives stable
+# per-pod identity and a DNS name that resolves to every pod — which is what
+# pathlockd's peer discovery consumes. See pathlockd-services.yaml.
+#
+# pathlockd itself is stateless (all durable state is in TiKV), so there are no
+# volumeClaimTemplates here; the StatefulSet is used purely for stable network
+# identity.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pathlockd
+  labels:
+    app: pathlockd
+spec:
+  serviceName: pathlockd-headless   # must match the headless Service name
+  replicas: 3
+  podManagementPolicy: Parallel     # stateless pods: start/replace in parallel
+  selector:
+    matchLabels:
+      app: pathlockd
+  template:
+    metadata:
+      labels:
+        app: pathlockd
+    spec:
+      # Give in-flight TiKV commits time to finish on SIGTERM. pathlockd handles
+      # SIGTERM with a graceful gRPC shutdown; a longer grace reduces the chance
+      # of an interrupted commit (which self-heals via lock TTL + the stale-lock
+      # resolver regardless).
+      terminationGracePeriodSeconds: 30
+      # Spread replicas across nodes so a node loss drops at most one.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app: pathlockd
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: pathlockd
+          # Pin to a released tag; :latest is for convenience only.
+          image: ghcr.io/alexpacio/pathlockd:0.4.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: grpc
+              containerPort: 50051
+          env:
+            - name: PATHLOCKD_LISTEN
+              value: "0.0.0.0:50051"
+            # All PD endpoints of your replicated TiKV cluster. With tikv-operator
+            # this is the PD Service (e.g. "<cluster>-pd:2379"); otherwise list
+            # every PD so startup does not depend on one specific node being up.
+            - name: PATHLOCKD_PD_ENDPOINTS
+              value: "basic-pd:2379"
+            # The headless Service name: resolves to every ready pathlockd pod.
+            # pathlockd refreshes this to keep its peer fan-out set in sync with
+            # the current replica membership as you scale.
+            - name: PATHLOCKD_PEER_DISCOVERY_DNS
+              value: "pathlockd-headless:50051"
+            # This pod's own IP, so it excludes itself from the discovered peers.
+            - name: PATHLOCKD_SELF_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: PATHLOCKD_LOG_LEVEL
+              value: "info"
+            # OpenTelemetry export (optional) is configured with standard OTEL_*
+            # env vars, e.g.:
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: "http://otel-collector:4317"
+          # Liveness/readiness use the daemon's own --health-check (it dials the
+          # local instance's Health RPC, which also verifies TiKV reachability).
+          # Readiness gates both Services, so a pod that loses TiKV is pulled out
+          # of the client Service and the discovered-peer set until it recovers.
+          readinessProbe:
+            exec:
+              command: ["/usr/local/bin/pathlockd", "--health-check"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/pathlockd", "--health-check"]
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "1"
+              memory: "256Mi"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

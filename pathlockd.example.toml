@@ -8,10 +8,18 @@ listen = "0.0.0.0:50051"
 # PD endpoints of the TiKV cluster (one or more).
 pd_endpoints = ["127.0.0.1:2379"]
 
-# Other pathlockd replicas, for best-effort cross-instance event fan-out.
-# Leave empty for a single instance; the client-side recheck poll is always the
-# correctness backstop.
+# Cross-instance event fan-out. Leave all of this unset for a single instance;
+# the client-side recheck poll is always the correctness backstop.
+#
+# Static list of sibling replica endpoints (fixed replica count):
 peers = []
+#
+# Or, for elastic replicated deployments (Kubernetes), discover peers by
+# resolving a headless-Service DNS name that returns every replica's address.
+# This is the recommended replicated setup; see deploy/kubernetes/.
+# peer_discovery_dns = "pathlockd-headless:50051"
+# self_ip            = "10.0.0.5"   # wired from the K8s downward API status.podIP
+# peer_refresh_secs  = 10
 
 # Active GC sweep of expired keys, every N seconds (1 reclaims promptly, like a
 # 1Hz expiry cycle). 0 disables it — lazy expiry still guarantees correctness, so
