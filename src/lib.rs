@@ -9,6 +9,11 @@ pub mod proto {
     tonic::include_proto!("pathlockd.v1");
 }
 
+/// Internal node-to-node Raft transport (no client API stability guarantees).
+pub mod raft_proto {
+    tonic::include_proto!("pathlockd.raft.v1");
+}
+
 pub mod cluster;
 pub mod config;
 pub mod engine;

@@ -11,29 +11,50 @@ node_id = "pathlockd-0"
 # RocksDB data directory.
 data_dir = "/var/lib/pathlockd"
 
-# Internal addresses (used for cluster communication).
+# Addresses advertised to peers (carried in Raft membership and gossip).
 public_addr = "http://localhost:50051"
 raft_addr = "http://localhost:50052"
+# SWIM gossip UDP bind address.
 gossip_addr = "0.0.0.0:7946"
+# The concrete ip:port advertised for gossip. Defaults to the bind address
+# when it names an IP, else the auto-detected outbound IP. Set behind NAT.
+# gossip_advertise_addr = "10.0.0.5:7946"
 
-# Bootstrap a new cluster (single node or first node).
+# Initialize a brand-new cluster with this node as sole voter. Exactly one
+# node bootstraps, exactly once; every other node joins via seed_nodes and is
+# adopted by the membership reconcilers (learner -> voter, automatically).
 bootstrap = true
 
-# Join an existing cluster (mutually exclusive with bootstrap).
-# join = true
-# seed_nodes = ["node1:7946", "node2:7946"]
+# Gossip addresses of existing members (required unless bootstrap = true).
+# seed_nodes = ["pathlockd-0.pathlockd:7946"]
 
-# Number of Raft groups (deterministic sharding via HRW hashing).
-group_count = 256
+# Number of Raft groups (deterministic sharding via HRW hashing; fixed at
+# cluster birth — changing it remaps every routing domain).
+group_count = 32
 
-# Raft replication factor (must be odd). NOTE: >1 requires Raft replication,
-# which is not implemented yet — run exactly one replica.
-replication_factor = 1
+# Path segments (beyond the handler) in the routing domain. 0 shards by
+# handler only (no restrictions); K > 0 shards deeper for write parallelism
+# within one handler, at the cost of rejecting locks at depth < K.
+routing_prefix_segments = 0
+
+# Voters per Raft group (odd). The effective factor degrades to the largest
+# odd number <= the stable node count and upgrades automatically as nodes
+# join (1 node -> 1, 3+ nodes -> 3, ...).
+replication_factor = 3
 
 # Raft tuning.
 raft_snapshot_interval_entries = 10000
 raft_snapshot_min_log_entries = 5000
 raft_max_inflight = 256
+raft_election_timeout_min_ms = 1500
+raft_election_timeout_max_ms = 3000
+raft_heartbeat_interval_ms = 500
+
+# Elastic membership reconciliation.
+# stability_window_secs = 30          # node must be up this long before placement
+# eviction_window_secs = 60           # dead voter replaced after this long
+# leader_balance_interval_secs = 60   # leadership drifts to HRW-preferred voters
+# max_concurrent_reconciles = 4       # membership changes per reconcile tick
 
 # RocksDB tuning.
 rocksdb_wal_sync = true                # fsync WAL once per committed write group
@@ -43,9 +64,9 @@ rocksdb_max_background_jobs = 4        # flush/compaction parallelism
 rocksdb_block_cache_mb = 128           # shared block cache
 rocksdb_write_buffer_mb = 16           # per-column-family memtable size
 
-# Serialized writer queue depth; submissions beyond it are rejected with
+# In-flight write budget per Raft group; excess writes are rejected with
 # UNAVAILABLE (fail-fast backpressure instead of unbounded queueing).
-write_queue_depth = 1024
+max_inflight_per_group = 1024
 
 # GC sweep of expired records (0 disables). Each tick drains the expiry
 # backlog in batches until caught up (within a small time budget).
@@ -56,18 +77,9 @@ group_gc_batch = 1024
 # seconds so old tombstones never slow future scans (0 disables).
 gc_compact_interval_secs = 600
 
-# Cross-instance event fan-out. Leave unset for a single instance; the
-# client-side recheck poll is always the correctness backstop.
-#
-# Static list of sibling peer endpoints:
+# Cross-instance event fan-out: cluster members are discovered via gossip
+# automatically; this adds extra static endpoints (rarely needed).
 peers = []
-#
-# Or, for elastic replicated deployments (Kubernetes), discover peers by
-# resolving a headless-Service DNS name that returns every replica's address.
-# This is the recommended replicated setup; see deploy/kubernetes/.
-# peer_discovery_dns = "pathlockd-headless:50051"
-# self_ip            = "10.0.0.5"   # wired from K8s downward API status.podIP
-# peer_refresh_secs  = 10
 
 # In-process event broadcast channel capacity.
 event_buffer = 8192

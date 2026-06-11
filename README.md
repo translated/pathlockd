@@ -17,12 +17,13 @@ machines. It exposes a small, precise set of locking primitives over **gRPC**
 and stores all durable state in an embedded **RocksDB** engine — with no
 external dependencies.
 
-> **Replication status.** Raft-replicated, multi-node lock state is the target
-> architecture but is **not implemented yet**: today each node grants locks
-> from its own private store. Run **exactly one replica**. Running several
-> replicas behind a load balancer silently breaks mutual exclusion (two owners
-> can hold the same write lock, and fencing tokens are per-node). The daemon
-> logs a prominent warning at startup if clustering options are set.
+> **Replication status.** Lock state is **Raft-replicated** across an elastic
+> Multi-Raft cluster (one embedded openraft group per shard, SWIM/foca for
+> discovery). Any node serves any request — writes forward to the shard's
+> leader; a leader crash fails over within the election timeout with no lost
+> acknowledged state; fencing tokens stay globally monotonic across failovers.
+> 1 node works (no fault tolerance), 3+ nodes give HA; replicas join and leave
+> at runtime and groups re-place themselves automatically.
 
 It is *opinionated*: the locking model is exactly the one a virtual-filesystem
 needs — write locks that cover a whole subtree, point reads that don't, fencing
@@ -76,13 +77,14 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
    your application (one lock = one owner id = one connection)
         │  gRPC
         ▼
-   ┌─────────────┐
-   │  pathlockd  │   single node (today); Multi-Raft N-replica is the roadmap
-   └──────┬──────┘
-          ▼
-   ┌───────────────┐
-   │  RocksDB      │   embedded, per-node
-   └───────────────┘
+   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+   │  pathlockd  │◄──┤  pathlockd  ├──►│  pathlockd  │  N nodes
+   └──────┬──────┘   └──────┬──────┘   └──────┬──────┘  SWIM gossip (UDP)
+          │                 │                 │         Raft RPC (gRPC)
+   ┌──────▼──────┐   ┌──────▼──────┐   ┌──────▼──────┐
+   │   RocksDB   │   │   RocksDB   │   │   RocksDB   │  embedded, per node;
+   └─────────────┘   └─────────────┘   └─────────────┘  groups replicate via
+                                                        their Raft logs
 ```
 
 - **Self-contained binary.** All durable state lives in an embedded RocksDB
@@ -91,18 +93,27 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 - **RocksDB for persistence.** Lock metadata is stored in 14 column families
   with TTL-based expiry and background GC sweeps. WAL fsync guarantees
   durability across process crashes.
-- **Serialized command application.** State-machine commands (acquire, release,
-  renew, force-release, set-claim, set-wait-edge, incr-fence, GC sweeps) are
-  applied one at a time by a dedicated writer thread backed by RocksDB
-  WriteBatch, with group-committed WAL fsync and bounded-queue backpressure.
-  The engine functions are deterministic and synchronous — exactly the shape a
-  Raft apply loop needs, which is how multi-node replication will slot in.
-- **Atomicity.** Each mutating operation runs inside a single WriteBatch
-  applied atomically. A global apply lock guarantees read-modify-write
-  serialization, giving single-threaded correctness within a handler domain
-  while letting disjoint handlers commit in parallel. Read-only and advisory
-  checks (`AssertFencing`, `IsBlocking`, `DetectCycle`) read from a direct
-  RocksDB snapshot.
+- **Multi-Raft consensus.** The path namespace shards into `group_count` Raft
+  groups by **routing domain** (the handler prefix, optionally deeper): a
+  path, its ancestors, and its whole subtree always share one group, so every
+  lock operation is single-group — no cross-shard transactions, ever. Each
+  group is an independent openraft core; writes commit on the group's leader
+  and apply identically on every replica. A dedicated **system group** holds
+  the cluster-global state: the monotonic fencing counter, the deadlock
+  wait-graph, and the membership directory (replicated to every node).
+- **Elastic membership.** SWIM gossip (foca) discovers nodes and suspicion;
+  Raft membership stays the correctness authority. Each group's leader
+  reconciles its voter set toward an HRW placement over the stable members:
+  new nodes are adopted learner-first and promoted via joint consensus, dead
+  voters are replaced after an eviction window (never breaking quorum), and
+  leadership spreads across nodes. The replication factor upgrades
+  automatically as nodes arrive (1 → 3 → 5).
+- **Atomicity.** Each command applies inside a single WriteBatch with
+  read-your-writes semantics, serialized by its group's Raft apply loop.
+  Rejected outcomes (conflicts) commit nothing. One WAL fsync per batched
+  group of appends — across *all* groups on the node — preserves group-commit
+  throughput. Forwarded commands carry request ids and dedupe, so an
+  ambiguous retry (leader change mid-flight) applies exactly once.
 - **TTL-based leases.** Every record carries an absolute expiry timestamp.
   Reads treat elapsed entries as absent (correctness); a background GC sweep
   reclaims expired records (housekeeping, configurable interval). Set entries
@@ -214,59 +225,83 @@ To run the daemon on your host for development, see
 
 ## Production deployment
 
-**Deploy exactly one replica.** Lock state is per-node and not yet replicated;
-see the replication-status note at the top. A single instance runs on any
-container runtime:
+A cluster is N self-contained nodes. Each node needs three things:
+
+1. a **stable identity** — `node_id` ending in a unique integer
+   (`pathlockd-0`, `pathlockd-1`, …) that survives restarts;
+2. a **persistent volume** of its own — a node must come back on its own
+   disk (a wiped disk means rejoining as a learner and re-syncing);
+3. **addresses peers can reach**: `raft_addr` (gRPC/TCP), `gossip_addr`
+   (UDP), `public_addr` (client gRPC, used for event fan-out).
+
+Exactly **one** node sets `bootstrap = true` (it initializes the cluster the
+first time, idempotently); every node lists `seed_nodes` (gossip addresses of
+the others). A bootstrap-flagged node restarting on an empty disk **refuses to
+re-initialize** when its cluster still answers through the seeds, and joins it
+instead — so the flag is safe to leave set in static configs.
+
+Single node (dev or no-HA):
 
 ```bash
 docker run -d --restart=unless-stopped -p 50051:50051 \
-  -e PATHLOCKD_LISTEN="0.0.0.0:50051" \
-  -e PATHLOCKD_DATA_DIR="/data/pathlockd" \
+  -e PATHLOCKD_NODE_ID="pathlockd-0" \
   -e PATHLOCKD_BOOTSTRAP="true" \
   -v pathlockd-data:/data/pathlockd \
-  ghcr.io/alexpacio/pathlockd:0.6.0
+  ghcr.io/alexpacio/pathlockd:latest
 ```
 
-Use orchestrator-level restart (and the built-in `--health-check`, which now
-verifies the write path end-to-end) for availability. The sections below about
-peer event fan-out describe the cross-instance *event delivery* layer — it
-forwards `Subscribe` events between instances but does **not** replicate lock
-state, so it does not make a multi-replica deployment safe for locking.
+**Docker Swarm (3-node HA)**: see [`docker-stack.yml`](docker-stack.yml) — a
+ready-to-deploy reference stack. The pattern is **one single-replica service
+per node** (`pathlockd-0/1/2`), because lock state is per-task and Swarm's
+`replicas: 3` gives tasks neither stable identity nor stable volumes:
 
-> **Clocks.** Lease expiry uses a `now_ms` stamped into every command and
-> clamped monotonically by the serialized writer, so a backwards clock step
-> (NTP, VM resume) can never make later commands apply with earlier
-> timestamps. Fencing tokens are a monotonic counter stored in RocksDB.
+```bash
+# Pin each instance to a host so it always finds its volume:
+docker node update --label-add pathlockd=0 <node-A>
+docker node update --label-add pathlockd=1 <node-B>
+docker node update --label-add pathlockd=2 <node-C>
+docker stack deploy -c docker-stack.yml pathlockd
+```
 
-### Event fan-out across instances (Kubernetes)
+Clients on the same overlay network reach any service (`pathlockd-0:50051`,
+…); every node serves every request, forwarding writes to the right Raft
+leader internally. Kill any one container/host: the other two keep serving,
+acknowledged locks survive, and the node rejoins and re-syncs when it returns.
+
+On **Kubernetes**, the same shape is a StatefulSet with a headless Service:
+ordinal hostnames give the node ids, `volumeClaimTemplates` give per-pod
+disks, and `seed_nodes` points at the headless DNS name of pod 0 (or all
+pods).
+
+> **Clocks.** Lease expiry uses a `now_ms` stamped at proposal and clamped
+> monotonically inside each group's replicated state machine, so a backwards
+> clock step (NTP, VM resume) or a leader change to a node with a slower
+> clock can never make later commands apply with earlier timestamps. Fencing
+> tokens are one monotonic counter in the system Raft group.
+
+### Event fan-out across instances
 
 The per-owner event stream (`Subscribe` → `released` / `killed` / `revoke`)
-raises an event on whichever instance handled the call, which may be a
-*different* instance than the one holding the subscriber (a deadlock
-`RequestRevoke` or an admin `ForceRelease` targets *another* owner). To
-deliver it, the originating instance must forward to the **specific** instance
-holding that subscription — so every instance must be individually addressable
-*and* know its current peers.
+raises an event on whichever node handled the call, which may be a different
+node than the one holding the subscriber. Nodes discover each other via
+gossip and forward events peer-to-peer automatically — no configuration
+needed. Fan-out is best-effort by design: the client-side recheck poll is the
+correctness backstop, so a dropped event costs wakeup latency, never safety.
 
-- A **single load-balanced VIP** — a plain Deployment + ClusterIP, or a Docker
-  Swarm replicated service reached through its VIP / `tasks.` DNS — can't do
-  this: a forwarded event load-balances to *one* replica instead of fanning out
-  to all, so the subscriber usually misses it.
-- A **StatefulSet + headless Service** gives every pod stable identity and a DNS
-  name that resolves to *all* pod IPs. pathlockd resolves that name
-  (`PATHLOCKD_PEER_DISCOVERY_DNS`), refreshes it as replicas come and go, and
-  runs one forwarder per peer, so an event reaches every replica and tracks
-  scaling automatically.
+### Scaling and write throughput
 
-Cross-instance fan-out is best-effort — the client-side recheck poll is always
-the correctness backstop, so misconfigured fan-out only costs wakeup *latency*,
-never safety. On a single-VIP platform pathlockd still runs and stays correct;
-it just degrades to poll-latency wakeups. Kubernetes is what makes the
-low-latency event path work across replicas.
+Reads scale with nodes (any replica serves stale-tolerable reads locally).
+Writes scale with **routing domains**: every domain (handler prefix by
+default) serializes through one Raft group leader, and leaders spread across
+nodes. Many handlers → near-linear write scaling. Few handlers → set
+`routing_prefix_segments = K` to shard by the first K path segments instead,
+accepting that locks *above* depth K are rejected (containment must stay
+single-group). Renews should declare their domains (`RenewRequest.domains`)
+so each heartbeat touches only the groups that actually hold state.
 
-For a fixed replica count you can instead set a static peer list
-(`PATHLOCKD_PEERS`) of individually-addressable replica endpoints; DNS discovery
-is the elastic, scaling-aware version of the same fan-out.
+To **decommission** a node gracefully, mark it draining (internal
+`RaftTransport/SetDraining` RPC, or just stop it and let the eviction window
+re-place its groups); scale-up is automatic on join.
 
 ## Configuration
 
@@ -276,27 +311,34 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 
 | TOML key | Env var | Default | Meaning |
 | --- | --- | --- | --- |
-| `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC listen address |
-| `data_dir` | `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory |
-| `node_id` | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable node identifier |
-| `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
-| `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster |
-| `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
-| `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of Raft groups |
-| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `1` | Voters per group (must be odd; >1 requires Raft replication, not implemented yet) |
-| `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 disables) |
-| `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
-| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL once per committed write group, before acknowledging it |
-| `gc_compact_interval_secs` | `PATHLOCKD_GC_COMPACT_INTERVAL_SECS` | `600` | Physically compact the swept expiry-index region (0 disables) |
-| `write_queue_depth` | `PATHLOCKD_WRITE_QUEUE_DEPTH` | `1024` | Bounded writer queue; overflow is rejected with `UNAVAILABLE` |
+| `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | Client gRPC listen address |
+| `node_id` | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable identifier; must end in a unique integer per node |
+| `data_dir` | `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory (one per node, persistent) |
+| `public_addr` | `PATHLOCKD_PUBLIC_ADDR` | `http://localhost:50051` | Client gRPC address advertised to peers (event fan-out) |
+| `raft_addr` | `PATHLOCKD_RAFT_ADDR` | `http://localhost:50052` | Internal Raft/forwarding gRPC address advertised to peers |
+| `gossip_addr` | `PATHLOCKD_GOSSIP_ADDR` | `0.0.0.0:7946` | SWIM gossip UDP bind address |
+| `gossip_advertise_addr` | `PATHLOCKD_GOSSIP_ADVERTISE_ADDR` | auto | Concrete `ip:port` advertised for gossip (set behind NAT) |
+| `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip addresses of existing members (required unless bootstrapping) |
+| `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a brand-new cluster (exactly one node; guarded against re-init on empty disks) |
+| `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups (fixed at cluster birth) |
+| `routing_prefix_segments` | `PATHLOCKD_ROUTING_PREFIX_SEGMENTS` | `0` | Path depth of the routing domain (0 = handler only) |
+| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (odd; auto-degrades/upgrades with node count) |
+| `stability_window_secs` | `PATHLOCKD_STABILITY_WINDOW_SECS` | `30` | Node uptime required before group placement |
+| `eviction_window_secs` | `PATHLOCKD_EVICTION_WINDOW_SECS` | `60` | How long a voter must be gone before replacement |
+| `leader_balance_interval_secs` | `PATHLOCKD_LEADER_BALANCE_INTERVAL_SECS` | `60` | Leadership rebalancing cadence |
+| `max_inflight_per_group` | `PATHLOCKD_MAX_INFLIGHT_PER_GROUP` | `1024` | Per-group write budget; overflow rejected with `UNAVAILABLE` |
+| `raft_election_timeout_min_ms` / `_max_ms` | `PATHLOCKD_RAFT_ELECTION_TIMEOUT_*` | `1500`/`3000` | Election window (failover time ceiling) |
+| `raft_heartbeat_interval_ms` | `PATHLOCKD_RAFT_HEARTBEAT_INTERVAL_MS` | `500` | Leader heartbeat |
+| `raft_snapshot_interval_entries` | — | `10000` | Snapshot after this many log entries |
+| `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 disables; leaders sweep their groups) |
+| `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys per GC sweep command |
+| `gc_compact_interval_secs` | `PATHLOCKD_GC_COMPACT_INTERVAL_SECS` | `600` | Physically compact swept expiry regions (0 disables) |
+| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync the WAL once per batched append group |
 | `rocksdb_max_total_wal_size_mb` | `PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB` | `512` | Upper bound on total WAL size |
 | `rocksdb_max_background_jobs` | `PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS` | `4` | RocksDB flush/compaction parallelism |
 | `rocksdb_block_cache_mb` | `PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB` | `128` | Shared block cache size |
 | `rocksdb_write_buffer_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB` | `16` | Per-column-family memtable size |
-| `peers` | `PATHLOCKD_PEERS` | `[]` | static sibling pathlockd endpoints for cross-instance event fan-out (fixed replica count) |
-| `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | `host:port` of a headless Service that resolves to every replica; enables elastic peer fan-out (K8s) |
-| `self_ip` | `PATHLOCKD_SELF_IP` | none | this instance's own IP, to exclude itself from discovered peers (wire from the downward API `status.podIP`) |
-| `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | how often to re-resolve `peer_discovery_dns` |
+| `peers` | `PATHLOCKD_PEERS` | `[]` | Extra static event fan-out endpoints (members are auto-discovered) |
 | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
 | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
 
@@ -334,8 +376,16 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
 `PathLock` service: `Acquire`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
 `AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
-`ClearWaitEdge`, `IsOwnerAlive`, `RequestRevoke`, `Subscribe` (server stream),
-`Health`.
+`ClearWaitEdge`, `SetClaim`, `ClearClaim`, `IsOwnerAlive`, `RequestRevoke`,
+`Subscribe` (server stream), `Health`.
+
+Claims (`SetClaim`/`ClearClaim`) are TTL-governed anti-starvation reservations:
+a waiter plants a claim on the path it is queued for, new overlapping acquires
+by other owners bounce with `preempt_claimed` while existing holders drain, and
+the claimant's own acquire consumes the claim atomically on grant. `SetClaim`
+is claim-if-absent — a live foreign claim is reported, never overwritten — and
+claims require no liveness lease, so a pure waiter (holding nothing yet) can
+reserve, and a crashed claimant's reservation simply expires.
 
 ## Building
 
@@ -362,7 +412,10 @@ cargo/protoc/clang). The first run builds a small cached builder image.
 ```bash
 ./scripts/test-unit.sh           # crate unit tests (no cluster needed)
 cargo test --test engine_tests    # lock engine tests (RocksDB integration)
-cargo test --test e2e_tests       # full e2e tests (starts daemon, drives gRPC)
+cargo test --test e2e_tests       # full e2e tests (starts a 1-node cluster, drives gRPC)
+cargo test --test cluster_tests   # 3-node cluster: formation, leader-kill failover under
+                                  # contention (exactly-one-holder invariant), wiped-disk
+                                  # bootstrap guard, node rejoin
 cargo test --test load            # throughput benchmarks
 ./scripts/test-e2e-stress.sh     # starts peered replicas, checks cross-replica events, runs GC stress
 ```

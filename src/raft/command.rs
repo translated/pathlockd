@@ -50,6 +50,10 @@ pub enum Op {
         claimant: String,
         ttl_ms: u64,
     },
+    ClearClaim {
+        path: String,
+        claimant: String,
+    },
     SetWaitEdge {
         owner: String,
         edge: WaitEdge,
@@ -63,9 +67,22 @@ pub enum Op {
         batch: u32,
     },
     IncrFence,
-    /// Writes nothing; used to probe that the serialized writer is alive and
-    /// draining its queue (health checks).
+    /// Writes nothing; used to probe that consensus is live (health checks).
     Noop,
+    /// Sys-group only: record a group's membership in the cluster directory
+    /// (observability + routing hints; Raft membership stays authoritative).
+    DirectoryUpdate {
+        group: u32,
+        voters: Vec<u64>,
+        learners: Vec<u64>,
+        leader: Option<u64>,
+    },
+    /// Sys-group only: mark a node as draining — reconcilers migrate groups
+    /// off it and transfer its leaderships away before it exits.
+    SetNodeDraining {
+        node_id: u64,
+        draining: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +97,7 @@ pub enum ApplyResponse {
     Acquire(crate::engine::AcquireOutcome),
     Renew(crate::engine::RenewOutcome),
     AssertFencing(crate::engine::AssertOutcome),
+    SetClaim(crate::engine::ClaimOutcome),
     IncrFence(i64),
     /// Outcome of a `GcSweep` pass. `scanned` is the number of expiry-index
     /// entries processed (a full batch means more backlog remains); `reclaimed`

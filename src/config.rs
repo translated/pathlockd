@@ -13,14 +13,14 @@
 //! public_addr      = "http://pathlockd-0.pathlockd:50051"
 //! gossip_addr      = "0.0.0.0:7946"
 //! group_count      = 256
-//! replication_factor = 1   # >1 requires Raft replication (not implemented yet)
+//! replication_factor = 3
 //! group_gc_interval_secs = 1
 //! group_gc_batch   = 1024
 //! gc_compact_interval_secs = 600
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
-//! write_queue_depth = 1024
+//! max_inflight_per_group = 1024
 //! rocksdb_wal_sync = true
 //! rocksdb_max_total_wal_size_mb = 512
 //! rocksdb_max_background_jobs = 4
@@ -48,12 +48,22 @@ pub struct Config {
     pub public_addr: String,
     /// Internal Raft transport address.
     pub raft_addr: String,
-    /// SWIM gossip address.
+    /// SWIM gossip bind address (UDP).
     pub gossip_addr: String,
+    /// The `ip:port` this node advertises to peers for gossip. Defaults to
+    /// the bind address when it names a concrete IP, else the auto-detected
+    /// outbound IP with the bind port. Set explicitly behind NAT.
+    pub gossip_advertise_addr: Option<String>,
     /// Seed nodes for initial cluster bootstrap.
     pub seed_nodes: Vec<String>,
-    /// Number of Raft groups.
+    /// Number of Raft groups (fixed at cluster birth; changing it remaps
+    /// every routing domain).
     pub group_count: u32,
+    /// Path segments (beyond the handler) included in the routing domain.
+    /// 0 = shard by handler only (every operation single-group, no
+    /// restrictions). K > 0 shards deeper for write parallelism within one
+    /// handler, at the cost of rejecting locks at depth < K.
+    pub routing_prefix_segments: u32,
     /// Voters per Raft group (must be odd).
     pub replication_factor: u32,
     /// Per-group GC sweep interval (seconds; 0 disables).
@@ -62,31 +72,40 @@ pub struct Config {
     pub group_gc_batch: u32,
     /// Per-subscriber event queue depth.
     pub event_buffer: usize,
-    /// Peer pathlockd endpoints for cross-instance event fan-out (optional, static list).
+    /// Extra static pathlockd endpoints for cross-instance event fan-out
+    /// (optional; cluster members are discovered via gossip automatically).
     pub peers: Vec<String>,
-    /// A `host:port` DNS name that resolves to every replica's gossip address.
-    pub peer_discovery_dns: Option<String>,
-    /// This instance's own IP, used to exclude itself from discovered peers.
-    pub self_ip: Option<String>,
-    /// How often to re-resolve peer_discovery_dns (seconds).
-    pub peer_refresh_secs: u64,
     /// Server-side deadline for each unary/stream setup RPC.
     pub request_timeout_ms: u64,
     /// Per-HTTP/2-connection request concurrency limit.
     pub max_concurrent_requests_per_connection: usize,
-    /// Bootstrap a new cluster.
+    /// Initialize a brand-new cluster with this node as the sole voter of
+    /// every group. Exactly one node bootstraps, exactly once; all others
+    /// join by announcing to `seed_nodes` and being adopted by reconcilers.
     pub bootstrap: bool,
-    /// Join an existing cluster.
-    pub join: bool,
     /// Raft snapshot interval (entries).
     pub raft_snapshot_interval_entries: u64,
     /// Raft minimum log entries before snapshot.
     pub raft_snapshot_min_log_entries: u64,
     /// Max in-flight Raft proposals.
     pub raft_max_inflight: usize,
-    /// Max commands queued for the serialized writer before new writes are
-    /// rejected with UNAVAILABLE (fail-fast backpressure).
-    pub write_queue_depth: usize,
+    /// Raft election timeout window (ms).
+    pub raft_election_timeout_min_ms: u64,
+    pub raft_election_timeout_max_ms: u64,
+    /// Raft leader heartbeat interval (ms; must be < election timeout min).
+    pub raft_heartbeat_interval_ms: u64,
+    /// In-flight write budget per Raft group; excess writes are rejected
+    /// with UNAVAILABLE (fail-fast backpressure).
+    pub max_inflight_per_group: usize,
+    /// A node must be continuously up this long before reconcilers place
+    /// group replicas on it (flap damping).
+    pub stability_window_secs: u64,
+    /// A dead voter is only replaced after being gone this long.
+    pub eviction_window_secs: u64,
+    /// How often group leadership is rebalanced toward HRW-preferred voters.
+    pub leader_balance_interval_secs: u64,
+    /// Max groups one reconcile tick may change membership for.
+    pub max_concurrent_reconciles: usize,
     /// How often the swept region of the expiry index is physically compacted
     /// away (seconds; 0 disables).
     pub gc_compact_interval_secs: u64,
@@ -116,26 +135,29 @@ impl Default for Config {
             public_addr: "http://localhost:50051".to_string(),
             raft_addr: "http://localhost:50052".to_string(),
             gossip_addr: "0.0.0.0:7946".to_string(),
+            gossip_advertise_addr: None,
             seed_nodes: Vec::new(),
-            group_count: 256,
-            // Clustered replication is not implemented yet (P3); default to the
-            // only deployment shape that is actually safe today.
-            replication_factor: 1,
+            group_count: 32,
+            routing_prefix_segments: 0,
+            replication_factor: 3,
             group_gc_interval_secs: 1,
             group_gc_batch: 1024,
             event_buffer: 8192,
             peers: Vec::new(),
-            peer_discovery_dns: None,
-            self_ip: None,
-            peer_refresh_secs: 10,
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
             bootstrap: false,
-            join: false,
             raft_snapshot_interval_entries: 10_000,
             raft_snapshot_min_log_entries: 5_000,
             raft_max_inflight: 256,
-            write_queue_depth: 1024,
+            raft_election_timeout_min_ms: 1_500,
+            raft_election_timeout_max_ms: 3_000,
+            raft_heartbeat_interval_ms: 500,
+            max_inflight_per_group: 1024,
+            stability_window_secs: 30,
+            eviction_window_secs: 60,
+            leader_balance_interval_secs: 60,
+            max_concurrent_reconciles: 4,
             gc_compact_interval_secs: 600,
             rocksdb_wal_sync: true,
             rocksdb_max_open_files: 4096,
@@ -157,24 +179,29 @@ struct FileConfig {
     public_addr: Option<String>,
     raft_addr: Option<String>,
     gossip_addr: Option<String>,
+    gossip_advertise_addr: Option<String>,
     seed_nodes: Option<Vec<String>>,
     group_count: Option<u32>,
+    routing_prefix_segments: Option<u32>,
     replication_factor: Option<u32>,
     group_gc_interval_secs: Option<u64>,
     group_gc_batch: Option<u32>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
-    peer_discovery_dns: Option<String>,
-    self_ip: Option<String>,
-    peer_refresh_secs: Option<u64>,
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
     bootstrap: Option<bool>,
-    join: Option<bool>,
     raft_snapshot_interval_entries: Option<u64>,
     raft_snapshot_min_log_entries: Option<u64>,
     raft_max_inflight: Option<usize>,
-    write_queue_depth: Option<usize>,
+    raft_election_timeout_min_ms: Option<u64>,
+    raft_election_timeout_max_ms: Option<u64>,
+    raft_heartbeat_interval_ms: Option<u64>,
+    max_inflight_per_group: Option<usize>,
+    stability_window_secs: Option<u64>,
+    eviction_window_secs: Option<u64>,
+    leader_balance_interval_secs: Option<u64>,
+    max_concurrent_reconciles: Option<usize>,
     gc_compact_interval_secs: Option<u64>,
     rocksdb_wal_sync: Option<bool>,
     rocksdb_max_open_files: Option<i32>,
@@ -201,7 +228,25 @@ struct Cli {
 impl Config {
     pub fn load() -> anyhow::Result<(Config, bool)> {
         let cli = Cli::parse();
-        Ok((Config::load_from(cli.config)?, cli.health_check))
+        if cli.health_check {
+            // The health probe only dials the local listen address; cluster
+            // identity/seed validation does not apply to it.
+            return Ok((Config::load_unvalidated(cli.config)?, true));
+        }
+        Ok((Config::load_from(cli.config)?, false))
+    }
+
+    fn load_unvalidated(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
+        let mut cfg = Config::default();
+        if let Some(path) = config_path {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("reading config {}: {e}", path.display()))?;
+            let file: FileConfig = toml::from_str(&raw)
+                .map_err(|e| anyhow::anyhow!("parsing config {}: {e}", path.display()))?;
+            apply_file(&mut cfg, file);
+        }
+        apply_env(&mut cfg)?;
+        Ok(cfg)
     }
 
     pub fn load_from(config_path: Option<PathBuf>) -> anyhow::Result<Config> {
@@ -236,25 +281,37 @@ impl Config {
         if self.group_count == 0 {
             anyhow::bail!("group_count must be > 0");
         }
+        if self.group_count == u32::MAX {
+            anyhow::bail!("group_count must be < u32::MAX (reserved for the system group)");
+        }
         if self.node_id.is_empty() {
             anyhow::bail!("node_id must not be empty");
         }
-        if self.join && self.seed_nodes.is_empty() {
-            anyhow::bail!("seed_nodes must not be empty for join mode");
+        if self.raft_heartbeat_interval_ms == 0
+            || self.raft_election_timeout_min_ms <= self.raft_heartbeat_interval_ms
+            || self.raft_election_timeout_max_ms <= self.raft_election_timeout_min_ms
+        {
+            anyhow::bail!(
+                "raft timing must satisfy heartbeat < election_min < election_max (got {} / {} / {})",
+                self.raft_heartbeat_interval_ms,
+                self.raft_election_timeout_min_ms,
+                self.raft_election_timeout_max_ms
+            );
         }
-        if self.bootstrap && self.join {
-            anyhow::bail!("bootstrap and join are mutually exclusive");
+        self.numeric_node_id()?;
+        if !self.bootstrap && self.seed_nodes.is_empty() {
+            anyhow::bail!(
+                "a non-bootstrap node needs seed_nodes to find its cluster \
+                 (set bootstrap=true exactly once, on the first node)"
+            );
         }
-        if let Some(dns) = &self.peer_discovery_dns {
-            if !is_host_port(dns) {
-                anyhow::bail!("peer_discovery_dns must be \"host:port\": {dns}");
+        for seed in &self.seed_nodes {
+            if !is_host_port(seed) {
+                anyhow::bail!("seed_nodes entries must be \"host:port\": {seed}");
             }
-            if self.peer_refresh_secs == 0 {
-                anyhow::bail!("peer_refresh_secs must be > 0 when peer_discovery_dns is set");
-            }
         }
-        if self.write_queue_depth == 0 {
-            anyhow::bail!("write_queue_depth must be > 0");
+        if self.max_inflight_per_group == 0 {
+            anyhow::bail!("max_inflight_per_group must be > 0");
         }
         if self.group_gc_batch == 0 {
             anyhow::bail!("group_gc_batch must be > 0");
@@ -271,13 +328,39 @@ impl Config {
         Ok(())
     }
 
-    /// True when an option implying *replicated lock state* is set. Used to
-    /// warn loudly at startup: Raft replication is not implemented yet, and
-    /// pointing several replicas at the same clients silently breaks mutual
-    /// exclusion. (`peers`/`peer_discovery_dns` are not included — they only
-    /// feed the best-effort event fan-out, which is supported.)
-    pub fn clustering_requested(&self) -> bool {
-        self.replication_factor > 1 || !self.seed_nodes.is_empty() || self.join
+    /// The stable numeric Raft node id, derived from the trailing integer of
+    /// `node_id` (`pathlockd-3` → 3; a StatefulSet ordinal). Offset by one so
+    /// id 0 is never used (0 reads as "no node" in too many contexts).
+    pub fn numeric_node_id(&self) -> anyhow::Result<u64> {
+        let digits: String = self
+            .node_id
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        if digits.is_empty() {
+            anyhow::bail!(
+                "node_id must end in a unique integer (e.g. \"pathlockd-0\"): {}",
+                self.node_id
+            );
+        }
+        let ordinal: u64 = digits
+            .parse()
+            .map_err(|e| anyhow::anyhow!("node_id ordinal {digits}: {e}"))?;
+        Ok(ordinal + 1)
+    }
+
+    /// This node's metadata as carried in Raft membership and gossip.
+    pub fn node_meta(&self) -> crate::raft::types::NodeMeta {
+        crate::raft::types::NodeMeta {
+            name: self.node_id.clone(),
+            raft_addr: self.raft_addr.clone(),
+            public_addr: self.public_addr.clone(),
+            gossip_addr: self.gossip_addr.clone(),
+        }
     }
 }
 
@@ -295,28 +378,31 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(public_addr);
     apply!(raft_addr);
     apply!(gossip_addr);
+    if let Some(v) = file.gossip_advertise_addr {
+        cfg.gossip_advertise_addr = Some(v);
+    }
     apply!(seed_nodes);
     apply!(group_count);
+    apply!(routing_prefix_segments);
     apply!(replication_factor);
     apply!(group_gc_interval_secs);
     apply!(group_gc_batch);
     apply!(event_buffer);
     apply!(peers);
-    if let Some(v) = file.peer_discovery_dns {
-        cfg.peer_discovery_dns = Some(v);
-    }
-    if let Some(v) = file.self_ip {
-        cfg.self_ip = Some(v);
-    }
-    apply!(peer_refresh_secs);
     apply!(request_timeout_ms);
     apply!(max_concurrent_requests_per_connection);
     apply!(bootstrap);
-    apply!(join);
     apply!(raft_snapshot_interval_entries);
     apply!(raft_snapshot_min_log_entries);
     apply!(raft_max_inflight);
-    apply!(write_queue_depth);
+    apply!(raft_election_timeout_min_ms);
+    apply!(raft_election_timeout_max_ms);
+    apply!(raft_heartbeat_interval_ms);
+    apply!(max_inflight_per_group);
+    apply!(stability_window_secs);
+    apply!(eviction_window_secs);
+    apply!(leader_balance_interval_secs);
+    apply!(max_concurrent_reconciles);
     apply!(gc_compact_interval_secs);
     apply!(rocksdb_wal_sync);
     apply!(rocksdb_max_open_files);
@@ -334,21 +420,23 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     if let Some(v) = env_string("PATHLOCKD_PUBLIC_ADDR") { cfg.public_addr = v; }
     if let Some(v) = env_string("PATHLOCKD_RAFT_ADDR") { cfg.raft_addr = v; }
     if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADDR") { cfg.gossip_addr = v; }
+    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADVERTISE_ADDR") { cfg.gossip_advertise_addr = Some(v); }
     if let Some(v) = env_list("PATHLOCKD_SEED_NODES") { cfg.seed_nodes = v; }
     if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_COUNT")? { cfg.group_count = v; }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_ROUTING_PREFIX_SEGMENTS")? { cfg.routing_prefix_segments = v; }
     if let Some(v) = env_parse::<u32>("PATHLOCKD_REPLICATION_FACTOR")? { cfg.replication_factor = v; }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_GROUP_GC_INTERVAL_SECS")? { cfg.group_gc_interval_secs = v; }
     if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_GC_BATCH")? { cfg.group_gc_batch = v; }
     if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? { cfg.event_buffer = v; }
     if let Some(v) = env_list("PATHLOCKD_PEERS") { cfg.peers = v; }
-    if let Some(v) = env_string("PATHLOCKD_PEER_DISCOVERY_DNS") { cfg.peer_discovery_dns = Some(v); }
-    if let Some(v) = env_string("PATHLOCKD_SELF_IP") { cfg.self_ip = Some(v); }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_PEER_REFRESH_SECS")? { cfg.peer_refresh_secs = v; }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? { cfg.request_timeout_ms = v; }
     if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? { cfg.max_concurrent_requests_per_connection = v; }
     if let Some(v) = env_parse::<bool>("PATHLOCKD_BOOTSTRAP")? { cfg.bootstrap = v; }
-    if let Some(v) = env_parse::<bool>("PATHLOCKD_JOIN")? { cfg.join = v; }
-    if let Some(v) = env_parse::<usize>("PATHLOCKD_WRITE_QUEUE_DEPTH")? { cfg.write_queue_depth = v; }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_INFLIGHT_PER_GROUP")? { cfg.max_inflight_per_group = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_STABILITY_WINDOW_SECS")? { cfg.stability_window_secs = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_EVICTION_WINDOW_SECS")? { cfg.eviction_window_secs = v; }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_LEADER_BALANCE_INTERVAL_SECS")? { cfg.leader_balance_interval_secs = v; }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_RECONCILES")? { cfg.max_concurrent_reconciles = v; }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_GC_COMPACT_INTERVAL_SECS")? { cfg.gc_compact_interval_secs = v; }
     if let Some(v) = env_parse::<bool>("PATHLOCKD_ROCKSDB_WAL_SYNC")? { cfg.rocksdb_wal_sync = v; }
     if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_OPEN_FILES")? { cfg.rocksdb_max_open_files = v; }

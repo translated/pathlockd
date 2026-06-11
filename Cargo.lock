@@ -618,8 +618,10 @@ version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f59e967f3f675997e4a4a6b99d2a75148d59d64c46211b78b4f34ebb951b273"
 dependencies = [
+ "bincode",
  "bytes",
  "rand 0.9.4",
+ "serde",
 ]
 
 [[package]]
@@ -1465,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "pathlockd"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1479,6 +1481,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "prost",
+ "rand 0.9.4",
  "rocksdb",
  "serde",
  "tempfile",

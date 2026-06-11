@@ -16,15 +16,16 @@ use crate::engine::{
 use crate::events::Broadcaster;
 use crate::proto::{
     self, path_lock_server::PathLock, AcquireRequest, AcquireResponse, AcquireStatus,
-    AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearWaitEdgeRequest,
-    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, DumpLocksRequest,
-    DumpLocksResponse, Event, ForceReleaseRequest, ForceReleaseResponse, HealthRequest,
-    HealthResponse, IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest,
-    InspectPathResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
-    IsOwnerAliveResponse, ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock,
-    PublishEventRequest, PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest,
-    ReleaseResponse, RenewRequest, RenewResponse, RenewStatus, RequestRevokeRequest,
-    RequestRevokeResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
+    AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearClaimRequest,
+    ClearClaimResponse, ClearWaitEdgeRequest, ClearWaitEdgeResponse, CycleKind,
+    DetectCycleRequest, DetectCycleResponse, DumpLocksRequest, DumpLocksResponse, Event,
+    ForceReleaseRequest, ForceReleaseResponse, HealthRequest, HealthResponse,
+    IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest, InspectPathResponse,
+    IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse,
+    ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock, PublishEventRequest,
+    PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
+    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetClaimRequest,
+    SetClaimResponse, SetClaimStatus, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
 };
 
 fn engine_err(e: anyhow::Error) -> Status {
@@ -177,11 +178,27 @@ fn to_state(i: i32) -> Result<engine::State, Status> {
 pub struct PathLockService {
     pub router: Arc<Router>,
     pub broadcaster: Broadcaster,
+    /// With deep routing prefixes (`routing_prefix_segments` = K > 0), locks
+    /// at depth < K would span Raft groups and are rejected up front.
+    min_lock_depth: u32,
 }
 
 impl PathLockService {
-    pub fn new(router: Arc<Router>, broadcaster: Broadcaster) -> Self {
-        Self { router, broadcaster }
+    pub fn new(router: Arc<Router>, broadcaster: Broadcaster, min_lock_depth: u32) -> Self {
+        Self { router, broadcaster, min_lock_depth }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn check_lockable_depth(&self, path: &str) -> Result<(), Status> {
+        if self.min_lock_depth > 0
+            && crate::cluster::placement::path_depth(path) < self.min_lock_depth
+        {
+            return Err(Status::invalid_argument(format!(
+                "locks above routing depth {} are not supported with routing_prefix_segments > 0: {path}",
+                self.min_lock_depth
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -203,8 +220,8 @@ impl PathLock for PathLockService {
                     "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
                 )));
             }
-            for r in &req.requests { check_path(&r.path)?; }
-            for r in &req.release_requests { check_path(&r.path)?; }
+            for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
+            for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
             if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
                 check_write_fencing_token(req.fencing_token)?;
             }
@@ -294,7 +311,7 @@ impl PathLock for PathLockService {
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let ttl_ms = req.ttl_ms;
-            let outcome = router.renew(&owner_id, ttl_ms).await.map_err(engine_err)?;
+            let outcome = router.renew(&owner_id, ttl_ms, &req.domains).await.map_err(engine_err)?;
             let resp = match outcome {
                 RenewOutcome::Ok => RenewResponse { status: RenewStatus::Ok as i32, ..Default::default() },
                 RenewOutcome::Lost { path, reason } => RenewResponse { status: RenewStatus::Lost as i32, path, reason },
@@ -421,6 +438,48 @@ impl PathLock for PathLockService {
         }).await
     }
 
+    async fn set_claim(
+        &self,
+        request: Request<SetClaimRequest>,
+    ) -> Result<Response<SetClaimResponse>, Status> {
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "SetClaim", request, |request| async move {
+            let req = request.into_inner();
+            check_path(&req.path)?;
+            self.check_lockable_depth(&req.path)?;
+            check_id("claimant_owner_id", &req.claimant_owner_id)?;
+            if req.ttl_ms > MAX_CLAIM_TTL_MS {
+                return Err(Status::invalid_argument(format!("ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
+            }
+            let router = self.router.clone();
+            let outcome = router.set_claim(&req.path, &req.claimant_owner_id, req.ttl_ms).await.map_err(engine_err)?;
+            let resp = match outcome {
+                engine::ClaimOutcome::Ok => SetClaimResponse {
+                    status: SetClaimStatus::Ok as i32,
+                    claim_owner: String::new(),
+                },
+                engine::ClaimOutcome::Held { claimant } => SetClaimResponse {
+                    status: SetClaimStatus::Held as i32,
+                    claim_owner: claimant,
+                },
+            };
+            Ok(Response::new(resp))
+        }).await
+    }
+
+    async fn clear_claim(
+        &self,
+        request: Request<ClearClaimRequest>,
+    ) -> Result<Response<ClearClaimResponse>, Status> {
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ClearClaim", request, |request| async move {
+            let req = request.into_inner();
+            check_path(&req.path)?;
+            check_id("claimant_owner_id", &req.claimant_owner_id)?;
+            let router = self.router.clone();
+            router.clear_claim(&req.path, &req.claimant_owner_id).await.map_err(engine_err)?;
+            Ok(Response::new(ClearClaimResponse {}))
+        }).await
+    }
+
     async fn is_owner_alive(
         &self,
         request: Request<IsOwnerAliveRequest>,
@@ -446,14 +505,22 @@ impl PathLock for PathLockService {
                     return Err(Status::invalid_argument("claim_path and claimant_owner_id must be provided together"));
                 }
                 check_path(&req.claim_path)?;
+                self.check_lockable_depth(&req.claim_path)?;
                 check_id("claimant_owner_id", &req.claimant_owner_id)?;
                 if req.claim_ttl_ms > MAX_CLAIM_TTL_MS {
                     return Err(Status::invalid_argument(format!("claim_ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
                 }
                 let router = self.router.clone();
-                let claim_res = router.set_claim(&req.claim_path, &req.claimant_owner_id, req.claim_ttl_ms).await;
-                if let Err(e) = claim_res {
-                    tracing::warn!(owner_id = %req.owner_id, claim_path = %req.claim_path, error = %e, "failed to plant preemption claim");
+                match router.set_claim(&req.claim_path, &req.claimant_owner_id, req.claim_ttl_ms).await {
+                    Ok(engine::ClaimOutcome::Ok) => {}
+                    Ok(engine::ClaimOutcome::Held { claimant }) => {
+                        // Another waiter already reserved the path; the revoke
+                        // still proceeds — the victim cannot barge back either way.
+                        tracing::debug!(owner_id = %req.owner_id, claim_path = %req.claim_path, claimant = %claimant, "preemption claim already reserved by another claimant");
+                    }
+                    Err(e) => {
+                        tracing::warn!(owner_id = %req.owner_id, claim_path = %req.claim_path, error = %e, "failed to plant preemption claim");
+                    }
                 }
             }
             self.broadcaster.revoke(&req.owner_id);

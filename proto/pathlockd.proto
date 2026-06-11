@@ -105,6 +105,12 @@ message ReleaseResponse {}
 message RenewRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
+  // The routing domains in which this owner holds locks (the handler prefix
+  // of each held path, e.g. "google_drive"; with deeper routing prefixes,
+  // the prefix at the configured depth). Targets the renew fan-out at exactly
+  // those Raft groups. When empty, every group is probed — correct, but
+  // amplified; strongly discouraged for heartbeat-frequency renews.
+  repeated string domains = 3;
 }
 
 enum RenewStatus {
@@ -229,6 +235,48 @@ message IsOwnerAliveRequest {
 message IsOwnerAliveResponse {
   bool alive = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Claims (anti-starvation path reservations)
+//
+// A claim reserves a path for a claimant without granting the lock: new
+// acquires by other owners that overlap the claimed path (exact, ancestor, or
+// — for write requests — descendant) are refused with `preempt_claimed` while
+// existing holders drain. The claimant's own acquire consumes its claim
+// atomically on grant. Claims are TTL-governed only — they never require the
+// claimant to hold a lease, so a pure waiter (holding nothing yet) can reserve
+// the path it is queued for; a crashed claimant's reservation simply expires.
+// ---------------------------------------------------------------------------
+
+message SetClaimRequest {
+  // Path form "<handlerType>:<normalizedPath>".
+  string path = 1;
+  string claimant_owner_id = 2;
+  // Reservation TTL; 0 selects a short server default. Capped at the server's
+  // max claim TTL. Refreshing one's own claim re-arms the TTL.
+  uint64 ttl_ms = 3;
+}
+
+enum SetClaimStatus {
+  SET_CLAIM_STATUS_OK = 0;
+  // Another live claimant already reserves this path: the claim was NOT
+  // overwritten (claim-if-absent semantics). claim_owner names the holder.
+  SET_CLAIM_STATUS_HELD = 1;
+}
+
+message SetClaimResponse {
+  SetClaimStatus status = 1;
+  // The current claimant when status is HELD; empty on OK.
+  string claim_owner = 2;
+}
+
+message ClearClaimRequest {
+  string path = 1;
+  // Only this claimant's own claim is cleared; a foreign claim is untouched.
+  string claimant_owner_id = 2;
+}
+
+message ClearClaimResponse {}
 
 // ---------------------------------------------------------------------------
 // Cooperative revoke (publish a REVOKE event for an owner)
@@ -386,6 +434,8 @@ service PathLock {
   rpc IncrFencingToken(IncrFencingTokenRequest) returns (IncrFencingTokenResponse);
   rpc SetWaitEdge(SetWaitEdgeRequest) returns (SetWaitEdgeResponse);
   rpc ClearWaitEdge(ClearWaitEdgeRequest) returns (ClearWaitEdgeResponse);
+  rpc SetClaim(SetClaimRequest) returns (SetClaimResponse);
+  rpc ClearClaim(ClearClaimRequest) returns (ClearClaimResponse);
   rpc IsOwnerAlive(IsOwnerAliveRequest) returns (IsOwnerAliveResponse);
   rpc RequestRevoke(RequestRevokeRequest) returns (RequestRevokeResponse);
 

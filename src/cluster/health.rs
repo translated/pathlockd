@@ -1,15 +1,14 @@
-//! Readiness checks based on the serialized writer's actual ability to
-//! accept and apply commands.
+//! Readiness checks over the multi-raft runtime.
 
 use std::time::Duration;
 
 use crate::cluster::router::Router;
 
-/// How long the health probe waits for a no-op command to round-trip the
-/// writer queue. A writer wedged behind a RocksDB stall or a runaway command
-/// fails this, turning the node not-ready so the orchestrator can act —
-/// previously health stayed green while the write path was frozen.
-const WRITER_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the readiness probe waits for a no-op command to commit through
+/// the system group's consensus. A node that cannot reach a functioning sys
+/// leader within this window — partitioned, quorum-less, or wedged — turns
+/// not-ready so the orchestrator can act.
+const CONSENSUS_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Health status for the local node.
 #[derive(Debug, Clone)]
@@ -34,14 +33,17 @@ impl HealthStatus {
     }
 }
 
-/// Check whether the local node is ready to serve: the writer must be
-/// unpoisoned and drain a probe command within the timeout.
+/// Check whether the local node is ready to serve:
+/// - the WAL fsync batcher must be unpoisoned (fail-stop after fsync errors);
+/// - a no-op command must commit through the system group within the probe
+///   timeout, proving this node can reach working consensus end-to-end
+///   (leader election done, transport up, apply loop draining).
 pub async fn check_ready(router: &Router) -> HealthStatus {
     if !router.writer_healthy() {
-        return HealthStatus::not_ready("writer poisoned by WAL sync failure");
+        return HealthStatus::not_ready("WAL fsync failure poisoned this node");
     }
-    match router.probe_writer(WRITER_PROBE_TIMEOUT).await {
+    match router.probe_writer(CONSENSUS_PROBE_TIMEOUT).await {
         Ok(()) => HealthStatus::ready(),
-        Err(e) => HealthStatus::not_ready(format!("writer probe failed: {e}")),
+        Err(e) => HealthStatus::not_ready(format!("consensus probe failed: {e}")),
     }
 }

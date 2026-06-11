@@ -17,6 +17,9 @@ use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
 use pathlockd::store_keys;
 
+/// All single-process tests pin their state to one Raft group keyspace.
+const G: pathlockd::cluster::placement::GroupId = 0;
+
 fn open_temp_db() -> (Arc<rocksdb::DB>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("db");
@@ -41,7 +44,7 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
 }
 
 fn apply(db: &Arc<rocksdb::DB>, cmd: Command) -> ApplyResponse {
-    state_machine::apply(db, &cmd).unwrap()
+    state_machine::apply(db, G, &cmd).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +171,7 @@ fn read_heavy_workload() {
     );
 
     // Verify all readers hold the lock
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     for r in 0..readers {
         let owner = format!("reader-{r}");
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, &owner).unwrap());
@@ -202,7 +205,7 @@ fn read_write_mixed_conflict_rate() {
         "writer should be blocked by readers");
 
     // Reader count exceeds what we can scan, but all should be alive
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     for r in 0..10 {
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, &format!("r-{r}")).unwrap());
     }
@@ -286,7 +289,7 @@ fn gc_reclaims_expired_locks() {
     });
 
     // Verify: ephemeral owners are dead, permanent owners are alive
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), future + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, future + 1);
 
     let mut expired = 0u32;
     for i in 0..ephemeral_count {
@@ -384,7 +387,7 @@ fn many_owner_release_all_throughput() {
     );
 
     // Verify all are gone
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     for o in 0..owners {
         assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, &format!("fan-{o}")).unwrap(),
             "owner fan-{o} should be released");

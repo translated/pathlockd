@@ -1,0 +1,124 @@
+# pathlockd on Docker Swarm: a 3-node HA cluster.
+#
+#   docker node update --label-add pathlockd=0 <node-A>
+#   docker node update --label-add pathlockd=1 <node-B>
+#   docker node update --label-add pathlockd=2 <node-C>
+#   docker stack deploy -c docker-stack.yml pathlockd
+#
+# Why three single-replica services instead of one `replicas: 3` service:
+# every pathlockd node is stateful — it needs a stable identity (node_id), a
+# volume that follows it across restarts, and a stable DNS name peers can
+# dial. Swarm replicated tasks have none of those; three named services do.
+#
+# The placement constraints pin each instance to a labeled host because named
+# volumes are host-local: an instance rescheduled elsewhere would start on an
+# empty disk. (That case is *safe* — the bootstrap guard makes it rejoin and
+# re-sync instead of forking the cluster — but it is a full resync, not a
+# restart.) With a multi-host volume driver you may drop the constraints.
+#
+# Networking notes:
+# - seed_nodes use `tasks.<service>` DNS names: they resolve to the task IP
+#   directly. Plain service names resolve to a VIP, which breaks gossip
+#   (SWIM identities must carry real, mutually-visible ip:port addresses).
+# - raft/public addrs use service names (VIP): fine for TCP/gRPC.
+# - Clients on the same overlay network connect to any of
+#   pathlockd-{0,1,2}:50051 — every node serves every request. Publish ports
+#   only if clients live outside the overlay network.
+
+version: "3.8"
+
+x-pathlockd: &pathlockd
+  image: ghcr.io/alexpacio/pathlockd:latest
+  networks: [pathlockd]
+  stop_grace_period: 30s
+  deploy:
+    replicas: 1
+    restart_policy:
+      condition: any
+      delay: 3s
+    update_config:
+      order: stop-first # one member down at a time keeps quorum
+
+x-env: &env
+  PATHLOCKD_LISTEN: "0.0.0.0:50051"
+  PATHLOCKD_DATA_DIR: "/data/pathlockd"
+  PATHLOCKD_GOSSIP_ADDR: "0.0.0.0:7946"
+  PATHLOCKD_SEED_NODES: "tasks.pathlockd-0:7946,tasks.pathlockd-1:7946,tasks.pathlockd-2:7946"
+  PATHLOCKD_REPLICATION_FACTOR: "3"
+  PATHLOCKD_LOG_LEVEL: "info"
+
+services:
+  pathlockd-0:
+    <<: *pathlockd
+    hostname: pathlockd-0
+    environment:
+      <<: *env
+      PATHLOCKD_NODE_ID: "pathlockd-0"
+      PATHLOCKD_PUBLIC_ADDR: "http://pathlockd-0:50051"
+      PATHLOCKD_RAFT_ADDR: "http://pathlockd-0:50052"
+      # Exactly one node bootstraps. Safe to leave set: on an empty disk it
+      # first checks the seeds for an existing cluster and joins it instead.
+      PATHLOCKD_BOOTSTRAP: "true"
+    volumes:
+      - pathlockd-data-0:/data/pathlockd
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+      update_config:
+        order: stop-first
+      placement:
+        constraints: ["node.labels.pathlockd == 0"]
+
+  pathlockd-1:
+    <<: *pathlockd
+    hostname: pathlockd-1
+    environment:
+      <<: *env
+      PATHLOCKD_NODE_ID: "pathlockd-1"
+      PATHLOCKD_PUBLIC_ADDR: "http://pathlockd-1:50051"
+      PATHLOCKD_RAFT_ADDR: "http://pathlockd-1:50052"
+    volumes:
+      - pathlockd-data-1:/data/pathlockd
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+      update_config:
+        order: stop-first
+      placement:
+        constraints: ["node.labels.pathlockd == 1"]
+
+  pathlockd-2:
+    <<: *pathlockd
+    hostname: pathlockd-2
+    environment:
+      <<: *env
+      PATHLOCKD_NODE_ID: "pathlockd-2"
+      PATHLOCKD_PUBLIC_ADDR: "http://pathlockd-2:50051"
+      PATHLOCKD_RAFT_ADDR: "http://pathlockd-2:50052"
+    volumes:
+      - pathlockd-data-2:/data/pathlockd
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+        delay: 3s
+      update_config:
+        order: stop-first
+      placement:
+        constraints: ["node.labels.pathlockd == 2"]
+
+networks:
+  pathlockd:
+    driver: overlay
+    # Attachable so client containers outside this stack can join and reach
+    # pathlockd-{0,1,2}:50051 directly.
+    attachable: true
+
+volumes:
+  pathlockd-data-0:
+  pathlockd-data-1:
+  pathlockd-data-2:

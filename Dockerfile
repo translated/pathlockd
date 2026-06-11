@@ -27,7 +27,8 @@ FROM gcr.io/distroless/cc-debian13 AS runtime
 COPY --from=dirs --chown=65532:65532 /data /data
 COPY --from=builder /build/target/release/pathlockd /usr/local/bin/pathlockd
 
-EXPOSE 50051
+# 50051 client gRPC; 50052 internal raft gRPC; 7946/udp SWIM gossip.
+EXPOSE 50051 50052 7946/udp
 ENV PATHLOCKD_LISTEN=0.0.0.0:50051
 ENV PATHLOCKD_DATA_DIR=/data/pathlockd
 

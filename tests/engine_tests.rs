@@ -15,6 +15,9 @@ use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
 use pathlockd::store_keys;
 
+/// All single-process tests pin their state to one Raft group keyspace.
+const G: pathlockd::cluster::placement::GroupId = 0;
+
 /// Creates a new RocksDB in a temp directory with all column families.
 fn open_temp_db() -> (Arc<rocksdb::DB>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
@@ -30,7 +33,7 @@ fn open_temp_db() -> (Arc<rocksdb::DB>, tempfile::TempDir) {
 }
 
 fn apply(db: &Arc<rocksdb::DB>, cmd: Command) -> ApplyResponse {
-    state_machine::apply(db, &cmd).unwrap()
+    state_machine::apply(db, G, &cmd).unwrap()
 }
 
 fn wr(path: &str) -> LockReq {
@@ -235,7 +238,7 @@ fn combined_acquire_and_release_keeps_owner_alive() {
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
 
     // Alice must still be alive and own /new.
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
     assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap(), "owner lost liveness after combined acquire/release");
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/new").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
@@ -382,7 +385,7 @@ fn assert_fencing_validates_ownership() {
     });
 
     // Read-only check via StoreTxn
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let outcome = pathlockd::engine::assert_fencing_inner(&mut txn, "alice", 1, &["h:/a".to_string()]).unwrap();
     assert_eq!(outcome, AssertOutcome::Ok);
 
@@ -456,17 +459,15 @@ fn set_claim_blocks_other_owners() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    // Make Alice alive so her claim is valid
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
-    });
-
-    // Alice plants a claim on h:/a
-    apply(&db, Command {
+    // Alice plants a claim on h:/a as a PURE WAITER: she holds nothing and
+    // has no ALIVE record. Claims are TTL-governed only, so the claim must
+    // still block — this is the anti-starvation case (a waiter reserving the
+    // path it is queued for).
+    let resp = apply(&db, Command {
         request_id: None, now_ms: now,
         op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
     });
+    assert!(matches!(resp, ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Ok)));
 
     // Bob tries to acquire → conflict (preempt_claimed)
     let resp = apply(&db, Command {
@@ -474,8 +475,9 @@ fn set_claim_blocks_other_owners() {
         op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
     });
     match resp {
-        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, owner, .. }) => {
             assert_eq!(reason, "preempt_claimed");
+            assert_eq!(owner, "alice");
         }
         other => panic!("expected Conflict, got {:?}", other),
     }
@@ -486,6 +488,127 @@ fn set_claim_blocks_other_owners() {
         op: Op::Acquire(acquire_args("alice", 30_000, 3, vec![wr("h:/a")])),
     });
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+#[test]
+fn set_claim_is_claim_if_absent() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Alice reserves h:/a.
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+    assert!(matches!(resp, ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Ok)));
+
+    // Bob's claim on the same path is refused and does NOT overwrite Alice's.
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "bob".into(), ttl_ms: 5_000 },
+    });
+    match resp {
+        ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Held { claimant }) => {
+            assert_eq!(claimant, "alice");
+        }
+        other => panic!("expected Held, got {:?}", other),
+    }
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.claim_owner.as_deref(), Some("alice"));
+    drop(txn);
+
+    // Alice re-planting her own claim re-arms the TTL (still Ok).
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+    assert!(matches!(resp, ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Ok)));
+}
+
+#[test]
+fn clear_claim_only_clears_own_claim() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
+    });
+
+    // Bob's clear is a no-op on Alice's claim.
+    apply(&db, Command {
+        request_id: None, now_ms: now + 1,
+        op: Op::ClearClaim { path: "h:/a".into(), claimant: "bob".into() },
+    });
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    assert_eq!(info.claim_owner.as_deref(), Some("alice"));
+    drop(txn);
+
+    // Alice's own clear removes it; Bob can then acquire.
+    apply(&db, Command {
+        request_id: None, now_ms: now + 2,
+        op: Op::ClearClaim { path: "h:/a".into(), claimant: "alice".into() },
+    });
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 3,
+        op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+    });
+    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+}
+
+#[test]
+fn cycle_detection_traverses_pure_waiter_claim_edges() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    // Holder "bob" holds h:/a/b and is blocked by pure-waiter "alice"'s claim
+    // on h:/a (he wants to extend upward). Alice, in turn, waits on Bob's
+    // held descendant lock. Alice holds NOTHING (no ALIVE record): the cycle
+    // walk must still traverse the claim edge via is_blocking instead of
+    // pruning it on the liveness probe.
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a/b")])),
+    });
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 60_000 },
+    });
+    assert!(matches!(resp, ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Ok)));
+
+    // alice → bob (blocked by his held write on h:/a/b)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "alice".into(),
+            edge: pathlockd::raft::command::WaitEdge {
+                conflict_owner: "bob".into(),
+                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/a/b".into(), reason: "descendant_write_locked".into() }),
+            },
+            ttl_ms: 60_000,
+        },
+    });
+    // bob → alice (blocked by her claim on h:/a)
+    apply(&db, Command {
+        request_id: None, now_ms: now,
+        op: Op::SetWaitEdge {
+            owner: "bob".into(),
+            edge: pathlockd::raft::command::WaitEdge {
+                conflict_owner: "alice".into(),
+                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/a".into(), reason: "preempt_claimed".into() }),
+            },
+            ttl_ms: 60_000,
+        },
+    });
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
+    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "alice", 16).unwrap();
+    match outcome {
+        CycleOutcome::Cycle(chain) => assert_eq!(chain, vec!["alice".to_string(), "bob".to_string()]),
+        other => panic!("expected Cycle, got {:?}", other),
+    }
 }
 
 #[test]
@@ -525,11 +648,11 @@ fn wait_edge_cycle_detection() {
     });
 
     // With alive owners, verify the wait edges via is_blocking
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(
         &mut txn, "h:/x", "a", "write_locked"
     ).unwrap());
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(
         &mut txn, "h:/y", "b", "write_locked"
     ).unwrap());
@@ -553,7 +676,7 @@ fn gc_sweep_cleans_expiry_entries() {
     });
 
     // Alice's lock should now be treated as expired (lazy expiry)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 201);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 201);
     let alive = pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap();
     assert!(!alive, "owner should be expired after TTL + GC");
 }
@@ -651,7 +774,7 @@ fn is_blocking_detects_write_block() {
         op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked").unwrap());
     assert!(!pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "bob", "write_locked").unwrap());
 }
@@ -667,7 +790,7 @@ fn is_blocking_detects_read_block() {
         op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "read_locked").unwrap());
 }
 
@@ -943,7 +1066,7 @@ fn combined_held_and_new_in_same_op() {
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
 
     // Alice now holds both
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let info_a = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     let info_b = pathlockd::engine::inspect_path_inner(&mut txn, "h:/b").unwrap();
     assert_eq!(info_a.write_owner.as_deref(), Some("alice"));
@@ -991,7 +1114,7 @@ fn detect_cycle_no_cycle_chain() {
         },
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
     assert_eq!(outcome, CycleOutcome::None);
 }
@@ -1058,7 +1181,7 @@ fn detect_cycle_truncated_at_max_depth() {
     });
 
     // Walk with max_depth=2 → truncated at b→c (3 nodes visited but depth 2)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 2).unwrap();
     match outcome {
         CycleOutcome::Truncated(chain) => {
@@ -1098,13 +1221,13 @@ fn detect_cycle_stale_edge_dead_blocker() {
     });
 
     // b is dead now, cycle walk should prune the stale edge
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
     // Edge pruned, b is dead → no cycle
     assert_eq!(outcome, CycleOutcome::None);
 
     // Also verify b is no longer alive
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
     assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "b").unwrap());
 }
 
@@ -1123,7 +1246,7 @@ fn is_blocking_descendant_read_locked() {
         op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(
         &mut txn, "h:/a/b/c", "alice", "descendant_read_locked"
     ).unwrap());
@@ -1139,7 +1262,7 @@ fn is_blocking_rejects_wrong_owner() {
         op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(!pathlockd::engine::is_blocking_inner(
         &mut txn, "h:/a", "bob", "write_locked"
     ).unwrap());
@@ -1157,7 +1280,7 @@ fn is_blocking_dead_owner_prunes_read() {
     });
 
     // After TTL, is_blocking should return false (owner dead, pruned)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     assert!(!pathlockd::engine::is_blocking_inner(
         &mut txn, "h:/a", "alice", "read_locked"
     ).unwrap());
@@ -1176,13 +1299,7 @@ fn claim_on_ancestor_blocks_descendant_acquire() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    // Make Alice alive
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
-    });
-
-    // Alice claims ancestor
+    // Alice claims the ancestor as a pure waiter (no lease needed).
     apply(&db, Command {
         request_id: None, now_ms: now,
         op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
@@ -1206,13 +1323,7 @@ fn claim_on_descendant_blocks_ancestor_write_acquire() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    // Make Alice alive
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
-    });
-
-    // Alice claims a descendant
+    // Alice claims a descendant as a pure waiter (no lease needed).
     apply(&db, Command {
         request_id: None, now_ms: now,
         op: Op::SetClaim { path: "h:/a/b".into(), claimant: "alice".into(), ttl_ms: 5_000 },
@@ -1236,13 +1347,7 @@ fn same_owner_claim_consumed_on_acquire() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    // Alice is alive
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/unrelated")])),
-    });
-
-    // Alice claims /a
+    // Alice claims /a as a pure waiter.
     apply(&db, Command {
         request_id: None, now_ms: now,
         op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 5_000 },
@@ -1256,7 +1361,7 @@ fn same_owner_claim_consumed_on_acquire() {
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
 
     // Verify claim is gone
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert!(info.claim_owner.is_none());
 }
@@ -1266,19 +1371,14 @@ fn dead_claim_does_not_block() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    // Make Alice alive
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 1, 1, vec![wr("h:/unrelated")])),
-    });
-
-    // Alice claims with 1ms TTL
+    // Alice claims with 1ms TTL. Claims are TTL-governed only, so expiry is
+    // the sole way a crashed claimant's reservation goes away.
     apply(&db, Command {
         request_id: None, now_ms: now,
         op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 1 },
     });
 
-    // After TTL, the claim is dead and Alice is dead → Bob acquires
+    // After the TTL, the claim is expired → Bob acquires
     let resp = apply(&db, Command {
         request_id: None, now_ms: now + 2,
         op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
@@ -1316,7 +1416,7 @@ fn multiple_readers_on_same_path() {
     assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
 
     // All three appear in inspect
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert_eq!(info.read_owners.len(), 3);
 }
@@ -1376,7 +1476,7 @@ fn force_release_unknown_owner_is_noop() {
     });
 
     // Bob still holds
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("bob"));
 }
@@ -1456,7 +1556,7 @@ fn detect_cycle_with_no_metadata_skips_is_blocking() {
 
     // Cycle found (even though is_blocking on these paths would fail —
     // without metadata, the check is skipped)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
     match outcome {
         CycleOutcome::Cycle(chain) => {
@@ -1481,7 +1581,7 @@ fn inspect_path_returns_correct_state() {
         op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
     });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
     assert!(info.read_owners.is_empty());
@@ -1500,7 +1600,7 @@ fn list_owner_locks_returns_all_held() {
     };
     apply(&db, Command { request_id: None, now_ms: now, op: Op::Acquire(args) });
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 1);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let (_alive, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "alice").unwrap();
     assert_eq!(locks.len(), 2);
     let paths: Vec<&str> = locks.iter().map(|l| l.path.as_str()).collect();
@@ -1544,7 +1644,7 @@ fn empty_release_requests_are_noop() {
     });
 
     // Alice still holds
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
 }
@@ -1568,7 +1668,7 @@ fn stale_write_lock_of_dead_owner_is_grantable_in_one_command() {
     let now = store_keys::now_ms();
 
     {
-        let mut txn = WriteTxn::new(db.clone(), now);
+        let mut txn = WriteTxn::new(db.clone(), G, now);
         // Lock record + descendant index exactly as the engine writes them,
         // but with no owner_alive record for "ghost".
         txn.set_str(store_keys::CF_WRITE_LOCKS, b"h:/stale", "ghost", 600_000)
@@ -1592,7 +1692,7 @@ fn stale_write_lock_of_dead_owner_is_grantable_in_one_command() {
         "dead owner's lock must be granted in one command, got {resp:?}"
     );
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 2);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/stale").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("bob"));
 }
@@ -1616,7 +1716,7 @@ fn lost_acquire_commits_no_partial_state() {
 
     // Simulate external loss of the lock record (the owner set still lists it).
     {
-        let mut txn = WriteTxn::new(db.clone(), now + 1);
+        let mut txn = WriteTxn::new(db.clone(), G, now + 1);
         txn.delete_raw(store_keys::CF_WRITE_LOCKS, b"h:/a").unwrap();
         assert!(txn.commit().unwrap());
     }
@@ -1634,7 +1734,7 @@ fn lost_acquire_commits_no_partial_state() {
     }
 
     // Nothing from the failed command may be visible: h:/c is free for others.
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 3);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
     let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/c").unwrap();
     assert_eq!(info.write_owner, None, "lost acquire must not grant h:/c");
     let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "bob").unwrap();
@@ -1661,7 +1761,7 @@ fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
     let now: u64 = 1_000_000;
 
     {
-        let mut txn = WriteTxn::new(db.clone(), now);
+        let mut txn = WriteTxn::new(db.clone(), G, now);
         for i in 0..50 {
             txn.set_str(
                 store_keys::CF_WAIT_EDGES,
@@ -1694,10 +1794,11 @@ fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
     assert_eq!(s4, 0, "drained backlog scans nothing");
     assert_eq!(r1 + r2 + r3 + r4, 50, "every record reclaimed exactly once");
 
-    // The cursor is persisted in the meta CF.
+    // The cursor is persisted in the meta CF under the group's keyspace.
     let meta = db.cf_handle(store_keys::CF_META).unwrap();
+    let cursor_key = store_keys::group_key(G, store_keys::META_GC_CURSOR_KEY);
     assert!(
-        db.get_cf(&meta, store_keys::META_GC_CURSOR_KEY).unwrap().is_some(),
+        db.get_cf(&meta, &cursor_key).unwrap().is_some(),
         "gc cursor must be persisted"
     );
 }
@@ -1718,7 +1819,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
 
     // Seed 66_000 live members (> MAX_SET_ENUM_MEMBERS = 65_536) directly.
     {
-        let mut txn = WriteTxn::new(db.clone(), now);
+        let mut txn = WriteTxn::new(db.clone(), G, now);
         txn.set_str(
             store_keys::CF_OWNER_ALIVE,
             &store_keys::alive_key("hoarder"),
@@ -1739,7 +1840,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
     }
 
     // One-shot enumeration (renew) hits the limit error.
-    let err = state_machine::apply(&db, &Command {
+    let err = state_machine::apply(&db, G, &Command {
         request_id: None, now_ms: now + 2,
         op: Op::Renew { owner: "hoarder".into(), ttl_ms: 600_000 },
     })
@@ -1756,7 +1857,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
     });
     assert!(matches!(resp, ApplyResponse::Unit));
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), now + 4);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 4);
     assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "hoarder").unwrap());
     let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "hoarder").unwrap();
     assert!(locks.is_empty(), "hold set must be fully cleaned");
@@ -1792,7 +1893,9 @@ fn fence_refreshes_reuse_one_quantized_expiry_slot() {
     let mut iter = db.raw_iterator_cf(&expiry);
     iter.seek_to_first();
     while iter.valid() {
-        if let Some((_exp, cf, _pk)) = store_keys::decode_expiry_entry(iter.key().unwrap()) {
+        // Strip the 4-byte group prefix before decoding the expiry entry.
+        let key = iter.key().unwrap();
+        if let Some((_exp, cf, _pk)) = store_keys::decode_expiry_entry(&key[4..]) {
             if cf == store_keys::CF_FENCES {
                 fence_entries += 1;
             }

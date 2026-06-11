@@ -27,11 +27,19 @@ Configuration is loaded from lowest to highest precedence:
 
 | Field | Default | Description |
 |---|---|---|
-| `group_count` | `256` | Number of Raft groups (shards) |
-| `replication_factor` | `3` | Voters per Raft group (must be odd) |
-| `seed_nodes` | `[]` | Bootstrap seed nodes for SWIM gossip |
-| `bootstrap` | `false` | Set to `true` on the first node to create a new cluster |
-| `join` | `false` | Set to `true` when joining an existing cluster |
+| `group_count` | `32` | Number of Raft groups (shards; fixed at cluster birth) |
+| `routing_prefix_segments` | `0` | Path depth of the routing domain (0 = handler only) |
+| `replication_factor` | `3` | Voters per Raft group (odd; auto-degrades to the node count and upgrades as nodes join) |
+| `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
+| `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
+| `public_addr` / `raft_addr` | localhost | Addresses advertised to peers — must be reachable cluster-wide |
+| `gossip_addr` | `0.0.0.0:7946` | SWIM UDP bind; `gossip_advertise_addr` overrides the advertised ip:port |
+| `stability_window_secs` | `30` | Node uptime before reconcilers place replicas on it |
+| `eviction_window_secs` | `60` | How long a dead voter must be gone before replacement |
+| `leader_balance_interval_secs` | `60` | Leadership rebalancing cadence |
+| `max_inflight_per_group` | `1024` | Per-group write budget (overflow → `UNAVAILABLE`) |
+| `raft_election_timeout_min_ms`/`_max_ms` | `1500`/`3000` | Failover time ceiling |
+| `raft_heartbeat_interval_ms` | `500` | Leader heartbeat |
 
 ### Storage settings
 
@@ -52,7 +60,7 @@ public_addr = "http://pathlockd-0.pathlockd:50051"
 raft_addr = "http://pathlockd-0.pathlockd:50052"
 gossip_addr = "0.0.0.0:7946"
 seed_nodes = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946", "pathlockd-2.pathlockd:7946"]
-group_count = 256
+group_count = 32
 replication_factor = 3
 group_gc_interval_secs = 1
 group_gc_batch = 1024
@@ -66,36 +74,54 @@ log_level = "info"
 ### Single-node mode
 
 ```bash
-pathlockd --config pathlockd.toml
+pathlockd --config pathlockd.toml   # with bootstrap = true
 ```
 
-The node opens its local RocksDB at `data_dir/groups/g000001/db` and serves
-gRPC on the configured `listen` address.
+A 1-node cluster: fully functional (RF 1), no fault tolerance. The node opens
+its RocksDB at `data_dir/db` and serves gRPC on `listen`.
 
 ### Multi-node cluster
 
-**Bootstrap the first node:**
+**Bootstrap the first node** (`bootstrap = true`, exactly one node, once):
 
 ```bash
-pathlockd --config pathlockd.toml  # with bootstrap = true
+pathlockd --config pathlockd-0.toml
 ```
 
-**Join additional nodes:**
+**Join additional nodes** — no join flag; presence of `seed_nodes` is enough:
 
 ```bash
-pathlockd --config pathlockd.toml  # with join = true, seed_nodes populated
+pathlockd --config pathlockd-1.toml   # seed_nodes = ["<node-0-gossip>:7946", ...]
 ```
+
+A joining node announces itself via SWIM; group leaders adopt it as a learner
+(snapshot + log catch-up) and promote it to voter once it is stable for
+`stability_window_secs`. With 3 nodes every group reaches RF 3 automatically.
+Until adopted, the node already serves all client traffic by proxying to the
+current leaders.
+
+**Scale down / decommission:** stop the node. Its groups keep quorum (RF 3
+tolerates one loss), and after `eviction_window_secs` the survivors elect a
+replacement placement. For a planned removal, drain first (internal
+`RaftTransport/SetDraining` RPC) so leaderships migrate before the stop.
+
+**Node replacement with an empty disk** (volume lost, pod rescheduled): start
+it with the same `node_id` and seeds. The bootstrap guard prevents
+re-initialization; the node rejoins, receives snapshots, and re-syncs. Note
+the standard Raft caveat: a *voter* that loses its disk also loses its vote —
+prefer replacing the node id (next ordinal) when you can, and let the old
+identity age out via the eviction window.
+
+**Docker Swarm:** see [`docker-stack.yml`](../docker-stack.yml) — three
+single-replica services (stable identity + per-node volume each) on one
+overlay network, `tasks.*` DNS for gossip seeds.
 
 ## Health checks
 
-Health status reports ready when:
-
-- RocksDB opened all local groups
-- Gossip/SWIM started
-- Internal Raft transport started
-- Local node has joined the cluster
-- `g_sys` has a known leader
-- Enough groups have leader/quorum
+Readiness is proven end-to-end: the probe commits a no-op command through the
+system Raft group (locally or forwarded to its leader) within 2 seconds. A
+node that is partitioned, quorum-less, or wedged turns not-ready. A WAL fsync
+failure poisons the node permanently (fail-stop) until restart.
 
 ```bash
 pathlockd --health-check
@@ -154,17 +180,12 @@ export OTEL_SDK_DISABLED=true
 
 ```
 <data_dir>/
-  groups/
-    g000001/
-      db/               # RocksDB with all column families
-    g000002/
-      db/
-    ...
-    sys/
-      db/               # System group for fencing tokens
+  db/                   # one RocksDB per node, shared by all hosted groups
 ```
 
-Each `db/` directory contains a RocksDB database with these column families:
+Every key carries a 4-byte big-endian group prefix, so each Raft group owns a
+contiguous, range-deletable keyspace inside the shared database. The column
+families:
 
 | CF | Content |
 |---|---|
@@ -181,6 +202,7 @@ Each `db/` directory contains a RocksDB database with these column families:
 | `owner_holds` | `owner:NUL:mode:NUL:path -> OwnedLockRecord` |
 | `wait_edges` | `owner -> WaitEdgeRecord` |
 | `expiry` | `be64(expires_at):NUL:kind:NUL:primary_key -> ExpiryRecord` |
+| `request_dedupe` | `request_id -> cached ApplyResponse` (apply-once forwarding) |
 
 ## Tuning
 
@@ -201,19 +223,34 @@ Set `group_gc_interval_secs = 0` to disable active GC (lazy expiry still applies
 - `max_concurrent_requests_per_connection`: Per-HTTP/2 connection limit. Default `256`.
 - `request_timeout_ms`: Server-side deadline per RPC. Default `30000`.
 
-### Lock domain cardinality
+### Lock domain cardinality and write scaling
 
-- `group_count` should exceed the number of hot lock domains by at least 4x.
-  Each domain maps to exactly one Raft group via HRW hashing.
-- Multi-domain acquires are rejected in the current version.
+- Each routing domain maps to exactly one Raft group (HRW); all writes for a
+  domain serialize through that group's leader. Write throughput scales with
+  the number of *domains*, spread across nodes by leader balancing.
+- Few handlers? Set `routing_prefix_segments = K` to shard by the first K
+  path segments — locks above depth K are then rejected (containment must
+  stay single-group).
+- Multi-domain acquires are rejected; owner-wide operations (renew,
+  release-all, force-release) fan out per group. Clients should declare
+  `RenewRequest.domains` so heartbeats touch only the groups holding state.
 
 ## Troubleshooting
 
 ### Node won't start
 
 - Check `data_dir` exists and is writable
-- Verify `node_id` is unique across the cluster
-- Verify `replication_factor` is odd and <= cluster size
+- `node_id` must be unique and end in an integer (`pathlockd-3`)
+- A non-bootstrap node refuses to start without `seed_nodes`
+- Verify `raft_addr`/`gossip_addr` ports are free and reachable by peers
+  (gossip is UDP — check firewalls separately from TCP)
+
+### Cluster won't form
+
+- Seeds must resolve to concrete per-node addresses, not a load-balanced VIP
+  (on Swarm use `tasks.<service>`; on k8s the headless service)
+- Watch for `gossip: member up` lines on both sides; if absent, UDP is blocked
+- `bootstrap` on exactly one node; the others join via seeds
 
 ### High lock latency
 

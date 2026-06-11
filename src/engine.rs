@@ -122,16 +122,26 @@ pub enum CycleOutcome {
     Truncated(Vec<String>),
 }
 
+/// Outcome of planting a claim (claim-if-absent semantics).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ClaimOutcome {
+    Ok,
+    /// Another live claimant already reserves the path; nothing was written.
+    Held {
+        claimant: String,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WaitEdgeMetadata {
     pub conflict_path: String,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WaitEdge {
-    conflict_owner: String,
-    metadata: Option<WaitEdgeMetadata>,
+    pub conflict_owner: String,
+    pub metadata: Option<WaitEdgeMetadata>,
 }
 
 const WAIT_EDGE_V1_PREFIX: &str = "v1:";
@@ -203,17 +213,12 @@ fn get_live_write_owner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<O
     Ok(None)
 }
 
+/// Claims are TTL-governed only: a claim is live until its key expires,
+/// independent of any liveness lease. This is deliberate — the claimant is
+/// typically a *waiter* that holds nothing yet (so it has no ALIVE record),
+/// and a crashed claimant's reservation self-expires within the claim TTL.
 fn get_live_claim<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<String>> {
-    let claim_k = claim_key(path);
-    let Some(claimant) = tx.get_str(CLAIM_CF, &claim_k)? else {
-        return Ok(None);
-    };
-    if owner_alive(tx, &claimant)? {
-        return Ok(Some(claimant));
-    }
-    tx.del(CLAIM_CF, &claim_k)?;
-    remove_claim_indexes(tx, path)?;
-    Ok(None)
+    tx.get_str(CLAIM_CF, &claim_key(path))
 }
 
 fn find_blocking_claim<T: StoreTxn>(
@@ -929,6 +934,14 @@ fn parse_len_field(input: &str) -> Option<(usize, &str)> {
     Some((len.parse::<usize>().ok()?, rest))
 }
 
+/// Read one owner's wait edge (if any) from the wait-graph keyspace.
+pub fn read_wait_edge<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<Option<WaitEdge>> {
+    match tx.get_str(WAIT_CF, &wait_key(owner))? {
+        None => Ok(None),
+        Some(raw) => Ok(Some(parse_wait_edge(raw)?)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DETECT_CYCLE
 // ---------------------------------------------------------------------------
@@ -955,16 +968,26 @@ pub fn detect_cycle_inner<T: StoreTxn>(
         };
         let next = edge.conflict_owner;
 
-        if tx.get_str(ALIVE_CF, &alive_key(&next))?.is_none() {
-            tx.del(WAIT_CF, &wait_key(&current))?;
-            tx.del(WAIT_CF, &wait_key(&next))?;
-            return Ok(CycleOutcome::None);
-        }
-
-        if let Some(meta) = edge.metadata {
-            if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason)? {
-                tx.del(WAIT_CF, &wait_key(&current))?;
-                return Ok(CycleOutcome::None);
+        match edge.metadata {
+            // is_blocking is authoritative when the edge carries metadata: it
+            // covers lock state (which itself checks owner liveness) and
+            // TTL-governed claims — a pure-waiter claimant has no ALIVE record
+            // but still blocks, so a bare liveness probe would wrongly prune
+            // claim edges and hide claim-involved cycles.
+            Some(meta) => {
+                if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason)? {
+                    tx.del(WAIT_CF, &wait_key(&current))?;
+                    return Ok(CycleOutcome::None);
+                }
+            }
+            // Legacy edge without metadata: liveness is the only staleness
+            // signal available.
+            None => {
+                if tx.get_str(ALIVE_CF, &alive_key(&next))?.is_none() {
+                    tx.del(WAIT_CF, &wait_key(&current))?;
+                    tx.del(WAIT_CF, &wait_key(&next))?;
+                    return Ok(CycleOutcome::None);
+                }
             }
         }
 
@@ -1029,19 +1052,43 @@ pub fn clear_wait_edge_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Re
     tx.del(WAIT_CF, &wait_key(owner))
 }
 
+/// Plant a claim with claim-if-absent semantics: a live claim by another
+/// claimant is never overwritten (it is returned instead), while re-planting
+/// one's own claim re-arms its TTL.
 pub fn set_claim_inner<T: StoreTxn>(
     tx: &mut T,
     path: &str,
     claimant: &str,
     ttl_ms: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ClaimOutcome> {
     let ttl = if ttl_ms == 0 {
         CLAIM_DEFAULT_TTL_MS
     } else {
         ttl_ms
     };
+    if let Some(current) = get_live_claim(tx, path)? {
+        if current != claimant {
+            return Ok(ClaimOutcome::Held { claimant: current });
+        }
+    }
     tx.set_str(CLAIM_CF, &claim_key(path), claimant, ttl)?;
-    add_claim_indexes(tx, path, ttl)
+    add_claim_indexes(tx, path, ttl)?;
+    Ok(ClaimOutcome::Ok)
+}
+
+/// Clear a claimant's own claim. A foreign claim is left untouched, so a
+/// late/duplicated clear can never erase a competitor's reservation.
+pub fn clear_claim_inner<T: StoreTxn>(
+    tx: &mut T,
+    path: &str,
+    claimant: &str,
+) -> anyhow::Result<()> {
+    let claim_k = claim_key(path);
+    if tx.get_str(CLAIM_CF, &claim_k)?.as_deref() == Some(claimant) {
+        tx.del(CLAIM_CF, &claim_k)?;
+        remove_claim_indexes(tx, path)?;
+    }
+    Ok(())
 }
 
 pub fn is_owner_alive_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<bool> {
@@ -1052,7 +1099,7 @@ pub fn is_owner_alive_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Res
 // Inspection (read-only observability)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PathInfo {
     pub write_owner: Option<String>,
     pub read_owners: Vec<String>,
@@ -1060,13 +1107,13 @@ pub struct PathInfo {
     pub claim_owner: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct OwnedLock {
     pub path: String,
     pub mode: Mode,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LockEntry {
     pub owner: String,
     pub path: String,
@@ -1074,7 +1121,7 @@ pub struct LockEntry {
     pub fence: Option<i64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct LockDumpPage {
     pub entries: Vec<LockEntry>,
     pub next_cursor: Option<Vec<u8>>,
@@ -1096,10 +1143,9 @@ pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
 
     let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?);
 
-    let claim_owner = match tx.get_str(CLAIM_CF, &claim_key(path))? {
-        Some(claimant) if owner_alive(tx, &claimant)? => Some(claimant),
-        _ => None,
-    };
+    // Claims are TTL-governed only; an unexpired claim is live regardless of
+    // whether the claimant holds a lease (pure waiters hold nothing).
+    let claim_owner = tx.get_str(CLAIM_CF, &claim_key(path))?;
 
     Ok(PathInfo {
         write_owner,

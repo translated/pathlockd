@@ -33,14 +33,20 @@ async fn start_daemon() -> Daemon {
     std::fs::create_dir_all(&data_dir).unwrap();
 
     let port = alloc_port();
+    let raft_port = alloc_port();
+    let gossip_port = alloc_port();
     let config_path = dir.path().join("pathlockd.toml");
     let config = format!(
         r#"
 listen = "127.0.0.1:{port}"
 node_id = "e2e-test-{port}"
 data_dir = "{}"
+public_addr = "http://127.0.0.1:{port}"
+raft_addr = "http://127.0.0.1:{raft_port}"
+gossip_addr = "127.0.0.1:{gossip_port}"
 group_count = 4
 replication_factor = 1
+bootstrap = true
 group_gc_interval_secs = 1
 group_gc_batch = 1024
 event_buffer = 128
@@ -180,6 +186,7 @@ async fn e2e_renew_and_lost() {
         .renew(RenewRequest {
             owner_id: "renew-test".into(),
             ttl_ms: 10000,
+            domains: vec![],
         })
         .await
         .unwrap()
@@ -566,14 +573,20 @@ async fn connect_ready(port: u16) -> PathLockClient<Channel> {
 }
 
 fn spawn_daemon_at(dir: &std::path::Path, data_dir: &std::path::Path, port: u16) -> Child {
+    let raft_port = alloc_port();
+    let gossip_port = alloc_port();
     let config_path = dir.join(format!("pathlockd-{port}.toml"));
     let config = format!(
         r#"
 listen = "127.0.0.1:{port}"
-node_id = "e2e-crash-{port}"
+node_id = "e2e-crash-0"
 data_dir = "{}"
+public_addr = "http://127.0.0.1:{port}"
+raft_addr = "http://127.0.0.1:{raft_port}"
+gossip_addr = "127.0.0.1:{gossip_port}"
 group_count = 4
 replication_factor = 1
+bootstrap = true
 group_gc_interval_secs = 1
 group_gc_batch = 1024
 event_buffer = 128

@@ -7,10 +7,16 @@
 //! one member per RocksDB key as `set_key \0 member`, so the per-path/per-owner
 //! "set" is the contiguous key range under `set_key \0`.
 //!
+//! Every key below additionally carries a 4-byte big-endian **group prefix**
+//! (see `group_key`): one node hosts replicas of many Raft groups in a single
+//! RocksDB, and each group owns a contiguous, range-deletable keyspace. The
+//! transaction layer applies the prefix; engine-level code only ever sees
+//! group-relative keys.
+//!
 //! ```text
 //! cf:default          catches any key not routed to a specific CF (safety net)
-//! cf:meta             fence counter, gc cursor, raft metadata
-//! cf:raft_log         raft log entries
+//! cf:meta             fence counter, gc cursor, raft vote/membership/applied
+//! cf:raft_log         be_u32(group) ++ be_u64(index) -> log entry
 //! cf:write_locks      path -> owner record
 //! cf:read_locks       path\0 \0owner -> member record
 //! cf:fences           path -> fencing token record
@@ -22,9 +28,12 @@
 //! cf:owner_holds      owner\0 \0mode:path -> member record
 //! cf:wait_edges       owner -> wait edge record
 //! cf:expiry           be_u64(expires_at)\0cf_name\0primary_key -> expiry record
+//! cf:request_dedupe   request_id -> cached ApplyResponse record
 //! ```
 
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::cluster::placement::GroupId;
 
 pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
@@ -35,10 +44,47 @@ pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
 /// index row — and its eventual tombstone — per refresh.
 pub const EXPIRY_INDEX_QUANTUM_MS: u64 = 3_600_000;
 
-// --- meta column family keys ---
+// --- meta column family keys (group-relative; the transaction layer scopes
+// --- them to a group, see `group_key`) ---
 
 pub const META_FENCE_COUNTER_KEY: &[u8] = b"fence_counter";
 pub const META_GC_CURSOR_KEY: &[u8] = b"gc_cursor";
+pub const META_LAST_NOW_KEY: &[u8] = b"last_now_ms";
+pub const META_VOTE_KEY: &[u8] = b"raft_vote";
+pub const META_COMMITTED_KEY: &[u8] = b"raft_committed";
+pub const META_LAST_APPLIED_KEY: &[u8] = b"raft_last_applied";
+pub const META_MEMBERSHIP_KEY: &[u8] = b"raft_membership";
+pub const META_PURGED_KEY: &[u8] = b"raft_purged";
+pub const META_SNAPSHOT_META_KEY: &[u8] = b"raft_snapshot_meta";
+pub const META_SNAPSHOT_DATA_KEY: &[u8] = b"raft_snapshot_data";
+
+// --- group scoping ---
+//
+// Every node hosts replicas of many Raft groups in ONE shared RocksDB. All
+// keys in every state CF (and the raft log / per-group meta) carry a fixed
+// 4-byte big-endian group prefix so each group owns a contiguous, range-
+// deletable keyspace.
+
+/// The 4-byte key prefix of a group's keyspace.
+pub fn group_prefix(group: GroupId) -> [u8; 4] {
+    group.to_be_bytes()
+}
+
+/// Scope a group-relative key into the group's keyspace.
+pub fn group_key(group: GroupId, key: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(4 + key.len());
+    buf.extend_from_slice(&group.to_be_bytes());
+    buf.extend_from_slice(key);
+    buf
+}
+
+/// The half-open key range `[start, end)` covering a group's entire keyspace
+/// within one column family. `end` is `None` for the last possible group.
+pub fn group_range(group: GroupId) -> (Vec<u8>, Option<Vec<u8>>) {
+    let start = group.to_be_bytes().to_vec();
+    let end = group.checked_add(1).map(|g| g.to_be_bytes().to_vec());
+    (start, end)
+}
 
 // --- column family names ---
 
@@ -55,6 +101,9 @@ pub const CF_OWNER_ALIVE: &str = "owner_alive";
 pub const CF_OWNER_HOLDS: &str = "owner_holds";
 pub const CF_WAIT_EDGES: &str = "wait_edges";
 pub const CF_EXPIRY: &str = "expiry";
+/// Request-id → cached ApplyResponse, so a command retried after an
+/// ambiguous timeout (e.g. re-forwarded after a leader change) applies once.
+pub const CF_DEDUPE: &str = "request_dedupe";
 
 /// All state-machine column families (excluding CF_RAFT_LOG and CF_META which
 /// are owned by openraft's storage wrappers).
@@ -70,6 +119,7 @@ pub const STATE_CFS: &[&str] = &[
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
     CF_EXPIRY,
+    CF_DEDUPE,
 ];
 
 /// All column families including raft internals.
@@ -88,6 +138,7 @@ pub const ALL_CFS: &[&str] = &[
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
     CF_EXPIRY,
+    CF_DEDUPE,
 ];
 
 // --- key encoding ---

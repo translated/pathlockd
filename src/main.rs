@@ -8,18 +8,24 @@ use std::{
 
 use futures::FutureExt;
 use tonic::transport::{Endpoint, Server};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use pathlockd::cluster::gossip;
-use pathlockd::cluster::router::{Router, WriterOptions};
+use pathlockd::cluster::controller::{spawn_controller, ControllerOptions};
+use pathlockd::cluster::gossip::{self, NodeIdentity};
+use pathlockd::cluster::placement::SYS_GROUP;
+use pathlockd::cluster::router::{Router, RoutingOptions};
 use pathlockd::config::Config;
 use pathlockd::events::Broadcaster;
 use pathlockd::otel;
 use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::path_lock_server::PathLockServer;
 use pathlockd::proto::HealthRequest;
+use pathlockd::raft::log_store::FsyncBatcher;
+use pathlockd::raft::manager::{raft_config, RaftGroups};
+use pathlockd::raft::network::PeerPool;
+use pathlockd::raft::server::RaftTransportService;
+use pathlockd::raft_proto::raft_transport_server::RaftTransportServer;
 use pathlockd::service::PathLockService;
-use pathlockd::store_keys;
 use pathlockd::store_rocksdb::{open_db, DbTuning};
 
 const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
@@ -36,42 +42,30 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let telemetry = otel::init(&cfg.log_level)?;
+    let node_id = cfg.numeric_node_id()?;
+    let node_meta = cfg.node_meta();
 
     info!(
         listen = %cfg.listen,
         node_id = %cfg.node_id,
+        numeric_node_id = node_id,
         data_dir = %cfg.data_dir.display(),
         group_count = cfg.group_count,
         replication_factor = cfg.replication_factor,
+        raft_addr = %cfg.raft_addr,
         gossip_addr = %cfg.gossip_addr,
         seed_nodes = ?cfg.seed_nodes,
-        request_timeout_ms = cfg.request_timeout_ms,
+        bootstrap = cfg.bootstrap,
         otel_traces = telemetry.traces_enabled(),
         otel_metrics = telemetry.metrics_enabled(),
         "starting pathlockd"
     );
 
-    if cfg.clustering_requested() {
-        warn!(
-            replication_factor = cfg.replication_factor,
-            seed_nodes = ?cfg.seed_nodes,
-            join = cfg.join,
-            "clustered replication is configured but NOT implemented yet: every \
-             replica grants locks from its own private store, so running more \
-             than one replica against the same clients silently breaks mutual \
-             exclusion. Run exactly one replica until Raft replication lands. \
-             (Cross-instance event fan-out via peers/peer_discovery_dns is \
-             best-effort delivery only and does not replicate lock state.)"
-        );
-    }
-
-    // Ensure data directory exists
+    // One shared RocksDB per node; every hosted Raft group owns a prefixed
+    // keyspace inside it.
     std::fs::create_dir_all(&cfg.data_dir)?;
-
-    // Open the local RocksDB for single-process/single-group mode (P1-P2).
-    let db_path = cfg.data_dir.join("groups").join("g000001").join("db");
+    let db_path = cfg.data_dir.join("db");
     std::fs::create_dir_all(&db_path)?;
-
     let db = open_db(
         &db_path,
         &DbTuning {
@@ -83,24 +77,134 @@ async fn main() -> anyhow::Result<()> {
         },
     )?;
 
-    // Start gossip (SWIM stub in P0-P2)
-    let gossip_addr: SocketAddr = cfg.gossip_addr.parse()?;
-    let _members = gossip::start_gossip(1, gossip_addr, cfg.seed_nodes.clone()).await?;
+    // The node-wide WAL fsync batcher (group commit across all raft groups).
+    let batcher = FsyncBatcher::start(db.clone(), cfg.rocksdb_wal_sync);
 
-    // Router owns the serialized writer thread (bounded queue + group commit).
-    let router = Arc::new(Router::new(
+    // Multi-raft runtime.
+    let groups = RaftGroups::new(
         db.clone(),
-        WriterOptions {
-            queue_depth: cfg.write_queue_depth,
-            wal_sync: cfg.rocksdb_wal_sync,
+        node_id,
+        node_meta.clone(),
+        raft_config(&cfg),
+        batcher,
+        PeerPool::new(),
+    )?;
+
+    // Resume every group with prior local raft state (restart path). Whether
+    // to *initialize* a brand-new cluster is decided after gossip is up, so
+    // an empty-disk node configured to bootstrap can detect an existing
+    // cluster and join it instead (split-brain guard).
+    let resumed = resume_local_groups(&groups, &db, cfg.group_count).await?;
+    info!(resumed, "resumed locally-known raft groups");
+
+    // Internal raft transport (protocol RPCs, forwarding) on raft_addr.
+    let raft_listen = raft_listen_addr(&cfg.raft_addr)?;
+    {
+        let transport = RaftTransportService::new(groups.clone(), cfg.group_count);
+        tokio::spawn(async move {
+            let server = Server::builder()
+                .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
+                .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
+                .tcp_keepalive(Some(TCP_KEEPALIVE))
+                .add_service(RaftTransportServer::new(transport))
+                .serve(raft_listen)
+                .await;
+            if let Err(e) = server {
+                error!(error = %e, "raft transport server exited");
+            }
+        });
+        info!(%raft_listen, "raft transport listening");
+    }
+
+    // SWIM gossip: discovery + failure hints. The advertised gossip address
+    // is the identity's cluster-wide Addr, so it must be a concrete ip:port.
+    let gossip_bind: SocketAddr = cfg.gossip_addr.parse()?;
+    let first_seed = match cfg.seed_nodes.first() {
+        Some(seed) => tokio::net::lookup_host(seed.as_str())
+            .await
+            .ok()
+            .and_then(|mut addrs| addrs.next()),
+        None => None,
+    };
+    let gossip_advertised = gossip::advertised_addr(
+        gossip_bind,
+        cfg.gossip_advertise_addr.as_deref(),
+        first_seed.as_ref(),
+    )?;
+    let mut advertised_meta = node_meta.clone();
+    advertised_meta.gossip_addr = gossip_advertised.to_string();
+    let identity = NodeIdentity {
+        node_id,
+        meta: advertised_meta,
+        incarnation: pathlockd::store_keys::now_ms(),
+    };
+    info!(%gossip_advertised, "gossip advertise address");
+    let members = gossip::start_gossip(identity, gossip_bind, cfg.seed_nodes.clone()).await?;
+
+    // Router: path→group routing, leader forwarding, fan-out.
+    let router = Arc::new(Router::new(
+        groups.clone(),
+        RoutingOptions {
+            group_count: cfg.group_count,
+            routing_prefix_segments: cfg.routing_prefix_segments,
+            max_inflight_per_group: cfg.max_inflight_per_group,
         },
+        Some(members.watch()),
     ));
     otel::register_writer_queue_depth(router.write_queue_depth());
 
-    // Events: cross-instance fan-out
-    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
+    // Bootstrap decision (split-brain guard). Initializing groups is only
+    // allowed when this node has no prior raft state AND no existing cluster
+    // answers through the seeds — a bootstrap-configured node restarting on a
+    // wiped volume must rejoin its old cluster, never found a second one.
+    if cfg.bootstrap {
+        if resumed > 0 {
+            // Prior state: cores resumed above; (re-)initialize is a no-op.
+            info!("bootstrap flag set but local raft state exists; resuming, not re-initializing");
+        } else if !cfg.seed_nodes.is_empty()
+            && router
+                .discover_existing_cluster(Duration::from_secs(10))
+                .await
+        {
+            warn!(
+                "bootstrap requested on an empty disk, but an existing cluster \
+                 answered through the seeds — refusing to initialize a second \
+                 cluster; joining the existing one instead"
+            );
+        } else {
+            let voters = std::collections::BTreeMap::from([(node_id, node_meta.clone())]);
+            for group in (0..cfg.group_count).chain([SYS_GROUP]) {
+                groups.bootstrap_group(group, voters.clone()).await?;
+            }
+            info!(
+                groups = cfg.group_count + 1,
+                "bootstrap: all groups initialized"
+            );
+        }
+    }
 
-    // Start per-group GC tasks (routed through the serialized writer).
+    // Elastic membership: every node reconciles the groups it leads.
+    spawn_controller(
+        groups.clone(),
+        router.clone(),
+        members.clone(),
+        ControllerOptions {
+            group_count: cfg.group_count,
+            replication_factor: cfg.replication_factor,
+            stability_window: Duration::from_secs(cfg.stability_window_secs),
+            eviction_window: Duration::from_secs(cfg.eviction_window_secs),
+            reconcile_interval: Duration::from_secs(5),
+            leader_balance_interval: Duration::from_secs(cfg.leader_balance_interval_secs),
+            max_concurrent_reconciles: cfg.max_concurrent_reconciles,
+        },
+    );
+
+    // Events: cross-instance fan-out — static peers + gossip-discovered ones.
+    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
+    spawn_event_peer_sync(broadcaster.clone(), members.clone(), node_id);
+
+    // GC: each node sweeps the groups it leads (the sweep is a raft command,
+    // so followers apply the identical reclaim).
     if cfg.group_gc_interval_secs > 0 {
         spawn_group_gc(
             router.clone(),
@@ -109,20 +213,12 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Periodically drop the already-swept region of the expiry index from
-    // disk so its tombstones never pile up in front of future scans.
+    // Physical expiry-index maintenance for locally-hosted groups.
     if cfg.gc_compact_interval_secs > 0 {
-        spawn_expiry_maintenance(db.clone(), cfg.gc_compact_interval_secs);
+        spawn_expiry_maintenance(db.clone(), groups.clone(), cfg.gc_compact_interval_secs);
     }
 
-    // Peer discovery (DNS-based)
-    if let Some(dns) = cfg.peer_discovery_dns.clone() {
-        let self_ip = parse_self_ip(cfg.self_ip.as_deref());
-        info!(%dns, refresh_secs = cfg.peer_refresh_secs, self_ip = ?self_ip, "peer discovery enabled");
-        spawn_peer_discovery(broadcaster.clone(), dns, self_ip, cfg.peer_refresh_secs);
-    }
-
-    let path_lock = PathLockService::new(router, broadcaster.clone());
+    let path_lock = PathLockService::new(router, broadcaster.clone(), cfg.routing_prefix_segments);
     let addr: SocketAddr = cfg
         .listen
         .parse()
@@ -146,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         Ok(_) => info!("pathlockd stopped"),
         Err(e) => error!(error = %e, "pathlockd stopped with server error"),
     }
+    groups.shutdown_all().await;
     if let Err(e) = telemetry.shutdown() {
         warn!(error = %e, "OpenTelemetry shutdown failed");
     }
@@ -154,12 +251,87 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Restart the raft cores of every group with prior local state (identified
+/// by a persisted vote or membership in the group's meta keyspace).
+async fn resume_local_groups(
+    groups: &Arc<RaftGroups>,
+    db: &Arc<rocksdb::DB>,
+    group_count: u32,
+) -> anyhow::Result<u32> {
+    use pathlockd::store_keys;
+    let mut resumed = 0;
+    for group in (0..group_count).chain([SYS_GROUP]) {
+        let has_state = {
+            let meta = db
+                .cf_handle(store_keys::CF_META)
+                .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+            db.get_cf(
+                &meta,
+                store_keys::group_key(group, store_keys::META_VOTE_KEY),
+            )?
+            .is_some()
+                || db
+                    .get_cf(
+                        &meta,
+                        store_keys::group_key(group, store_keys::META_MEMBERSHIP_KEY),
+                    )?
+                    .is_some()
+        };
+        if has_state {
+            groups.start_group(group).await?;
+            resumed += 1;
+        }
+    }
+    Ok(resumed)
+}
+
+/// The socket address the raft transport binds: the port of `raft_addr`, on
+/// all interfaces.
+fn raft_listen_addr(raft_addr: &str) -> anyhow::Result<SocketAddr> {
+    let without_scheme = raft_addr
+        .strip_prefix("http://")
+        .or_else(|| raft_addr.strip_prefix("https://"))
+        .unwrap_or(raft_addr);
+    let authority = without_scheme.trim_end_matches('/');
+    let port: u16 = match authority.parse::<SocketAddr>() {
+        Ok(addr) => addr.port(),
+        Err(_) => authority
+            .rsplit_once(':')
+            .ok_or_else(|| anyhow::anyhow!("raft_addr must include a port: {raft_addr}"))?
+            .1
+            .parse()
+            .map_err(|e| anyhow::anyhow!("raft_addr port in {raft_addr}: {e}"))?,
+    };
+    Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+}
+
+// --- Event fan-out peer sync (gossip-fed) ---
+
+fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembers, self_id: u64) {
+    tokio::spawn(async move {
+        let mut rx = members.watch();
+        loop {
+            {
+                let peers: Vec<String> = rx
+                    .borrow()
+                    .values()
+                    .filter(|m| m.node_id != self_id && !m.meta.public_addr.is_empty())
+                    .map(|m| m.meta.public_addr.clone())
+                    .collect();
+                broadcaster.reconcile_dynamic_peers(&peers);
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    });
+}
+
 // --- Background GC ---
 
-/// Per-pass wall-clock budget. Each sweep is one bounded command through the
-/// serialized writer; the pass keeps issuing sweeps until the backlog is
-/// drained or the budget is spent, so GC throughput adapts to the write rate
-/// instead of being capped at `batch` keys per tick.
+/// Per-pass wall-clock budget. Each sweep is one bounded raft command; the
+/// pass keeps issuing sweeps until the backlog is drained or the budget is
+/// spent, so GC throughput adapts to the write rate.
 const GC_PASS_BUDGET: Duration = Duration::from_millis(250);
 
 fn spawn_group_gc(router: Arc<Router>, interval_secs: u64, batch: u32) {
@@ -178,22 +350,27 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
     let started = Instant::now();
     let mut total_scanned = 0u64;
     let mut total_reclaimed = 0u64;
-    loop {
-        match router.gc_sweep(batch).await {
-            Ok((scanned, reclaimed)) => {
-                total_scanned += u64::from(scanned);
-                total_reclaimed += reclaimed;
-                // A short page means the backlog is drained.
-                if scanned < batch || started.elapsed() >= GC_PASS_BUDGET {
-                    break;
+    // Only the groups this node currently leads: the leader proposes the
+    // sweep; every replica applies it identically.
+    'groups: for group in router.led_groups() {
+        loop {
+            match router.gc_sweep(group, batch).await {
+                Ok((scanned, reclaimed)) => {
+                    total_scanned += u64::from(scanned);
+                    total_reclaimed += reclaimed;
+                    if scanned < batch {
+                        break;
+                    }
+                    if started.elapsed() >= GC_PASS_BUDGET {
+                        break 'groups;
+                    }
                 }
-            }
-            Err(e) => {
-                otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), false);
-                // Under write saturation the sweep is rejected by the bounded
-                // queue (client traffic takes priority); retry next tick.
-                warn!(error = %e, "group gc sweep failed; retrying next tick");
-                return;
+                Err(e) => {
+                    otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), false);
+                    // Lost leadership mid-pass or backpressure: retry next tick.
+                    warn!(error = %e, group, "group gc sweep failed; retrying next tick");
+                    return;
+                }
             }
         }
     }
@@ -202,36 +379,31 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
 
 // --- Expiry index physical maintenance ---
 
-fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, interval_secs: u64) {
+fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, groups: Arc<RaftGroups>, interval_secs: u64) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
-            run_background_step("expiry maintenance", expiry_maintenance_pass(db.clone())).await;
+            let hosted = groups.hosted();
+            run_background_step(
+                "expiry maintenance",
+                expiry_maintenance_pass(db.clone(), hosted),
+            )
+            .await;
         }
     });
 }
 
-/// Physically reclaim the swept region of the expiry index. Everything below
-/// the persisted GC cursor is already logically deleted; dropping whole SST
-/// files in that range (then compacting the remainder) keeps the queue-shaped
-/// column family from accreting a tombstone wall in front of the cursor.
-async fn expiry_maintenance_pass(db: Arc<rocksdb::DB>) {
+async fn expiry_maintenance_pass(
+    db: Arc<rocksdb::DB>,
+    groups: Vec<pathlockd::cluster::placement::GroupId>,
+) {
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let meta = db
-            .cf_handle(store_keys::CF_META)
-            .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
-        let Some(cursor) = db.get_cf(&meta, store_keys::META_GC_CURSOR_KEY)? else {
-            return Ok(());
-        };
-        let expiry = db
-            .cf_handle(store_keys::CF_EXPIRY)
-            .ok_or_else(|| anyhow::anyhow!("missing expiry column family"))?;
-        db.delete_file_in_range_cf(&expiry, &[] as &[u8], cursor.as_slice())
-            .map_err(|e| anyhow::anyhow!("delete_file_in_range: {e}"))?;
-        db.compact_range_cf(&expiry, None::<&[u8]>, Some(cursor.as_slice()));
+        for group in groups {
+            pathlockd::store_rocksdb::compact_swept_expiry(&db, group)?;
+        }
         Ok(())
     })
     .await;
@@ -276,64 +448,6 @@ fn health_probe_url(listen: &str) -> anyhow::Result<String> {
         IpAddr::V4(ip) => format!("http://{ip}:{}", addr.port()),
         IpAddr::V6(ip) => format!("http://[{ip}]:{}", addr.port()),
     })
-}
-
-// --- Peer discovery ---
-
-fn parse_self_ip(self_ip: Option<&str>) -> Option<IpAddr> {
-    let raw = self_ip?;
-    match raw.parse::<IpAddr>() {
-        Ok(ip) => Some(ip),
-        Err(e) => {
-            warn!(self_ip = %raw, error = %e, "ignoring unparseable self_ip");
-            None
-        }
-    }
-}
-
-fn spawn_peer_discovery(
-    broadcaster: Broadcaster,
-    dns: String,
-    self_ip: Option<IpAddr>,
-    refresh_secs: u64,
-) {
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_secs(refresh_secs));
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tick.tick().await;
-            match resolve_peers(&dns, self_ip).await {
-                Ok(peers) => {
-                    debug!(dns = %dns, count = peers.len(), ?peers, "resolved pathlockd peers");
-                    broadcaster.reconcile_dynamic_peers(&peers);
-                }
-                Err(e) => {
-                    warn!(dns = %dns, error = %e, "peer discovery resolution failed; keeping current peer set");
-                }
-            }
-        }
-    });
-}
-
-async fn resolve_peers(dns: &str, self_ip: Option<IpAddr>) -> anyhow::Result<Vec<String>> {
-    let addrs = tokio::net::lookup_host(dns)
-        .await
-        .map_err(|e| anyhow::anyhow!("resolving peer discovery dns {dns}: {e}"))?;
-    let mut peers = std::collections::BTreeSet::new();
-    for addr in addrs {
-        if Some(addr.ip()) == self_ip {
-            continue;
-        }
-        peers.insert(peer_url(addr));
-    }
-    Ok(peers.into_iter().collect())
-}
-
-fn peer_url(addr: SocketAddr) -> String {
-    match addr.ip() {
-        IpAddr::V4(ip) => format!("http://{ip}:{}", addr.port()),
-        IpAddr::V6(ip) => format!("http://[{ip}]:{}", addr.port()),
-    }
 }
 
 // --- Shared helpers ---
@@ -404,27 +518,15 @@ mod tests {
     }
 
     #[test]
-    fn peer_url_brackets_ipv6() {
+    fn raft_listen_addr_extracts_port() {
         assert_eq!(
-            peer_url(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
-                50051
-            )),
-            "http://10.0.0.1:50051"
+            raft_listen_addr("http://10.0.0.5:50052").unwrap(),
+            "0.0.0.0:50052".parse::<SocketAddr>().unwrap()
         );
         assert_eq!(
-            peer_url(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 50051)),
-            "http://[::1]:50051"
+            raft_listen_addr("http://pathlockd-0.pathlockd:50052").unwrap(),
+            "0.0.0.0:50052".parse::<SocketAddr>().unwrap()
         );
-    }
-
-    #[test]
-    fn parse_self_ip_handles_valid_and_invalid() {
-        assert_eq!(parse_self_ip(None), None);
-        assert_eq!(
-            parse_self_ip(Some("10.0.0.5")),
-            Some("10.0.0.5".parse().unwrap())
-        );
-        assert_eq!(parse_self_ip(Some("not-an-ip")), None);
+        assert!(raft_listen_addr("http://nodeport").is_err());
     }
 }

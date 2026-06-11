@@ -1,0 +1,69 @@
+// Internal node-to-node transport: openraft protocol RPCs, leader command
+// forwarding, and linearizable read forwarding.
+//
+// Raft protocol payloads are opaque bincode-serialized openraft types tagged
+// with the target group; one HTTP/2 channel per peer carries every group's
+// traffic. This surface is cluster-internal and carries no client API
+// stability guarantees.
+
+syntax = "proto3";
+
+package pathlockd.raft.v1;
+
+// A group-tagged opaque payload (bincode-encoded openraft request/response).
+message RaftFrame {
+  uint32 group = 1;
+  bytes payload = 2;
+}
+
+// One chunk of a full-snapshot transfer. The first chunk carries the
+// bincode-encoded leader vote and snapshot meta; every chunk carries a slice
+// of the snapshot image.
+message SnapshotChunk {
+  uint32 group = 1;
+  bytes vote = 2;
+  bytes meta = 3;
+  bytes data = 4;
+}
+
+// A client command forwarded to the group's leader. `command` is a bincode
+// Command; the response payload is a bincode Result<ApplyResponse, ForwardError>.
+message ForwardRequest {
+  uint32 group = 1;
+  bytes command = 2;
+}
+
+message ForwardResponse {
+  bytes result = 1;
+}
+
+// A read executed on the group's leader after a linearizable read barrier.
+// `read_op` is a bincode ReadOp; the response payload is a bincode
+// Result<ReadResult, ForwardError>.
+message ForwardReadRequest {
+  uint32 group = 1;
+  bytes read_op = 2;
+}
+
+message ForwardReadResponse {
+  bytes result = 1;
+}
+
+// Admin: mark a node as draining. Reconcilers migrate groups off draining
+// nodes and transfer leaderships away; clear the flag to cancel.
+message SetDrainingRequest {
+  uint64 node_id = 1;
+  bool draining = 2;
+}
+
+message SetDrainingResponse {}
+
+service RaftTransport {
+  rpc AppendEntries(RaftFrame) returns (RaftFrame);
+  rpc Vote(RaftFrame) returns (RaftFrame);
+  rpc TransferLeader(RaftFrame) returns (RaftFrame);
+  rpc InstallSnapshot(stream SnapshotChunk) returns (RaftFrame);
+  rpc Forward(ForwardRequest) returns (ForwardResponse);
+  rpc ForwardRead(ForwardReadRequest) returns (ForwardReadResponse);
+  rpc SetDraining(SetDrainingRequest) returns (SetDrainingResponse);
+}

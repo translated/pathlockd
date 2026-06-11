@@ -11,6 +11,11 @@
 //!   validation and then re-read the stale committed record during execution.
 //! - [`RocksDbTxn`]: a read-only view over committed state for observability
 //!   reads (`inspect`, `detect_cycle`, `is_blocking`, `assert_fencing`).
+//!
+//! Both transactions are **group-scoped**: one node hosts replicas of many
+//! Raft groups in a single shared RocksDB, and every key a transaction touches
+//! is transparently prefixed with its group id (`store_keys::group_key`).
+//! Engine-level code only ever sees group-relative keys.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
@@ -18,6 +23,7 @@ use std::sync::Arc;
 
 use rocksdb::DB;
 
+use crate::cluster::placement::{GroupId, SYS_GROUP};
 use crate::store_keys::{self, expired};
 
 // ---------------------------------------------------------------------------
@@ -74,8 +80,19 @@ pub trait StoreTxn {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum StoredRecord {
-    Str { v: String, exp: u64 },
-    Counter { v: i64 },
+    Str {
+        v: String,
+        exp: u64,
+    },
+    Counter {
+        v: i64,
+    },
+    /// Arbitrary binary payload with an expiry (e.g. cached ApplyResponses in
+    /// the dedupe CF). Appended last so existing variant encodings are stable.
+    Bytes {
+        v: Vec<u8>,
+        exp: u64,
+    },
 }
 
 pub(crate) fn encode_record(rec: &StoredRecord) -> anyhow::Result<Vec<u8>> {
@@ -204,8 +221,9 @@ fn cf_options(name: &str, cache: &rocksdb::Cache, tuning: &DbTuning) -> rocksdb:
     table.set_pin_l0_filter_and_index_blocks_in_cache(true);
     opts.set_block_based_table_factory(&table);
 
-    if name == store_keys::CF_EXPIRY {
-        // Pure FIFO workload: everything written is later deleted in order.
+    if name == store_keys::CF_EXPIRY || name == store_keys::CF_RAFT_LOG {
+        // Queue-shaped workloads: written at the head, range-deleted from the
+        // tail (expiry sweep / raft log purge).
         opts.add_compact_on_deletion_collector_factory(10_000, 2_500, 0.25);
     } else if store_keys::STATE_CFS.contains(&name) {
         opts.add_compact_on_deletion_collector_factory(10_000, 5_000, 0.5);
@@ -464,6 +482,7 @@ fn has_live_member_impl(
 /// outcomes) from committing partial state.
 pub struct WriteTxn {
     db: Arc<DB>,
+    group: GroupId,
     batch: rocksdb::WriteBatch,
     overlay: HashMap<&'static str, Overlay>,
     now_ms: u64,
@@ -471,9 +490,10 @@ pub struct WriteTxn {
 }
 
 impl WriteTxn {
-    pub fn new(db: Arc<DB>, now_ms: u64) -> Self {
+    pub fn new(db: Arc<DB>, group: GroupId, now_ms: u64) -> Self {
         Self {
             db,
+            group,
             batch: rocksdb::WriteBatch::default(),
             overlay: HashMap::new(),
             now_ms,
@@ -481,58 +501,95 @@ impl WriteTxn {
         }
     }
 
-    /// Overlay-aware raw point read.
+    /// Scope a group-relative key into this transaction's group keyspace.
+    fn scoped(&self, key: &[u8]) -> Vec<u8> {
+        store_keys::group_key(self.group, key)
+    }
+
+    /// Overlay-aware raw point read of a group-relative key.
     pub fn get_raw(&self, cf: &'static str, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
-        if let Some(entry) = self.overlay.get(cf).and_then(|m| m.get(key)) {
+        self.get_full(cf, &self.scoped(key))
+    }
+
+    /// Overlay-aware read of an already-scoped (full) key.
+    fn get_full(&self, cf: &'static str, full_key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        if let Some(entry) = self.overlay.get(cf).and_then(|m| m.get(full_key)) {
             return Ok(entry.clone());
         }
         let cf_handle = self
             .db
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
-        Ok(self.db.get_cf(&cf_handle, key)?)
+        Ok(self.db.get_cf(&cf_handle, full_key)?)
     }
 
     pub fn put_raw(&mut self, cf: &'static str, key: &[u8], value: Vec<u8>) -> anyhow::Result<()> {
+        let full_key = self.scoped(key);
+        self.put_full(cf, full_key, value)
+    }
+
+    fn put_full(
+        &mut self,
+        cf: &'static str,
+        full_key: Vec<u8>,
+        value: Vec<u8>,
+    ) -> anyhow::Result<()> {
         let db = self.db.clone();
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
-        self.batch.put_cf(&cf_handle, key, &value);
+        self.batch.put_cf(&cf_handle, &full_key, &value);
         self.overlay
             .entry(cf)
             .or_default()
-            .insert(key.to_vec(), Some(value));
+            .insert(full_key, Some(value));
         self.dirty = true;
         Ok(())
     }
 
     pub fn delete_raw(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<()> {
+        let full_key = self.scoped(key);
         let db = self.db.clone();
         let cf_handle = db
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
-        self.batch.delete_cf(&cf_handle, key);
-        self.overlay
-            .entry(cf)
-            .or_default()
-            .insert(key.to_vec(), None);
+        self.batch.delete_cf(&cf_handle, &full_key);
+        self.overlay.entry(cf).or_default().insert(full_key, None);
         self.dirty = true;
         Ok(())
     }
 
-    /// Overlay-aware ordered scan of `[start, upper)`.
+    /// Overlay-aware ordered scan of `[start, upper)` within this group's
+    /// keyspace. Bounds are group-relative; `visit` receives group-relative
+    /// keys. `upper = None` scans to the end of the group's keyspace, never
+    /// into a neighbouring group.
     pub fn scan_merged<F>(
         &self,
         cf: &'static str,
         start: Option<&[u8]>,
         upper: Option<&[u8]>,
-        visit: F,
+        mut visit: F,
     ) -> anyhow::Result<()>
     where
         F: FnMut(&[u8], &[u8]) -> anyhow::Result<bool>,
     {
-        scan_with_overlay(&self.db, cf, self.overlay.get(cf), start, upper, visit)
+        let gp = store_keys::group_prefix(self.group);
+        let scoped_start = match start {
+            Some(s) => store_keys::group_key(self.group, s),
+            None => gp.to_vec(),
+        };
+        let scoped_upper = match upper {
+            Some(u) => Some(store_keys::group_key(self.group, u)),
+            None => prefix_upper_bound(&gp),
+        };
+        scan_with_overlay(
+            &self.db,
+            cf,
+            self.overlay.get(cf),
+            Some(&scoped_start),
+            scoped_upper.as_deref(),
+            |k, v| visit(&k[gp.len()..], v),
+        )
     }
 
     /// Atomically commit the accumulated writes. Returns `false` when the
@@ -549,6 +606,34 @@ impl WriteTxn {
         let opts = rocksdb::WriteOptions::default();
         self.db.write_opt(self.batch, &opts)?;
         Ok(true)
+    }
+
+    /// Store an expiring binary record (TTL-indexed like `set_str`).
+    pub fn set_bytes(
+        &mut self,
+        cf: &'static str,
+        key: &[u8],
+        value: Vec<u8>,
+        ttl_ms: u64,
+    ) -> anyhow::Result<()> {
+        let exp = store_keys::expiry_at(self.now_ms, ttl_ms);
+        let record = encode_record(&StoredRecord::Bytes { v: value, exp })?;
+        self.put_raw(cf, key, record)?;
+        if ttl_ms > 0 {
+            self.write_expiry(exp, cf, key)?;
+        }
+        Ok(())
+    }
+
+    /// Read a live binary record written by [`WriteTxn::set_bytes`].
+    pub fn get_bytes(&self, cf: &'static str, key: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        match self.get_raw(cf, key)? {
+            Some(raw) => match decode_record(&raw)? {
+                StoredRecord::Bytes { v, exp } if !expired(exp, self.now_ms) => Ok(Some(v)),
+                _ => Ok(None),
+            },
+            None => Ok(None),
+        }
     }
 
     fn write_expiry(
@@ -642,7 +727,8 @@ impl StoreTxn for WriteTxn {
         key: &[u8],
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        smembers_limited_impl(&self.db, cf, self.overlay.get(cf), key, limit, self.now_ms)
+        let sk = self.scoped(key);
+        smembers_limited_impl(&self.db, cf, self.overlay.get(cf), &sk, limit, self.now_ms)
     }
 
     fn smembers_page(
@@ -652,15 +738,20 @@ impl StoreTxn for WriteTxn {
         cursor: Option<Vec<u8>>,
         page: usize,
     ) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
-        smembers_page_impl(
+        // The page cursor is a full member key *relative to the group*; the
+        // shared impl works on scoped keys, so translate in and out.
+        let sk = self.scoped(key);
+        let scoped_cursor = cursor.map(|c| store_keys::group_key(self.group, &c));
+        let (members, next) = smembers_page_impl(
             &self.db,
             cf,
             self.overlay.get(cf),
-            key,
-            cursor,
+            &sk,
+            scoped_cursor,
             page,
             self.now_ms,
-        )
+        )?;
+        Ok((members, next.map(|n| n[4..].to_vec())))
     }
 
     fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> anyhow::Result<bool> {
@@ -675,7 +766,8 @@ impl StoreTxn for WriteTxn {
     }
 
     fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<bool> {
-        has_live_member_impl(&self.db, cf, self.overlay.get(cf), key, self.now_ms)
+        let sk = self.scoped(key);
+        has_live_member_impl(&self.db, cf, self.overlay.get(cf), &sk, self.now_ms)
     }
 }
 
@@ -685,12 +777,17 @@ impl StoreTxn for WriteTxn {
 
 pub struct RocksDbTxn {
     db: Arc<DB>,
+    group: GroupId,
     now_ms: u64,
 }
 
 impl RocksDbTxn {
-    pub fn new(db: Arc<DB>, now_ms: u64) -> Self {
-        Self { db, now_ms }
+    pub fn new(db: Arc<DB>, group: GroupId, now_ms: u64) -> Self {
+        Self { db, group, now_ms }
+    }
+
+    fn scoped(&self, key: &[u8]) -> Vec<u8> {
+        store_keys::group_key(self.group, key)
     }
 }
 
@@ -704,7 +801,7 @@ impl StoreTxn for RocksDbTxn {
             .db
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
-        match self.db.get_cf(&cf_handle, key)? {
+        match self.db.get_cf(&cf_handle, self.scoped(key))? {
             Some(v) => Ok(live_str(decode_record(&v)?, self.now_ms)),
             None => Ok(None),
         }
@@ -753,7 +850,8 @@ impl StoreTxn for RocksDbTxn {
         key: &[u8],
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
-        smembers_limited_impl(&self.db, cf, None, key, limit, self.now_ms)
+        let sk = self.scoped(key);
+        smembers_limited_impl(&self.db, cf, None, &sk, limit, self.now_ms)
     }
 
     fn smembers_page(
@@ -763,11 +861,15 @@ impl StoreTxn for RocksDbTxn {
         cursor: Option<Vec<u8>>,
         page: usize,
     ) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
-        smembers_page_impl(&self.db, cf, None, key, cursor, page, self.now_ms)
+        let sk = self.scoped(key);
+        let scoped_cursor = cursor.map(|c| store_keys::group_key(self.group, &c));
+        let (members, next) =
+            smembers_page_impl(&self.db, cf, None, &sk, scoped_cursor, page, self.now_ms)?;
+        Ok((members, next.map(|n| n[4..].to_vec())))
     }
 
     fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> anyhow::Result<bool> {
-        let member_key = member_key(key, member);
+        let member_key = self.scoped(&member_key(key, member));
         let cf_handle = self
             .db
             .cf_handle(cf)
@@ -782,7 +884,8 @@ impl StoreTxn for RocksDbTxn {
     }
 
     fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<bool> {
-        has_live_member_impl(&self.db, cf, None, key, self.now_ms)
+        let sk = self.scoped(key);
+        has_live_member_impl(&self.db, cf, None, &sk, self.now_ms)
     }
 }
 
@@ -794,11 +897,13 @@ impl StoreTxn for RocksDbTxn {
 /// expired/dead residue between live entries.
 const DUMP_RAW_SCAN_CAP: usize = 65_536;
 
-/// Scan one page of every owner's held locks. `cursor` is the raw key to
-/// resume from (returned by the previous page); `page` caps the entries
-/// returned. Dead owners' residue is skipped, not reported.
+/// Scan one page of every owner's held locks within one group. `cursor` is
+/// the group-relative raw key to resume from (returned by the previous page);
+/// `page` caps the entries returned. Dead owners' residue is skipped, not
+/// reported.
 pub fn dump_owner_holds(
     db: &Arc<DB>,
+    group: GroupId,
     now_ms: u64,
     cursor: Option<Vec<u8>>,
     page: usize,
@@ -810,7 +915,7 @@ pub fn dump_owner_holds(
     let mut raw = 0usize;
     let mut next_cursor: Option<Vec<u8>> = None;
 
-    let mut fence_txn = RocksDbTxn::new(db.clone(), now_ms);
+    let mut fence_txn = RocksDbTxn::new(db.clone(), group, now_ms);
 
     let mut owner_alive = |owner: &str, txn: &mut RocksDbTxn| -> anyhow::Result<bool> {
         if let Some(alive) = alive_memo.get(owner) {
@@ -823,13 +928,20 @@ pub fn dump_owner_holds(
         Ok(alive)
     };
 
+    let gp = store_keys::group_prefix(group);
+    let start = match &cursor {
+        Some(c) => store_keys::group_key(group, c),
+        None => gp.to_vec(),
+    };
+    let upper = prefix_upper_bound(&gp);
     scan_with_overlay(
         db,
         store_keys::CF_OWNER_HOLDS,
         None,
-        cursor.as_deref(),
-        None,
-        |k, v| {
+        Some(&start),
+        upper.as_deref(),
+        |full_key, v| {
+            let k = &full_key[gp.len()..];
             if entries.len() >= page || raw >= DUMP_RAW_SCAN_CAP {
                 next_cursor = Some(k.to_vec());
                 return Ok(false);
@@ -886,6 +998,53 @@ pub fn dump_owner_holds(
 }
 
 // ---------------------------------------------------------------------------
+// Group lifecycle utilities
+// ---------------------------------------------------------------------------
+
+/// Range-delete a lock group's entire keyspace (state CFs, raft log, meta) —
+/// used when this node stops hosting the group. The system group is never
+/// destroyed locally (every node keeps at least a learner replica of it).
+pub fn destroy_group(db: &DB, group: GroupId) -> anyhow::Result<()> {
+    anyhow::ensure!(group != SYS_GROUP, "refusing to destroy the system group");
+    let (start, end) = store_keys::group_range(group);
+    let end = end.expect("non-sys group has a bounded range");
+    for cf in store_keys::STATE_CFS
+        .iter()
+        .chain([store_keys::CF_RAFT_LOG, store_keys::CF_META].iter())
+    {
+        let handle = db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
+        db.delete_range_cf(&handle, &start, &end)?;
+        let _ = db.delete_file_in_range_cf(&handle, &start, &end);
+    }
+    Ok(())
+}
+
+/// Physically reclaim the swept region of one group's expiry index:
+/// everything below the group's persisted GC cursor is already logically
+/// deleted, so whole SST files in that range are dropped and the remainder
+/// compacted, keeping the queue-shaped index free of tombstone walls.
+pub fn compact_swept_expiry(db: &DB, group: GroupId) -> anyhow::Result<()> {
+    let meta = db
+        .cf_handle(store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    let cursor_key = store_keys::group_key(group, store_keys::META_GC_CURSOR_KEY);
+    let Some(cursor) = db.get_cf(&meta, &cursor_key)? else {
+        return Ok(());
+    };
+    let expiry = db
+        .cf_handle(store_keys::CF_EXPIRY)
+        .ok_or_else(|| anyhow::anyhow!("missing expiry column family"))?;
+    let from = store_keys::group_prefix(group).to_vec();
+    let to = store_keys::group_key(group, &cursor);
+    db.delete_file_in_range_cf(&expiry, from.as_slice(), to.as_slice())
+        .map_err(|e| anyhow::anyhow!("delete_file_in_range: {e}"))?;
+    db.compact_range_cf(&expiry, Some(from.as_slice()), Some(to.as_slice()));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -924,7 +1083,7 @@ mod tests {
     #[test]
     fn write_txn_reads_observe_pending_writes() {
         let (db, _dir) = open_test_db();
-        let mut txn = WriteTxn::new(db, 1_000);
+        let mut txn = WriteTxn::new(db, 0, 1_000);
         txn.set_str(store_keys::CF_WRITE_LOCKS, b"h:/a", "alice", 5_000)
             .unwrap();
         assert_eq!(
@@ -942,12 +1101,12 @@ mod tests {
     fn write_txn_pending_delete_shadows_committed_value() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.set_str(store_keys::CF_WRITE_LOCKS, b"h:/a", "alice", 5_000)
                 .unwrap();
             assert!(txn.commit().unwrap());
         }
-        let mut txn = WriteTxn::new(db, 1_001);
+        let mut txn = WriteTxn::new(db, 0, 1_001);
         assert_eq!(
             txn.get_str(store_keys::CF_WRITE_LOCKS, b"h:/a").unwrap(),
             Some("alice".to_string())
@@ -963,14 +1122,14 @@ mod tests {
     fn write_txn_set_scans_merge_overlay_and_committed() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.sadd(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/a", 5_000)
                 .unwrap();
             txn.sadd(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/b", 5_000)
                 .unwrap();
             assert!(txn.commit().unwrap());
         }
-        let mut txn = WriteTxn::new(db, 1_001);
+        let mut txn = WriteTxn::new(db, 0, 1_001);
         txn.srem(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/a")
             .unwrap();
         txn.sadd(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/c", 5_000)
@@ -997,12 +1156,12 @@ mod tests {
     fn write_txn_has_live_member_sees_pending_removal_of_last_member() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.sadd(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/a", 5_000)
                 .unwrap();
             txn.commit().unwrap();
         }
-        let mut txn = WriteTxn::new(db, 1_001);
+        let mut txn = WriteTxn::new(db, 0, 1_001);
         txn.srem(store_keys::CF_OWNER_HOLDS, b"alice", "write:h:/a")
             .unwrap();
         assert!(!txn
@@ -1013,7 +1172,7 @@ mod tests {
     #[test]
     fn write_txn_commit_reports_empty_batches() {
         let (db, _dir) = open_test_db();
-        let txn = WriteTxn::new(db, 1_000);
+        let txn = WriteTxn::new(db, 0, 1_000);
         assert!(!txn.commit().unwrap());
     }
 
@@ -1023,7 +1182,7 @@ mod tests {
     fn smembers_page_walks_set_with_cursor() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             for i in 0..10 {
                 txn.sadd(
                     store_keys::CF_OWNER_HOLDS,
@@ -1035,7 +1194,7 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let mut txn = RocksDbTxn::new(db, 1_001);
+        let mut txn = RocksDbTxn::new(db, 0, 1_001);
         let mut all = Vec::new();
         let mut cursor = None;
         let mut pages = 0;
@@ -1060,7 +1219,7 @@ mod tests {
     fn smembers_page_counts_expired_residue_without_erroring() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             for i in 0..20 {
                 // Half the members expire at 1_500.
                 let ttl = if i % 2 == 0 { 500 } else { 60_000 };
@@ -1074,7 +1233,7 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let mut txn = RocksDbTxn::new(db, 2_000);
+        let mut txn = RocksDbTxn::new(db, 0, 2_000);
         let mut live = Vec::new();
         let mut cursor = None;
         loop {
@@ -1096,7 +1255,7 @@ mod tests {
     fn smembers_limited_errors_when_live_members_exceed_limit() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             for i in 0..8 {
                 txn.sadd(
                     store_keys::CF_OWNER_HOLDS,
@@ -1108,7 +1267,7 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let mut txn = RocksDbTxn::new(db, 1_001);
+        let mut txn = RocksDbTxn::new(db, 0, 1_001);
         let err = txn
             .smembers_limited(store_keys::CF_OWNER_HOLDS, b"alice", 4)
             .unwrap_err();
@@ -1119,7 +1278,7 @@ mod tests {
     fn smembers_limited_tolerates_expired_residue_within_raw_cap() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             for i in 0..6 {
                 txn.sadd(
                     store_keys::CF_OWNER_HOLDS,
@@ -1134,7 +1293,7 @@ mod tests {
             txn.commit().unwrap();
         }
         // 7 raw keys, 1 live: limit 4 (raw cap 16) must succeed.
-        let mut txn = RocksDbTxn::new(db, 5_000);
+        let mut txn = RocksDbTxn::new(db, 0, 5_000);
         let members = txn
             .smembers_limited(store_keys::CF_OWNER_HOLDS, b"alice", 4)
             .unwrap();
@@ -1146,7 +1305,7 @@ mod tests {
     #[test]
     fn read_only_txn_get_str_returns_none_for_missing_key() {
         let (db, _dir) = open_test_db();
-        let mut txn = RocksDbTxn::new(db, 100_000);
+        let mut txn = RocksDbTxn::new(db, 0, 100_000);
         assert!(txn
             .get_str(store_keys::CF_WRITE_LOCKS, b"nonexistent")
             .unwrap()
@@ -1156,7 +1315,7 @@ mod tests {
     #[test]
     fn read_only_txn_mutations_fail_or_noop() {
         let (db, _dir) = open_test_db();
-        let mut txn = RocksDbTxn::new(db, 100_000);
+        let mut txn = RocksDbTxn::new(db, 0, 100_000);
         assert!(txn
             .set_str(store_keys::CF_WRITE_LOCKS, b"key", "val", 1000)
             .is_err());
@@ -1174,7 +1333,7 @@ mod tests {
     #[test]
     fn read_only_txn_empty_set_scans() {
         let (db, _dir) = open_test_db();
-        let mut txn = RocksDbTxn::new(db, 100_000);
+        let mut txn = RocksDbTxn::new(db, 0, 100_000);
         assert!(!txn
             .has_live_member(store_keys::CF_OWNER_HOLDS, b"empty-set")
             .unwrap());
@@ -1198,7 +1357,7 @@ mod tests {
     fn set_scans_do_not_leak_into_adjacent_sets() {
         let (db, _dir) = open_test_db();
         {
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.sadd(store_keys::CF_OWNER_HOLDS, b"alice", "m1", 60_000)
                 .unwrap();
             // "alice0" sorts immediately after the "alice\0" prefix range.
@@ -1206,7 +1365,7 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
-        let mut txn = RocksDbTxn::new(db, 1_001);
+        let mut txn = RocksDbTxn::new(db, 0, 1_001);
         let members = txn
             .smembers_limited(store_keys::CF_OWNER_HOLDS, b"alice", 100)
             .unwrap();
@@ -1222,7 +1381,7 @@ mod tests {
             // Mirror the engine's layout: the hold-set key is own_prefix(owner).
             let alice = store_keys::own_prefix("alice");
             let ghost = store_keys::own_prefix("ghost");
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.set_str(
                 store_keys::CF_OWNER_ALIVE,
                 &store_keys::alive_key("alice"),
@@ -1246,7 +1405,7 @@ mod tests {
                 .unwrap();
             txn.commit().unwrap();
         }
-        let page = dump_owner_holds(&db, 2_000, None, 64).unwrap();
+        let page = dump_owner_holds(&db, 0, 2_000, None, 64).unwrap();
         assert!(page.next_cursor.is_none());
         assert_eq!(page.entries.len(), 2);
         let write_entry = page
@@ -1263,7 +1422,7 @@ mod tests {
         let (db, _dir) = open_test_db();
         {
             let alice = store_keys::own_prefix("alice");
-            let mut txn = WriteTxn::new(db.clone(), 1_000);
+            let mut txn = WriteTxn::new(db.clone(), 0, 1_000);
             txn.set_str(
                 store_keys::CF_OWNER_ALIVE,
                 &store_keys::alive_key("alice"),
@@ -1282,11 +1441,72 @@ mod tests {
             }
             txn.commit().unwrap();
         }
-        let first = dump_owner_holds(&db, 2_000, None, 2).unwrap();
+        let first = dump_owner_holds(&db, 0, 2_000, None, 2).unwrap();
         assert_eq!(first.entries.len(), 2);
         let cursor = first.next_cursor.expect("more pages");
-        let rest = dump_owner_holds(&db, 2_000, Some(cursor), 64).unwrap();
+        let rest = dump_owner_holds(&db, 0, 2_000, Some(cursor), 64).unwrap();
         assert_eq!(rest.entries.len(), 3);
         assert!(rest.next_cursor.is_none());
+    }
+
+    // --- group isolation ---
+
+    #[test]
+    fn groups_share_one_db_without_leaking() {
+        let (db, _dir) = open_test_db();
+        for group in [0u32, 1, 2] {
+            let mut txn = WriteTxn::new(db.clone(), group, 1_000);
+            txn.set_str(
+                store_keys::CF_WRITE_LOCKS,
+                b"h:/same-key",
+                &format!("owner-{group}"),
+                60_000,
+            )
+            .unwrap();
+            txn.sadd(
+                store_keys::CF_OWNER_HOLDS,
+                b"alice\0",
+                "write:h:/same-key",
+                60_000,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        for group in [0u32, 1, 2] {
+            let mut txn = RocksDbTxn::new(db.clone(), group, 1_001);
+            assert_eq!(
+                txn.get_str(store_keys::CF_WRITE_LOCKS, b"h:/same-key")
+                    .unwrap(),
+                Some(format!("owner-{group}")),
+                "each group reads its own record"
+            );
+            let members = txn
+                .smembers_limited(store_keys::CF_OWNER_HOLDS, b"alice\0", 16)
+                .unwrap();
+            assert_eq!(members.len(), 1, "set scans stay within the group");
+        }
+    }
+
+    #[test]
+    fn destroy_group_removes_only_that_group() {
+        let (db, _dir) = open_test_db();
+        for group in [0u32, 1] {
+            let mut txn = WriteTxn::new(db.clone(), group, 1_000);
+            txn.set_str(store_keys::CF_WRITE_LOCKS, b"h:/a", "o", 60_000)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        destroy_group(&db, 1).unwrap();
+        let mut g0 = RocksDbTxn::new(db.clone(), 0, 1_001);
+        assert!(g0
+            .get_str(store_keys::CF_WRITE_LOCKS, b"h:/a")
+            .unwrap()
+            .is_some());
+        let mut g1 = RocksDbTxn::new(db.clone(), 1, 1_001);
+        assert!(g1
+            .get_str(store_keys::CF_WRITE_LOCKS, b"h:/a")
+            .unwrap()
+            .is_none());
+        assert!(destroy_group(&db, SYS_GROUP).is_err());
     }
 }

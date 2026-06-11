@@ -15,12 +15,11 @@ services:
       PATHLOCKD_DATA_DIR: "/data/pathlockd"
       PATHLOCKD_BOOTSTRAP: "true"
       PATHLOCKD_LOG_LEVEL: "info"
-      # This compose file runs a SINGLE pathlockd instance — currently the
-      # only safe deployment shape. Lock state is per-node and NOT yet
-      # Raft-replicated: running multiple replicas against the same clients
-      # breaks mutual exclusion. Cross-instance event fan-out
-      # (PATHLOCKD_PEERS / PATHLOCKD_PEER_DISCOVERY_DNS) forwards Subscribe
-      # events between instances but does not replicate lock state.
+      PATHLOCKD_NODE_ID: "pathlockd-0"
+      # This compose file runs a SINGLE pathlockd instance for local use
+      # (a 1-node Raft cluster: fully functional, no fault tolerance).
+      # For a replicated 3-node HA cluster on Docker Swarm, see
+      # docker-stack.yml.
     ports:
       - "50051:50051"
     volumes:
