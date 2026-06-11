@@ -312,6 +312,12 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `raft_addr` | `PATHLOCKD_RAFT_ADDR` | `http://localhost:50052` | Internal Raft/forwarding gRPC address advertised to peers |
 | `gossip_addr` | `PATHLOCKD_GOSSIP_ADDR` | `0.0.0.0:7946` | SWIM gossip UDP bind address |
 | `gossip_advertise_addr` | `PATHLOCKD_GOSSIP_ADVERTISE_ADDR` | auto | Concrete `ip:port` advertised for gossip (set behind NAT) |
+| `gossip_cluster_size` | `PATHLOCKD_GOSSIP_CLUSTER_SIZE` | `32` | Expected SWIM members for Foca dissemination/suspicion tuning |
+| `gossip_max_packet_size` | `PATHLOCKD_GOSSIP_MAX_PACKET_SIZE` | `1400` | Maximum Foca UDP payload size |
+| `gossip_seed_announce_interval_ms` | `PATHLOCKD_GOSSIP_SEED_ANNOUNCE_INTERVAL_MS` | `5000` | Seed DNS refresh and announce cadence while lonely |
+| `gossip_manual_gossip_interval_ms` | `PATHLOCKD_GOSSIP_MANUAL_GOSSIP_INTERVAL_MS` | `0` | Extra manual Foca gossip tick; 0 uses Foca periodic gossip only |
+| `gossip_foca_periodic` | `PATHLOCKD_GOSSIP_FOCA_PERIODIC` | `true` | Enable Foca's built-in periodic announce/gossip timers |
+| `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
 | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip addresses of existing members (required unless bootstrapping) |
 | `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a brand-new cluster (exactly one node; guarded against re-init on empty disks) |
 | `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups (fixed at cluster birth) |

@@ -160,7 +160,8 @@ async fn controller_loop(
         // Bootstrap grace: a single-node cluster must not wait the stability
         // window to make itself a voter — it already is one.
         let mut stable = presence.stable(&catalog, opts.stability_window, now);
-        stable.insert(members.local().node_id, members.local().meta.clone());
+        let local = members.local();
+        stable.insert(local.node_id, local.meta.clone());
 
         // Draining nodes are excluded from every desired set.
         let draining = directory::read_draining(&groups.db_handle()).unwrap_or_default();

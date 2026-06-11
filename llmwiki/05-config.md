@@ -16,8 +16,14 @@ Resolution order, lowest to highest precedence:
 | Public address | `public_addr` | `PATHLOCKD_PUBLIC_ADDR` | `http://localhost:50051` | Public gRPC address for clients/peers |
 | Raft address | `raft_addr` | `PATHLOCKD_RAFT_ADDR` | `http://localhost:50052` | Internal Raft transport |
 | Gossip address | `gossip_addr` | `PATHLOCKD_GOSSIP_ADDR` | `0.0.0.0:7946` | SWIM gossip bind |
+| Gossip cluster size | `gossip_cluster_size` | `PATHLOCKD_GOSSIP_CLUSTER_SIZE` | `32` | Expected members for Foca timing/dissemination |
+| Gossip max packet | `gossip_max_packet_size` | `PATHLOCKD_GOSSIP_MAX_PACKET_SIZE` | `1400` | Maximum Foca UDP payload size |
+| Gossip seed announce | `gossip_seed_announce_interval_ms` | `PATHLOCKD_GOSSIP_SEED_ANNOUNCE_INTERVAL_MS` | `5000` | Seed DNS refresh/announce cadence while lonely |
+| Gossip manual tick | `gossip_manual_gossip_interval_ms` | `PATHLOCKD_GOSSIP_MANUAL_GOSSIP_INTERVAL_MS` | `0` | Extra manual Foca gossip tick; 0 disables |
+| Gossip periodic | `gossip_foca_periodic` | `PATHLOCKD_GOSSIP_FOCA_PERIODIC` | `true` | Use Foca's built-in periodic announce/gossip timers |
+| Gossip send queue | `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
 | Seed nodes | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
-| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of Raft groups |
+| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups |
 | Replication factor | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
 | GC interval | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 = off) |
 | GC batch | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |

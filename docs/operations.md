@@ -34,6 +34,12 @@ Configuration is loaded from lowest to highest precedence:
 | `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
 | `public_addr` / `raft_addr` | localhost | Addresses advertised to peers — must be reachable cluster-wide |
 | `gossip_addr` | `0.0.0.0:7946` | SWIM UDP bind; `gossip_advertise_addr` overrides the advertised ip:port |
+| `gossip_cluster_size` | `32` | Expected SWIM members for Foca dissemination/suspicion tuning |
+| `gossip_max_packet_size` | `1400` | Maximum Foca UDP payload size |
+| `gossip_seed_announce_interval_ms` | `5000` | Seed DNS refresh and announce cadence while lonely |
+| `gossip_manual_gossip_interval_ms` | `0` | Extra manual Foca gossip tick; 0 uses Foca periodic gossip only |
+| `gossip_foca_periodic` | `true` | Enable Foca's built-in periodic announce/gossip timers |
+| `gossip_send_queue_depth` | `1024` | Bounded UDP writer queue depth |
 | `stability_window_secs` | `30` | Node uptime before reconcilers place replicas on it |
 | `eviction_window_secs` | `60` | How long a dead voter must be gone before replacement |
 | `leader_balance_interval_secs` | `60` | Leadership rebalancing cadence |
@@ -59,6 +65,9 @@ data_dir = "/var/lib/pathlockd"
 public_addr = "http://pathlockd-0.pathlockd:50051"
 raft_addr = "http://pathlockd-0.pathlockd:50052"
 gossip_addr = "0.0.0.0:7946"
+gossip_cluster_size = 32
+gossip_max_packet_size = 1400
+gossip_seed_announce_interval_ms = 5000
 seed_nodes = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946", "pathlockd-2.pathlockd:7946"]
 group_count = 32
 replication_factor = 3

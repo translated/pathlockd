@@ -12,6 +12,9 @@
 //! data_dir         = "/var/lib/pathlockd"
 //! public_addr      = "http://pathlockd-0.pathlockd:50051"
 //! gossip_addr      = "0.0.0.0:7946"
+//! gossip_cluster_size = 32
+//! gossip_max_packet_size = 1400
+//! gossip_seed_announce_interval_ms = 5000
 //! group_count      = 256
 //! replication_factor = 3
 //! group_gc_interval_secs = 1
@@ -55,6 +58,20 @@ pub struct Config {
     /// the bind address when it names a concrete IP, else the auto-detected
     /// outbound IP with the bind port. Set explicitly behind NAT.
     pub gossip_advertise_addr: Option<String>,
+    /// Expected SWIM cluster size, used by Foca to tune dissemination and
+    /// suspicion timing.
+    pub gossip_cluster_size: u32,
+    /// Maximum Foca UDP payload size.
+    pub gossip_max_packet_size: usize,
+    /// How often lonely nodes refresh and announce DNS seeds.
+    pub gossip_seed_announce_interval_ms: u64,
+    /// Optional extra manual gossip cadence; 0 disables and relies on Foca's
+    /// own periodic gossip.
+    pub gossip_manual_gossip_interval_ms: u64,
+    /// Keep Foca's built-in periodic announce/gossip timers enabled.
+    pub gossip_foca_periodic: bool,
+    /// Bounded queue depth for UDP writes emitted by Foca.
+    pub gossip_send_queue_depth: usize,
     /// Seed nodes for initial cluster bootstrap.
     pub seed_nodes: Vec<String>,
     /// Number of Raft groups (fixed at cluster birth; changing it remaps
@@ -139,6 +156,12 @@ impl Default for Config {
             raft_addr: "http://localhost:50052".to_string(),
             gossip_addr: "0.0.0.0:7946".to_string(),
             gossip_advertise_addr: None,
+            gossip_cluster_size: 32,
+            gossip_max_packet_size: 1400,
+            gossip_seed_announce_interval_ms: 5_000,
+            gossip_manual_gossip_interval_ms: 0,
+            gossip_foca_periodic: true,
+            gossip_send_queue_depth: 1024,
             seed_nodes: Vec::new(),
             group_count: 32,
             routing_prefix_segments: 0,
@@ -184,6 +207,12 @@ struct FileConfig {
     raft_addr: Option<String>,
     gossip_addr: Option<String>,
     gossip_advertise_addr: Option<String>,
+    gossip_cluster_size: Option<u32>,
+    gossip_max_packet_size: Option<usize>,
+    gossip_seed_announce_interval_ms: Option<u64>,
+    gossip_manual_gossip_interval_ms: Option<u64>,
+    gossip_foca_periodic: Option<bool>,
+    gossip_send_queue_depth: Option<usize>,
     seed_nodes: Option<Vec<String>>,
     group_count: Option<u32>,
     routing_prefix_segments: Option<u32>,
@@ -298,6 +327,18 @@ impl Config {
         if self.node_id.is_empty() {
             anyhow::bail!("node_id must not be empty");
         }
+        if self.gossip_cluster_size == 0 {
+            anyhow::bail!("gossip_cluster_size must be > 0");
+        }
+        if self.gossip_max_packet_size < 256 {
+            anyhow::bail!("gossip_max_packet_size must be >= 256");
+        }
+        if self.gossip_seed_announce_interval_ms == 0 {
+            anyhow::bail!("gossip_seed_announce_interval_ms must be > 0");
+        }
+        if self.gossip_send_queue_depth == 0 {
+            anyhow::bail!("gossip_send_queue_depth must be > 0");
+        }
         if self.raft_heartbeat_interval_ms == 0
             || self.raft_election_timeout_min_ms <= self.raft_heartbeat_interval_ms
             || self.raft_election_timeout_max_ms <= self.raft_election_timeout_min_ms
@@ -392,6 +433,12 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     if let Some(v) = file.gossip_advertise_addr {
         cfg.gossip_advertise_addr = Some(v);
     }
+    apply!(gossip_cluster_size);
+    apply!(gossip_max_packet_size);
+    apply!(gossip_seed_announce_interval_ms);
+    apply!(gossip_manual_gossip_interval_ms);
+    apply!(gossip_foca_periodic);
+    apply!(gossip_send_queue_depth);
     apply!(seed_nodes);
     apply!(group_count);
     apply!(routing_prefix_segments);
@@ -446,6 +493,24 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     }
     if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADVERTISE_ADDR") {
         cfg.gossip_advertise_addr = Some(v);
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GOSSIP_CLUSTER_SIZE")? {
+        cfg.gossip_cluster_size = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_GOSSIP_MAX_PACKET_SIZE")? {
+        cfg.gossip_max_packet_size = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GOSSIP_SEED_ANNOUNCE_INTERVAL_MS")? {
+        cfg.gossip_seed_announce_interval_ms = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GOSSIP_MANUAL_GOSSIP_INTERVAL_MS")? {
+        cfg.gossip_manual_gossip_interval_ms = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_GOSSIP_FOCA_PERIODIC")? {
+        cfg.gossip_foca_periodic = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH")? {
+        cfg.gossip_send_queue_depth = v;
     }
     if let Some(v) = env_list("PATHLOCKD_SEED_NODES") {
         cfg.seed_nodes = v;

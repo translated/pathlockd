@@ -19,6 +19,15 @@ gossip_addr = "0.0.0.0:7946"
 # The concrete ip:port advertised for gossip. Defaults to the bind address
 # when it names an IP, else the auto-detected outbound IP. Set behind NAT.
 # gossip_advertise_addr = "10.0.0.5:7946"
+# Foca/SWIM tuning. The defaults follow Foca's LAN profile: periodic
+# announce/gossip stays inside Foca, while pathlockd refreshes DNS seeds and
+# announces to them while it is lonely.
+gossip_cluster_size = 32
+gossip_max_packet_size = 1400
+gossip_seed_announce_interval_ms = 5000
+gossip_manual_gossip_interval_ms = 0
+gossip_foca_periodic = true
+gossip_send_queue_depth = 1024
 
 # Initialize a brand-new cluster with this node as sole voter. Exactly one
 # node bootstraps, exactly once; every other node joins via seed_nodes and is

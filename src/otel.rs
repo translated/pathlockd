@@ -24,6 +24,7 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
+use crate::cluster::gossip::GossipMetrics;
 use crate::raft::manager::RaftGroups;
 
 const SERVICE_NAME: &str = "pathlockd";
@@ -187,6 +188,156 @@ pub fn register_writer_queue_depth(depth: std::sync::Arc<std::sync::atomic::Atom
     // handle so the registration is not dropped eagerly by misbehaving SDKs.
     static GAUGE: OnceLock<opentelemetry::metrics::ObservableGauge<u64>> = OnceLock::new();
     let _ = GAUGE.set(gauge);
+}
+
+/// Register node-wide SWIM/Foca gauges. Counter-like values are exposed as
+/// monotonic observable values so the gossip loop only needs cheap atomics.
+pub fn register_gossip_metrics(metrics: Arc<GossipMetrics>) {
+    let meter = global::meter(INSTRUMENTATION_NAME);
+
+    let member_metrics = metrics.clone();
+    let members = meter
+        .u64_observable_gauge("pathlockd.gossip.members")
+        .with_description("Current SWIM live-member catalog size, including this node.")
+        .with_callback(move |observer| {
+            observer.observe(member_metrics.member_count(), &[]);
+        })
+        .build();
+
+    let incarnation_metrics = metrics.clone();
+    let local_incarnation = meter
+        .u64_observable_gauge("pathlockd.gossip.local_incarnation")
+        .with_description("Current local SWIM identity incarnation.")
+        .with_callback(move |observer| {
+            observer.observe(incarnation_metrics.local_incarnation(), &[]);
+        })
+        .build();
+
+    let timer_metrics = metrics.clone();
+    let timer_backlog = meter
+        .u64_observable_gauge("pathlockd.gossip.timer_backlog")
+        .with_description("Scheduled Foca timer events waiting to fire.")
+        .with_callback(move |observer| {
+            observer.observe(timer_metrics.timer_backlog(), &[]);
+        })
+        .build();
+
+    let queue_metrics = metrics.clone();
+    let send_queue = meter
+        .u64_observable_gauge("pathlockd.gossip.send_queue_depth")
+        .with_description("Queued UDP datagrams waiting for the gossip socket writer.")
+        .with_callback(move |observer| {
+            observer.observe(queue_metrics.send_queue_depth(), &[]);
+        })
+        .build();
+
+    let bad_metrics = metrics.clone();
+    let bad_datagrams = meter
+        .u64_observable_gauge("pathlockd.gossip.bad_datagrams_total")
+        .with_description("Malformed or rejected Foca datagrams observed by this node.")
+        .with_callback(move |observer| {
+            observer.observe(bad_metrics.bad_datagrams(), &[]);
+        })
+        .build();
+
+    let up_metrics = metrics.clone();
+    let member_up = meter
+        .u64_observable_gauge("pathlockd.gossip.member_up_total")
+        .with_description("Member-up notifications emitted by Foca.")
+        .with_callback(move |observer| {
+            observer.observe(up_metrics.member_up(), &[]);
+        })
+        .build();
+
+    let down_metrics = metrics.clone();
+    let member_down = meter
+        .u64_observable_gauge("pathlockd.gossip.member_down_total")
+        .with_description("Member-down notifications emitted by Foca.")
+        .with_callback(move |observer| {
+            observer.observe(down_metrics.member_down(), &[]);
+        })
+        .build();
+
+    let rename_metrics = metrics.clone();
+    let renamed = meter
+        .u64_observable_gauge("pathlockd.gossip.rename_total")
+        .with_description("Identity rename notifications emitted by Foca.")
+        .with_callback(move |observer| {
+            observer.observe(rename_metrics.renamed(), &[]);
+        })
+        .build();
+
+    let rejoin_metrics = metrics.clone();
+    let rejoins = meter
+        .u64_observable_gauge("pathlockd.gossip.rejoin_total")
+        .with_description("Local automatic rejoin notifications emitted by Foca.")
+        .with_callback(move |observer| {
+            observer.observe(rejoin_metrics.rejoins(), &[]);
+        })
+        .build();
+
+    let idle_metrics = metrics.clone();
+    let idle = meter
+        .u64_observable_gauge("pathlockd.gossip.idle_total")
+        .with_description("Times Foca reported no active cluster members.")
+        .with_callback(move |observer| {
+            observer.observe(idle_metrics.idle(), &[]);
+        })
+        .build();
+
+    let failure_metrics = metrics.clone();
+    let send_failures = meter
+        .u64_observable_gauge("pathlockd.gossip.send_failures_total")
+        .with_description("UDP socket send failures from the gossip writer.")
+        .with_callback(move |observer| {
+            observer.observe(failure_metrics.send_failures(), &[]);
+        })
+        .build();
+
+    let dropped_metrics = metrics.clone();
+    let send_dropped = meter
+        .u64_observable_gauge("pathlockd.gossip.send_dropped_total")
+        .with_description("Gossip datagrams dropped because the writer queue was unavailable.")
+        .with_callback(move |observer| {
+            observer.observe(dropped_metrics.send_dropped(), &[]);
+        })
+        .build();
+
+    let seed_metrics = metrics.clone();
+    let seed_failures = meter
+        .u64_observable_gauge("pathlockd.gossip.seed_resolve_failures_total")
+        .with_description("Failed DNS resolutions for configured gossip seeds.")
+        .with_callback(move |observer| {
+            observer.observe(seed_metrics.seed_resolve_failures(), &[]);
+        })
+        .build();
+
+    let unresolved_metrics = metrics;
+    let unresolved_targets = meter
+        .u64_observable_gauge("pathlockd.gossip.unresolved_targets_total")
+        .with_description("Foca send targets without a usable UDP destination.")
+        .with_callback(move |observer| {
+            observer.observe(unresolved_metrics.unresolved_targets(), &[]);
+        })
+        .build();
+
+    static GOSSIP_GAUGES: OnceLock<Vec<ObservableGauge<u64>>> = OnceLock::new();
+    let _ = GOSSIP_GAUGES.set(vec![
+        members,
+        local_incarnation,
+        timer_backlog,
+        send_queue,
+        bad_datagrams,
+        member_up,
+        member_down,
+        renamed,
+        rejoins,
+        idle,
+        send_failures,
+        send_dropped,
+        seed_failures,
+        unresolved_targets,
+    ]);
 }
 
 /// Register per-group Raft gauges. Values are sampled from OpenRaft's local
