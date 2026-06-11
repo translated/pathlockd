@@ -12,7 +12,7 @@ COPY build.rs ./
 COPY proto ./proto
 COPY src ./src
 
-# Pass e.g. RUSTFLAGS="-C target-cpu=x86-64-v3" for microarch-tuned builds.
+# Pass RUSTFLAGS for microarch-tuned builds.
 ARG RUSTFLAGS=""
 ENV RUSTFLAGS=${RUSTFLAGS}
 RUN cargo build --release --locked

@@ -161,12 +161,6 @@ filesystem, see the [**usage guide**](docs/usage-virtual-filesystem.md).
 Container images are published for **linux/amd64** and **linux/arm64** (Apple
 Silicon / AWS Graviton). The Node.js client targets `linux/amd64`.
 
-> **x86-64-v3 requirement.** The `linux/amd64` image is compiled with
-> `-C target-cpu=x86-64-v3` and **will crash with `Illegal instruction` on
-> CPUs that predate x86-64-v3** (Haswell / Excavator, ≈ 2013–2015).
-> This covers all mainstream server hardware since ≈ 2015 (AWS `c4`+, GCP
-> `n1`+, any Broadwell-or-newer Xeon/EPYC). Verify with
-> `grep -E 'avx2|bmi2' /proc/cpuinfo` — both flags must appear.
 
 ## Running from the container image
 
@@ -174,7 +168,7 @@ Pre-built images are published to GHCR on every version tag (`v*`):
 
 | Image tag | Binary | Notes |
 | --- | --- | --- |
-| `ghcr.io/alexpacio/pathlockd:0.6.0` | x86-64-v3 (amd64) / native (arm64) | requires x86-64-v3 or newer on amd64 (Haswell+, ≈2015+) |
+| `ghcr.io/alexpacio/pathlockd:0.6.0` | native (amd64/arm64) | |
 
 **Run pathlockd** (single node, no external dependencies):
 
@@ -393,17 +387,6 @@ reserve, and a crashed claimant's reservation simply expires.
 [`Dockerfile`](Dockerfile) bundles the builder stage, so `docker build`
 needs nothing on the host.
 
-**Microarch-tuned build** — the default `cargo build --release` targets the
-host CPU. To match the published Docker image (x86-64-v3) or tune further:
-
-```bash
-# match the published amd64 Docker image
-RUSTFLAGS="-C target-cpu=x86-64-v3" cargo build --release
-
-# container image
-docker build --build-arg RUSTFLAGS="-C target-cpu=x86-64-v3" -t pathlockd:x86-64-v3 .
-```
-
 ## Testing
 
 Everything runs inside containers, so Docker is the only prerequisite (no host
@@ -450,7 +433,7 @@ tarballs + `SHA256SUMS`).
 
 | Tag pattern | `RUSTFLAGS` | Notes |
 | --- | --- | --- |
-| `:v1.2.3`, `:1.2` | `-C target-cpu=x86-64-v3` | requires x86-64-v3+ on amd64; native on arm64 |
+| `:v1.2.3`, `:1.2` | (none) | native on amd64 and arm64 |
 
 Images are pushed to `ghcr.io/alexpacio/pathlockd` using the built-in
 `GITHUB_TOKEN`; no extra secrets are required.
