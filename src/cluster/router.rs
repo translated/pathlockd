@@ -191,9 +191,23 @@ impl Router {
         }
     }
 
+    fn request_id(&self, idempotency_key: Option<&str>) -> RequestId {
+        match idempotency_key {
+            Some(key) => RequestId {
+                client_id: format!("external:{key}"),
+                seq: 0,
+            },
+            None => self.next_request_id(),
+        }
+    }
+
     fn command(&self, op: Op) -> Command {
+        self.command_with_idempotency(op, None)
+    }
+
+    fn command_with_idempotency(&self, op: Op, idempotency_key: Option<&str>) -> Command {
         Command {
-            request_id: Some(self.next_request_id()),
+            request_id: Some(self.request_id(idempotency_key)),
             now_ms: crate::store_keys::now_ms(),
             op,
         }
@@ -539,6 +553,14 @@ impl Router {
     // -----------------------------------------------------------------------
 
     pub async fn acquire(&self, args: AcquireArgs) -> anyhow::Result<AcquireOutcome> {
+        self.acquire_with_idempotency(args, None).await
+    }
+
+    pub async fn acquire_with_idempotency(
+        &self,
+        args: AcquireArgs,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<AcquireOutcome> {
         let segments = self.routing.routing_prefix_segments;
         let domains: std::collections::HashSet<&str> = args
             .requests
@@ -560,7 +582,10 @@ impl Router {
         let group = place_domain(domain, self.routing.group_count);
 
         match self
-            .apply_to(group, self.command(Op::Acquire(args)))
+            .apply_to(
+                group,
+                self.command_with_idempotency(Op::Acquire(args), idempotency_key),
+            )
             .await?
         {
             ApplyResponse::Acquire(outcome) => Ok(outcome),
@@ -576,6 +601,17 @@ impl Router {
         reqs: &[RelReq],
         del_wait: bool,
     ) -> anyhow::Result<()> {
+        self.release_with_idempotency(owner, reqs, del_wait, None)
+            .await
+    }
+
+    pub async fn release_with_idempotency(
+        &self,
+        owner: &str,
+        reqs: &[RelReq],
+        del_wait: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         if reqs.is_empty() {
             return Ok(());
         }
@@ -587,30 +623,48 @@ impl Router {
                 .push(req.clone());
         }
         for (group, group_reqs) in by_group {
-            let cmd = self.command(Op::Release {
-                owner: owner.to_string(),
-                reqs: group_reqs,
-                del_wait,
-            });
+            let cmd = self.command_with_idempotency(
+                Op::Release {
+                    owner: owner.to_string(),
+                    reqs: group_reqs,
+                    del_wait,
+                },
+                idempotency_key,
+            );
             self.apply_to(group, cmd).await?;
         }
         if del_wait {
-            self.clear_wait_edge(owner).await?;
+            self.clear_wait_edge_with_idempotency(owner, idempotency_key)
+                .await?;
         }
         Ok(())
     }
 
     /// Release everything an owner holds, in every group.
     pub async fn release_all(&self, owner: &str, del_wait: bool) -> anyhow::Result<()> {
+        self.release_all_with_idempotency(owner, del_wait, None)
+            .await
+    }
+
+    pub async fn release_all_with_idempotency(
+        &self,
+        owner: &str,
+        del_wait: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         for group in self.lock_groups() {
-            let cmd = self.command(Op::ReleaseAll {
-                owner: owner.to_string(),
-                del_wait,
-            });
+            let cmd = self.command_with_idempotency(
+                Op::ReleaseAll {
+                    owner: owner.to_string(),
+                    del_wait,
+                },
+                idempotency_key,
+            );
             self.apply_to(group, cmd).await?;
         }
         if del_wait {
-            self.clear_wait_edge(owner).await?;
+            self.clear_wait_edge_with_idempotency(owner, idempotency_key)
+                .await?;
         }
         Ok(())
     }
@@ -633,6 +687,17 @@ impl Router {
         ttl_ms: u64,
         domains: &[String],
     ) -> anyhow::Result<RenewOutcome> {
+        self.renew_with_idempotency(owner, ttl_ms, domains, None)
+            .await
+    }
+
+    pub async fn renew_with_idempotency(
+        &self,
+        owner: &str,
+        ttl_ms: u64,
+        domains: &[String],
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<RenewOutcome> {
         let groups: Vec<GroupId> = if domains.is_empty() {
             self.lock_groups().collect()
         } else {
@@ -645,10 +710,13 @@ impl Router {
 
         let mut renewed_any = false;
         for group in groups {
-            let cmd = self.command(Op::Renew {
-                owner: owner.to_string(),
-                ttl_ms,
-            });
+            let cmd = self.command_with_idempotency(
+                Op::Renew {
+                    owner: owner.to_string(),
+                    ttl_ms,
+                },
+                idempotency_key,
+            );
             match self.apply_to(group, cmd).await? {
                 ApplyResponse::Renew(RenewOutcome::Ok) => renewed_any = true,
                 ApplyResponse::Renew(RenewOutcome::Lost { path, reason }) => {
@@ -672,13 +740,25 @@ impl Router {
 
     /// Forcibly release a victim owner everywhere (admin/deadlock breaker).
     pub async fn force_release(&self, victim: &str) -> anyhow::Result<()> {
+        self.force_release_with_idempotency(victim, None).await
+    }
+
+    pub async fn force_release_with_idempotency(
+        &self,
+        victim: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         for group in self.lock_groups() {
-            let cmd = self.command(Op::ForceRelease {
-                victim: victim.to_string(),
-            });
+            let cmd = self.command_with_idempotency(
+                Op::ForceRelease {
+                    victim: victim.to_string(),
+                },
+                idempotency_key,
+            );
             self.apply_to(group, cmd).await?;
         }
-        self.clear_wait_edge(victim).await?;
+        self.clear_wait_edge_with_idempotency(victim, idempotency_key)
+            .await?;
         Ok(())
     }
 
@@ -689,8 +769,18 @@ impl Router {
 
     /// Issue a new fencing token from the cluster-global counter (sys group).
     pub async fn incr_fencing_token(&self) -> anyhow::Result<i64> {
+        self.incr_fencing_token_with_idempotency(None).await
+    }
+
+    pub async fn incr_fencing_token_with_idempotency(
+        &self,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<i64> {
         match self
-            .apply_to(SYS_GROUP, self.command(Op::IncrFence))
+            .apply_to(
+                SYS_GROUP,
+                self.command_with_idempotency(Op::IncrFence, idempotency_key),
+            )
             .await?
         {
             ApplyResponse::IncrFence(token) => Ok(token),
@@ -707,22 +797,48 @@ impl Router {
         ttl_ms: u64,
         metadata: Option<&WaitEdgeMetadata>,
     ) -> anyhow::Result<()> {
-        let cmd = self.command(Op::SetWaitEdge {
-            owner: owner.to_string(),
-            edge: crate::raft::command::WaitEdge {
-                conflict_owner: conflict_owner.to_string(),
-                metadata: metadata.cloned(),
+        self.set_wait_edge_with_idempotency(owner, conflict_owner, ttl_ms, metadata, None)
+            .await
+    }
+
+    pub async fn set_wait_edge_with_idempotency(
+        &self,
+        owner: &str,
+        conflict_owner: &str,
+        ttl_ms: u64,
+        metadata: Option<&WaitEdgeMetadata>,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmd = self.command_with_idempotency(
+            Op::SetWaitEdge {
+                owner: owner.to_string(),
+                edge: crate::raft::command::WaitEdge {
+                    conflict_owner: conflict_owner.to_string(),
+                    metadata: metadata.cloned(),
+                },
+                ttl_ms,
             },
-            ttl_ms,
-        });
+            idempotency_key,
+        );
         self.apply_to(SYS_GROUP, cmd).await?;
         Ok(())
     }
 
     pub async fn clear_wait_edge(&self, owner: &str) -> anyhow::Result<()> {
-        let cmd = self.command(Op::ClearWaitEdge {
-            owner: owner.to_string(),
-        });
+        self.clear_wait_edge_with_idempotency(owner, None).await
+    }
+
+    pub async fn clear_wait_edge_with_idempotency(
+        &self,
+        owner: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmd = self.command_with_idempotency(
+            Op::ClearWaitEdge {
+                owner: owner.to_string(),
+            },
+            idempotency_key,
+        );
         self.apply_to(SYS_GROUP, cmd).await?;
         Ok(())
     }
@@ -733,12 +849,26 @@ impl Router {
         claimant: &str,
         ttl_ms: u64,
     ) -> anyhow::Result<ClaimOutcome> {
+        self.set_claim_with_idempotency(path, claimant, ttl_ms, None)
+            .await
+    }
+
+    pub async fn set_claim_with_idempotency(
+        &self,
+        path: &str,
+        claimant: &str,
+        ttl_ms: u64,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<ClaimOutcome> {
         let group = self.group_of(path);
-        let cmd = self.command(Op::SetClaim {
-            path: path.to_string(),
-            claimant: claimant.to_string(),
-            ttl_ms,
-        });
+        let cmd = self.command_with_idempotency(
+            Op::SetClaim {
+                path: path.to_string(),
+                claimant: claimant.to_string(),
+                ttl_ms,
+            },
+            idempotency_key,
+        );
         match self.apply_to(group, cmd).await? {
             ApplyResponse::SetClaim(outcome) => Ok(outcome),
             _ => anyhow::bail!("unexpected response type"),
@@ -746,11 +876,24 @@ impl Router {
     }
 
     pub async fn clear_claim(&self, path: &str, claimant: &str) -> anyhow::Result<()> {
+        self.clear_claim_with_idempotency(path, claimant, None)
+            .await
+    }
+
+    pub async fn clear_claim_with_idempotency(
+        &self,
+        path: &str,
+        claimant: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         let group = self.group_of(path);
-        let cmd = self.command(Op::ClearClaim {
-            path: path.to_string(),
-            claimant: claimant.to_string(),
-        });
+        let cmd = self.command_with_idempotency(
+            Op::ClearClaim {
+                path: path.to_string(),
+                claimant: claimant.to_string(),
+            },
+            idempotency_key,
+        );
         self.apply_to(group, cmd).await?;
         Ok(())
     }
@@ -1002,6 +1145,7 @@ mod tests {
             1,
             meta.clone(),
             raft_config(&cfg),
+            cfg.raft_snapshot_max_bytes,
             batcher,
             crate::raft::network::PeerPool::new(),
         )
@@ -1024,6 +1168,106 @@ mod tests {
             mode: Mode::Write,
             state: State::New,
         }
+    }
+
+    fn wr_rel(path: &str) -> RelReq {
+        RelReq {
+            path: path.into(),
+            mode: Mode::Write,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_idempotency_retries_incr_fence_once() {
+        let (router, _dir) = test_router().await;
+
+        let first = router
+            .incr_fencing_token_with_idempotency(Some("fence-retry-1"))
+            .await
+            .unwrap();
+        let retry = router
+            .incr_fencing_token_with_idempotency(Some("fence-retry-1"))
+            .await
+            .unwrap();
+        let next = router.incr_fencing_token().await.unwrap();
+
+        assert_eq!(first, retry);
+        assert_eq!(next, first + 1);
+    }
+
+    #[tokio::test]
+    async fn external_idempotency_retries_lock_mutations_once() {
+        let (router, _dir) = test_router().await;
+
+        let args = AcquireArgs {
+            owner_id: "idem-owner".into(),
+            ttl_ms: 30_000,
+            requests: vec![wr_req("h:/idem")],
+            fencing_token: 1,
+            release_requests: vec![],
+        };
+        assert_eq!(
+            router
+                .acquire_with_idempotency(args.clone(), Some("acquire-retry-1"))
+                .await
+                .unwrap(),
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            router
+                .acquire_with_idempotency(args, Some("acquire-retry-1"))
+                .await
+                .unwrap(),
+            AcquireOutcome::Ok
+        );
+
+        router
+            .release_with_idempotency(
+                "idem-owner",
+                &[wr_rel("h:/idem")],
+                false,
+                Some("release-retry-1"),
+            )
+            .await
+            .unwrap();
+        router
+            .release_with_idempotency(
+                "idem-owner",
+                &[wr_rel("h:/idem")],
+                false,
+                Some("release-retry-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router.inspect_path("h:/idem").await.unwrap().write_owner,
+            None
+        );
+
+        for path in ["h:/force-a", "h:/force-b"] {
+            assert_eq!(
+                router
+                    .acquire(AcquireArgs {
+                        owner_id: "victim".into(),
+                        ttl_ms: 30_000,
+                        requests: vec![wr_req(path)],
+                        fencing_token: 1,
+                        release_requests: vec![],
+                    })
+                    .await
+                    .unwrap(),
+                AcquireOutcome::Ok
+            );
+        }
+        router
+            .force_release_with_idempotency("victim", Some("force-retry-1"))
+            .await
+            .unwrap();
+        router
+            .force_release_with_idempotency("victim", Some("force-retry-1"))
+            .await
+            .unwrap();
+        assert!(!router.is_owner_alive("victim").await.unwrap());
     }
 
     #[tokio::test]

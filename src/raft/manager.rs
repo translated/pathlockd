@@ -24,6 +24,7 @@ pub struct RaftGroups {
     node_id: u64,
     node_meta: NodeMeta,
     raft_config: Arc<openraft::Config>,
+    snapshot_max_bytes: u64,
     batcher: FsyncBatcher,
     pool: PeerPool,
     groups: RwLock<HashMap<GroupId, Raft>>,
@@ -35,6 +36,7 @@ impl RaftGroups {
         node_id: u64,
         node_meta: NodeMeta,
         raft_config: openraft::Config,
+        snapshot_max_bytes: u64,
         batcher: FsyncBatcher,
         pool: PeerPool,
     ) -> anyhow::Result<Arc<Self>> {
@@ -48,6 +50,7 @@ impl RaftGroups {
             node_id,
             node_meta,
             raft_config,
+            snapshot_max_bytes,
             batcher,
             pool,
             groups: RwLock::new(HashMap::new()),
@@ -64,6 +67,14 @@ impl RaftGroups {
 
     pub fn peer_pool(&self) -> &PeerPool {
         &self.pool
+    }
+
+    pub fn snapshot_max_bytes(&self) -> u64 {
+        self.snapshot_max_bytes
+    }
+
+    pub fn replication_lag_threshold(&self) -> u64 {
+        self.raft_config.replication_lag_threshold
     }
 
     pub fn db_handle(&self) -> Arc<DB> {
@@ -114,7 +125,7 @@ impl RaftGroups {
         }
         let log_store = GroupLogStore::new(self.db.clone(), group, self.batcher.clone());
         let state_machine = GroupStateMachine::new(self.db.clone(), group, self.batcher.clone());
-        let network = RaftClientFactory::new(group, self.pool.clone());
+        let network = RaftClientFactory::new(group, self.pool.clone(), self.snapshot_max_bytes);
         let raft = Raft::new(
             self.node_id,
             self.raft_config.clone(),
@@ -219,6 +230,7 @@ pub fn raft_config(cfg: &crate::config::Config) -> openraft::Config {
             cfg.raft_snapshot_interval_entries,
         ),
         max_in_snapshot_log_to_keep: cfg.raft_snapshot_min_log_entries,
+        api_channel_size: Some(cfg.raft_max_inflight as u64),
         ..Default::default()
     }
 }

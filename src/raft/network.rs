@@ -33,7 +33,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Snapshot images stream in slices of this size.
-const SNAPSHOT_CHUNK: usize = 1 << 20;
+const DEFAULT_SNAPSHOT_CHUNK: usize = 1 << 20;
 
 pub(crate) fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Unreachable<TypeConfig>> {
     bincode::serde::encode_to_vec(v, bincode::config::standard())
@@ -109,11 +109,16 @@ impl PeerPool {
 pub struct RaftClientFactory {
     group: GroupId,
     pool: PeerPool,
+    snapshot_max_bytes: u64,
 }
 
 impl RaftClientFactory {
-    pub fn new(group: GroupId, pool: PeerPool) -> Self {
-        Self { group, pool }
+    pub fn new(group: GroupId, pool: PeerPool, snapshot_max_bytes: u64) -> Self {
+        Self {
+            group,
+            pool,
+            snapshot_max_bytes,
+        }
     }
 }
 
@@ -122,6 +127,7 @@ pub struct RaftClientConn {
     target: u64,
     node: NodeMeta,
     pool: PeerPool,
+    snapshot_max_bytes: u64,
 }
 
 impl RaftClientConn {
@@ -150,6 +156,7 @@ impl RaftNetworkFactory<TypeConfig> for RaftClientFactory {
             target,
             node: node.clone(),
             pool: self.pool.clone(),
+            snapshot_max_bytes: self.snapshot_max_bytes,
         }
     }
 }
@@ -187,8 +194,8 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
         &mut self,
         vote: Vote,
         snapshot: Snapshot,
-        _cancel: impl std::future::Future<Output = ReplicationClosed> + openraft::OptionalSend + 'static,
-        _option: RPCOption,
+        cancel: impl std::future::Future<Output = ReplicationClosed> + openraft::OptionalSend + 'static,
+        option: RPCOption,
     ) -> Result<SnapshotResponse<TypeConfig>, StreamingError<TypeConfig>> {
         let mut client = self
             .client()
@@ -198,13 +205,27 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
         let vote_bytes = encode(&vote).map_err(StreamingError::Unreachable)?;
         let meta_bytes = encode(&snapshot.meta).map_err(StreamingError::Unreachable)?;
         let image = snapshot.snapshot.into_inner();
+        let max_bytes = usize::try_from(self.snapshot_max_bytes).unwrap_or(usize::MAX);
+        if image.len() > max_bytes {
+            return Err(StreamingError::Unreachable(Unreachable::new(&IoStr(
+                format!(
+                    "snapshot image too large: {} bytes > {} bytes",
+                    image.len(),
+                    max_bytes
+                ),
+            ))));
+        }
+        let chunk_size = option
+            .snapshot_chunk_size()
+            .unwrap_or(DEFAULT_SNAPSHOT_CHUNK)
+            .max(1);
 
         let chunks = async_stream::stream! {
             let mut first = true;
             let mut offset = 0usize;
             // Always at least one chunk, so meta travels even for an empty image.
             loop {
-                let end = (offset + SNAPSHOT_CHUNK).min(image.len());
+                let end = (offset + chunk_size).min(image.len());
                 yield SnapshotChunk {
                     group,
                     vote: if first { vote_bytes.clone() } else { Vec::new() },
@@ -219,10 +240,19 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
             }
         };
 
-        let resp = client
-            .install_snapshot(chunks)
-            .await
-            .map_err(|e| StreamingError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
+        let mut request = tonic::Request::new(chunks);
+        request.set_timeout(option.hard_ttl());
+
+        tokio::pin!(cancel);
+        let resp = tokio::select! {
+            _ = &mut cancel => {
+                return Err(StreamingError::Unreachable(Unreachable::new(&IoStr(
+                    "snapshot replication cancelled".to_string(),
+                ))));
+            }
+            resp = client.install_snapshot(request) => resp
+                .map_err(|e| StreamingError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?,
+        };
         decode(&resp.into_inner().payload).map_err(StreamingError::Unreachable)
     }
 

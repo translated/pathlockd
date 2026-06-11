@@ -46,6 +46,8 @@ use crate::cluster::router::Router;
 use crate::raft::manager::RaftGroups;
 use crate::raft::types::NodeMeta;
 
+const LEARNER_CATCH_UP_WAIT: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone)]
 pub struct ControllerOptions {
     pub group_count: u32,
@@ -237,15 +239,32 @@ async fn reconcile_group(
     }
 
     let mut changed = false;
+    let mut caught_up_this_tick = BTreeSet::new();
 
     // Phase 1: every desired voter joins as a learner first.
     for node in &desired {
         if !current_all.contains(node) {
             if let Some(meta) = stable.get(node) {
                 info!(group, node, "adding learner");
-                raft.add_learner(*node, meta.clone(), false)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("add_learner({node}): {e}"))?;
+                match tokio::time::timeout(
+                    LEARNER_CATCH_UP_WAIT,
+                    raft.add_learner(*node, meta.clone(), true),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        caught_up_this_tick.insert(*node);
+                    }
+                    Ok(Err(e)) => return Err(anyhow::anyhow!("add_learner({node}): {e}")),
+                    Err(_) => {
+                        debug!(
+                            group,
+                            node,
+                            wait_ms = LEARNER_CATCH_UP_WAIT.as_millis() as u64,
+                            "learner catch-up wait timed out; controller will retry"
+                        );
+                    }
+                }
                 changed = true;
             }
         }
@@ -267,6 +286,30 @@ async fn reconcile_group(
 
     // Phase 2: move the voter set when it differs and the move is safe.
     if desired != current_voters {
+        let promotion_blockers: Vec<(u64, Option<u64>)> = desired
+            .difference(&current_voters)
+            .filter(|node| !caught_up_this_tick.contains(node))
+            .map(|node| {
+                (
+                    *node,
+                    learner_replication_lag(&metrics, *node, metrics.last_log_index),
+                )
+            })
+            .filter(|(_, lag)| match lag {
+                Some(lag) => *lag > groups.replication_lag_threshold(),
+                None => true,
+            })
+            .collect();
+        if !promotion_blockers.is_empty() {
+            debug!(
+                group,
+                ?promotion_blockers,
+                lag_threshold = groups.replication_lag_threshold(),
+                "waiting for learner catch-up before membership change"
+            );
+            return Ok(changed);
+        }
+
         // Departing voters must be genuinely gone (eviction window) or
         // demoted while alive (rebalancing/draining) — both fine; the guard
         // that matters is a live majority of the NEW configuration, or joint
@@ -330,4 +373,38 @@ async fn reconcile_group(
     }
 
     Ok(changed)
+}
+
+fn learner_replication_lag(
+    metrics: &crate::raft::types::RaftMetrics,
+    node: u64,
+    last_log_index: Option<u64>,
+) -> Option<u64> {
+    let matched = metrics
+        .replication
+        .as_ref()?
+        .get(&node)?
+        .as_ref()
+        .map(|log_id| log_id.index);
+    Some(replication_lag(matched, last_log_index))
+}
+
+fn replication_lag(matched_log_index: Option<u64>, last_log_index: Option<u64>) -> u64 {
+    let matched_next = matched_log_index.map(|i| i.saturating_add(1)).unwrap_or(0);
+    let last_next = last_log_index.map(|i| i.saturating_add(1)).unwrap_or(0);
+    last_next.saturating_sub(matched_next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::replication_lag;
+
+    #[test]
+    fn replication_lag_matches_openraft_distance_semantics() {
+        assert_eq!(replication_lag(None, None), 0);
+        assert_eq!(replication_lag(None, Some(3)), 4);
+        assert_eq!(replication_lag(Some(2), Some(3)), 1);
+        assert_eq!(replication_lag(Some(3), Some(3)), 0);
+        assert_eq!(replication_lag(Some(4), Some(3)), 0);
+    }
 }

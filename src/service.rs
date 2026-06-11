@@ -66,6 +66,17 @@ fn check_id(label: &str, id: &str) -> Result<(), Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn idempotency_key(key: &str) -> Result<Option<String>, Status> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if key.len() > MAX_ID_LEN {
+        return Err(Status::invalid_argument(format!("idempotency_key too long (max {MAX_ID_LEN} bytes)")));
+    }
+    Ok(Some(key.to_string()))
+}
+
+#[allow(clippy::result_large_err)]
 fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
     if ttl_ms == 0 {
         return Err(Status::invalid_argument("ttl_ms must be > 0"));
@@ -215,6 +226,7 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
             check_ttl(req.ttl_ms)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             if req.requests.len() + req.release_requests.len() > MAX_PATHS_PER_REQUEST {
                 return Err(Status::invalid_argument(format!(
                     "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
@@ -242,7 +254,7 @@ impl PathLock for PathLockService {
             };
 
             let router = self.router.clone();
-            let outcome = router.acquire(args).await.map_err(engine_err)?;
+            let outcome = router.acquire_with_idempotency(args, idempotency_key.as_deref()).await.map_err(engine_err)?;
             let resp = match outcome {
                 AcquireOutcome::Ok => {
                     if had_release && req.emit_release {
@@ -268,6 +280,7 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Release", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             if req.requests.len() > MAX_PATHS_PER_REQUEST {
                 return Err(Status::invalid_argument(format!("too many paths in one request (max {MAX_PATHS_PER_REQUEST})")));
             }
@@ -278,7 +291,7 @@ impl PathLock for PathLockService {
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let del_wait_key = req.del_wait_key;
-            router.release(&owner_id, &reqs, del_wait_key).await.map_err(engine_err)?;
+            router.release_with_idempotency(&owner_id, &reqs, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.released(&req.owner_id);
             Ok(Response::new(ReleaseResponse {}))
         }).await
@@ -291,10 +304,11 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ReleaseAll", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let del_wait_key = req.del_wait_key;
-            router.release_all(&owner_id, del_wait_key).await.map_err(engine_err)?;
+            router.release_all_with_idempotency(&owner_id, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.released(&req.owner_id);
             Ok(Response::new(ReleaseResponse {}))
         }).await
@@ -308,10 +322,11 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
             check_ttl(req.ttl_ms)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let ttl_ms = req.ttl_ms;
-            let outcome = router.renew(&owner_id, ttl_ms, &req.domains).await.map_err(engine_err)?;
+            let outcome = router.renew_with_idempotency(&owner_id, ttl_ms, &req.domains, idempotency_key.as_deref()).await.map_err(engine_err)?;
             let resp = match outcome {
                 RenewOutcome::Ok => RenewResponse { status: RenewStatus::Ok as i32, ..Default::default() },
                 RenewOutcome::Lost { path, reason } => RenewResponse { status: RenewStatus::Lost as i32, path, reason },
@@ -327,9 +342,10 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ForceRelease", request, |request| async move {
             let req = request.into_inner();
             check_id("victim_id", &req.victim_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let victim_id = req.victim_id.clone();
-            router.force_release(&victim_id).await.map_err(engine_err)?;
+            router.force_release_with_idempotency(&victim_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.killed(&req.victim_id);
             Ok(Response::new(ForceReleaseResponse {}))
         }).await
@@ -395,8 +411,10 @@ impl PathLock for PathLockService {
         &self,
         request: Request<IncrFencingTokenRequest>,
     ) -> Result<Response<IncrFencingTokenResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IncrFencingToken", request, |_request| async move {
-            let token = self.router.incr_fencing_token().await.map_err(engine_err)?;
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IncrFencingToken", request, |request| async move {
+            let req = request.into_inner();
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
+            let token = self.router.incr_fencing_token_with_idempotency(idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(IncrFencingTokenResponse { token }))
         }).await
     }
@@ -410,6 +428,7 @@ impl PathLock for PathLockService {
             check_id("owner_id", &req.owner_id)?;
             check_id("conflict_owner", &req.conflict_owner)?;
             check_ttl(req.ttl_ms)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
                 None
             } else if req.conflict_path.is_empty() || req.reason.is_empty() {
@@ -420,7 +439,7 @@ impl PathLock for PathLockService {
                 Some(WaitEdgeMetadata { conflict_path: req.conflict_path, reason: req.reason })
             };
             let router = self.router.clone();
-            router.set_wait_edge(&req.owner_id, &req.conflict_owner, req.ttl_ms, metadata.as_ref()).await.map_err(engine_err)?;
+            router.set_wait_edge_with_idempotency(&req.owner_id, &req.conflict_owner, req.ttl_ms, metadata.as_ref(), idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(SetWaitEdgeResponse {}))
         }).await
     }
@@ -432,8 +451,9 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ClearWaitEdge", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            router.clear_wait_edge(&req.owner_id).await.map_err(engine_err)?;
+            router.clear_wait_edge_with_idempotency(&req.owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(ClearWaitEdgeResponse {}))
         }).await
     }
@@ -450,8 +470,9 @@ impl PathLock for PathLockService {
             if req.ttl_ms > MAX_CLAIM_TTL_MS {
                 return Err(Status::invalid_argument(format!("ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
             }
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            let outcome = router.set_claim(&req.path, &req.claimant_owner_id, req.ttl_ms).await.map_err(engine_err)?;
+            let outcome = router.set_claim_with_idempotency(&req.path, &req.claimant_owner_id, req.ttl_ms, idempotency_key.as_deref()).await.map_err(engine_err)?;
             let resp = match outcome {
                 engine::ClaimOutcome::Ok => SetClaimResponse {
                     status: SetClaimStatus::Ok as i32,
@@ -474,8 +495,9 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_path(&req.path)?;
             check_id("claimant_owner_id", &req.claimant_owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            router.clear_claim(&req.path, &req.claimant_owner_id).await.map_err(engine_err)?;
+            router.clear_claim_with_idempotency(&req.path, &req.claimant_owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(ClearClaimResponse {}))
         }).await
     }

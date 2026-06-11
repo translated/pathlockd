@@ -145,33 +145,20 @@ impl RaftTransport for RaftTransportService {
     ) -> Result<Response<RaftFrame>, Status> {
         let mut stream = request.into_inner();
 
-        let mut group: Option<u32> = None;
-        let mut vote_bytes: Vec<u8> = Vec::new();
-        let mut meta_bytes: Vec<u8> = Vec::new();
-        let mut image: Vec<u8> = Vec::new();
+        let mut assembler = SnapshotAssembler::new(
+            usize::try_from(self.groups.snapshot_max_bytes()).unwrap_or(usize::MAX),
+        );
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            group.get_or_insert(chunk.group);
-            if !chunk.vote.is_empty() {
-                vote_bytes = chunk.vote;
-            }
-            if !chunk.meta.is_empty() {
-                meta_bytes = chunk.meta;
-            }
-            image.extend_from_slice(&chunk.data);
+            assembler.push(chunk?)?;
         }
-        let group = group.ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?;
-        if vote_bytes.is_empty() || meta_bytes.is_empty() {
-            return Err(Status::invalid_argument(
-                "snapshot stream missing vote/meta header",
-            ));
-        }
+        let incoming = assembler.finish()?;
+        let group = incoming.group;
         let raft = self.core(group).await?;
-        let vote = decode(&vote_bytes)?;
-        let meta: crate::raft::types::SnapshotMeta = decode(&meta_bytes)?;
+        let vote = decode(&incoming.vote_bytes)?;
+        let meta: crate::raft::types::SnapshotMeta = decode(&incoming.meta_bytes)?;
         let snapshot = crate::raft::types::Snapshot {
             meta,
-            snapshot: std::io::Cursor::new(image),
+            snapshot: std::io::Cursor::new(incoming.image),
         };
         let resp = raft
             .install_full_snapshot(vote, snapshot)
@@ -237,6 +224,115 @@ impl RaftTransport for RaftTransportService {
             .await
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(SetDrainingResponse {}))
+    }
+}
+
+struct IncomingSnapshot {
+    group: u32,
+    vote_bytes: Vec<u8>,
+    meta_bytes: Vec<u8>,
+    image: Vec<u8>,
+}
+
+struct SnapshotAssembler {
+    group: Option<u32>,
+    vote_bytes: Vec<u8>,
+    meta_bytes: Vec<u8>,
+    image: Vec<u8>,
+    max_bytes: usize,
+}
+
+impl SnapshotAssembler {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            group: None,
+            vote_bytes: Vec::new(),
+            meta_bytes: Vec::new(),
+            image: Vec::new(),
+            max_bytes,
+        }
+    }
+
+    fn push(&mut self, chunk: SnapshotChunk) -> Result<(), Status> {
+        match self.group {
+            Some(group) if group != chunk.group => {
+                return Err(Status::invalid_argument(format!(
+                    "snapshot stream changed group from {group} to {}",
+                    chunk.group
+                )));
+            }
+            None => self.group = Some(chunk.group),
+            _ => {}
+        }
+
+        if !chunk.vote.is_empty() {
+            self.vote_bytes = chunk.vote;
+        }
+        if !chunk.meta.is_empty() {
+            self.meta_bytes = chunk.meta;
+        }
+
+        let next_len = self
+            .image
+            .len()
+            .checked_add(chunk.data.len())
+            .ok_or_else(|| Status::resource_exhausted("snapshot image length overflow"))?;
+        if next_len > self.max_bytes {
+            return Err(Status::resource_exhausted(format!(
+                "snapshot image too large: {next_len} bytes > {} bytes",
+                self.max_bytes
+            )));
+        }
+        self.image.extend_from_slice(&chunk.data);
+        Ok(())
+    }
+
+    fn finish(self) -> Result<IncomingSnapshot, Status> {
+        let group = self
+            .group
+            .ok_or_else(|| Status::invalid_argument("empty snapshot stream"))?;
+        if self.vote_bytes.is_empty() || self.meta_bytes.is_empty() {
+            return Err(Status::invalid_argument(
+                "snapshot stream missing vote/meta header",
+            ));
+        }
+        Ok(IncomingSnapshot {
+            group,
+            vote_bytes: self.vote_bytes,
+            meta_bytes: self.meta_bytes,
+            image: self.image,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SnapshotAssembler;
+    use crate::raft_proto::SnapshotChunk;
+    use tonic::Code;
+
+    fn chunk(group: u32, data: &[u8]) -> SnapshotChunk {
+        SnapshotChunk {
+            group,
+            vote: b"vote".to_vec(),
+            meta: b"meta".to_vec(),
+            data: data.to_vec(),
+        }
+    }
+
+    #[test]
+    fn snapshot_assembler_rejects_oversized_images() {
+        let mut assembler = SnapshotAssembler::new(3);
+        let err = assembler.push(chunk(1, b"four")).unwrap_err();
+        assert_eq!(err.code(), Code::ResourceExhausted);
+    }
+
+    #[test]
+    fn snapshot_assembler_rejects_group_changes() {
+        let mut assembler = SnapshotAssembler::new(10);
+        assembler.push(chunk(1, b"a")).unwrap();
+        let err = assembler.push(chunk(2, b"b")).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 }
 

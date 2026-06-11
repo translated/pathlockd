@@ -45,7 +45,9 @@ async fn live_cluster_mutual_exclusion() {
     let mut b = client(&nodes[1]).await;
 
     let token = a
-        .incr_fencing_token(IncrFencingTokenRequest {})
+        .incr_fencing_token(IncrFencingTokenRequest {
+            idempotency_key: String::new(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -61,6 +63,7 @@ async fn live_cluster_mutual_exclusion() {
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -76,6 +79,7 @@ async fn live_cluster_mutual_exclusion() {
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -108,6 +112,7 @@ async fn live_cluster_mutual_exclusion() {
             mode: Mode::Write as i32,
         }],
         del_wait_key: false,
+        idempotency_key: String::new(),
     })
     .await
     .unwrap();
@@ -139,6 +144,7 @@ async fn live_cluster_state_survives_on_survivors() {
                 requests: vec![wr(&path)],
                 release_requests: vec![],
                 emit_release: false,
+                idempotency_key: String::new(),
             })
             .await
             .unwrap()
@@ -156,7 +162,9 @@ async fn live_cluster_take_lock() {
     let owner = std::env::var("PLK_OWNER").unwrap_or_else(|_| "failover-owner".into());
     let mut c = client(&nodes[0]).await;
     let token = c
-        .incr_fencing_token(IncrFencingTokenRequest {})
+        .incr_fencing_token(IncrFencingTokenRequest {
+            idempotency_key: String::new(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -169,6 +177,7 @@ async fn live_cluster_take_lock() {
             requests: vec![wr(&path)],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()

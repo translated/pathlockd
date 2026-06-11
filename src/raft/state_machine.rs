@@ -400,6 +400,16 @@ impl GroupStateMachine {
         self.db.get_cf(&cf, &scoped).map_err(io_err)
     }
 
+    fn get_meta_raw_snapshot(
+        &self,
+        snapshot: &rocksdb::Snapshot<'_>,
+        key: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        let cf = self.meta_cf()?;
+        let scoped = store_keys::group_key(self.group, key);
+        snapshot.get_cf(&cf, &scoped).map_err(io_err)
+    }
+
     fn put_meta_raw(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let cf = self.meta_cf()?;
         let scoped = store_keys::group_key(self.group, key);
@@ -547,6 +557,23 @@ impl GroupStateMachine {
     fn batcher_barrier(&self) -> io::Result<()> {
         self.batcher.barrier()
     }
+
+    fn applied_state_from_snapshot(
+        &self,
+        snapshot: &rocksdb::Snapshot<'_>,
+    ) -> io::Result<(Option<RaftLogId>, StoredMembership)> {
+        let applied =
+            match self.get_meta_raw_snapshot(snapshot, store_keys::META_LAST_APPLIED_KEY)? {
+                Some(bytes) => Some(decode_meta::<RaftLogId>(&bytes)?),
+                None => None,
+            };
+        let membership =
+            match self.get_meta_raw_snapshot(snapshot, store_keys::META_MEMBERSHIP_KEY)? {
+                Some(bytes) => decode_meta::<StoredMembership>(&bytes)?,
+                None => StoredMembership::default(),
+            };
+        Ok((applied, membership))
+    }
 }
 
 /// Builds a snapshot image of the group's applied state.
@@ -556,9 +583,14 @@ pub struct GroupSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
-        let (last_applied, membership) = self.sm.applied_state().await?;
-        let image =
-            crate::raft::snapshot::build_group_image(&self.sm.db, self.sm.group).map_err(io_err)?;
+        let db_snapshot = self.sm.db.snapshot();
+        let (last_applied, membership) = self.sm.applied_state_from_snapshot(&db_snapshot)?;
+        let image = crate::raft::snapshot::build_group_image_from_snapshot(
+            &self.sm.db,
+            &db_snapshot,
+            self.sm.group,
+        )
+        .map_err(io_err)?;
 
         let snapshot_id = format!(
             "g{}-{}-{}",

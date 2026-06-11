@@ -58,6 +58,8 @@ message AcquireRequest {
   repeated ReleaseRequest release_requests = 5;
   // When true and releases were applied, publish a RELEASED event for owner_id.
   bool emit_release = 6;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 7;
 }
 
 enum AcquireStatus {
@@ -89,11 +91,15 @@ message ReleaseLocksRequest {
   repeated ReleaseRequest requests = 2;
   // Fold the owner's wait-edge deletion into the same transaction.
   bool del_wait_key = 3;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 4;
 }
 
 message ReleaseAllRequest {
   string owner_id = 1;
   bool del_wait_key = 2;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 3;
 }
 
 message ReleaseResponse {}
@@ -111,6 +117,8 @@ message RenewRequest {
   // those Raft groups. When empty, every group is probed — correct, but
   // amplified; strongly discouraged for heartbeat-frequency renews.
   repeated string domains = 3;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 4;
 }
 
 enum RenewStatus {
@@ -130,6 +138,8 @@ message RenewResponse {
 
 message ForceReleaseRequest {
   string victim_id = 1;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 2;
 }
 
 message ForceReleaseResponse {}
@@ -194,7 +204,10 @@ message IsBlockingResponse {
 // Fencing counter (monotonic INCR)
 // ---------------------------------------------------------------------------
 
-message IncrFencingTokenRequest {}
+message IncrFencingTokenRequest {
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 1;
+}
 
 message IncrFencingTokenResponse {
   int64 token = 1;
@@ -214,12 +227,16 @@ message SetWaitEdgeRequest {
   // behaviour for those edges.
   string conflict_path = 4;
   string reason = 5;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 6;
 }
 
 message SetWaitEdgeResponse {}
 
 message ClearWaitEdgeRequest {
   string owner_id = 1;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 2;
 }
 
 message ClearWaitEdgeResponse {}
@@ -255,6 +272,8 @@ message SetClaimRequest {
   // Reservation TTL; 0 selects a short server default. Capped at the server's
   // max claim TTL. Refreshing one's own claim re-arms the TTL.
   uint64 ttl_ms = 3;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 4;
 }
 
 enum SetClaimStatus {
@@ -274,6 +293,8 @@ message ClearClaimRequest {
   string path = 1;
   // Only this claimant's own claim is cleared; a foreign claim is untouched.
   string claimant_owner_id = 2;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 3;
 }
 
 message ClearClaimResponse {}

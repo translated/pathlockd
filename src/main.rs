@@ -86,6 +86,7 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         node_meta.clone(),
         raft_config(&cfg),
+        cfg.raft_snapshot_max_bytes,
         batcher,
         PeerPool::new(),
     )?;
@@ -152,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
         Some(members.watch()),
     ));
     otel::register_writer_queue_depth(router.write_queue_depth());
+    otel::register_raft_group_metrics(groups.clone());
 
     // Bootstrap decision (split-brain guard). Initializing groups is only
     // allowed when this node has no prior raft state AND no existing cluster
