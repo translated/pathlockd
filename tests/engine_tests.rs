@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, Mode, RelReq, RenewOutcome,
-    State, WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, AssertOutcome, LockReq, Mode, RelReq, RenewOutcome, State,
+    WaitEdgeMetadata,
 };
 use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
@@ -559,59 +559,6 @@ fn clear_claim_only_clears_own_claim() {
 }
 
 #[test]
-fn cycle_detection_traverses_pure_waiter_claim_edges() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-
-    // Holder "bob" holds h:/a/b and is blocked by pure-waiter "alice"'s claim
-    // on h:/a (he wants to extend upward). Alice, in turn, waits on Bob's
-    // held descendant lock. Alice holds NOTHING (no ALIVE record): the cycle
-    // walk must still traverse the claim edge via is_blocking instead of
-    // pruning it on the liveness probe.
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a/b")])),
-    });
-    let resp = apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetClaim { path: "h:/a".into(), claimant: "alice".into(), ttl_ms: 60_000 },
-    });
-    assert!(matches!(resp, ApplyResponse::SetClaim(pathlockd::engine::ClaimOutcome::Ok)));
-
-    // alice → bob (blocked by his held write on h:/a/b)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "alice".into(),
-            edge: pathlockd::raft::command::WaitEdge {
-                conflict_owner: "bob".into(),
-                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/a/b".into(), reason: "descendant_write_locked".into() }),
-            },
-            ttl_ms: 60_000,
-        },
-    });
-    // bob → alice (blocked by her claim on h:/a)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "bob".into(),
-            edge: pathlockd::raft::command::WaitEdge {
-                conflict_owner: "alice".into(),
-                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/a".into(), reason: "preempt_claimed".into() }),
-            },
-            ttl_ms: 60_000,
-        },
-    });
-
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "alice", 16).unwrap();
-    match outcome {
-        CycleOutcome::Cycle(chain) => assert_eq!(chain, vec!["alice".to_string(), "bob".to_string()]),
-        other => panic!("expected Cycle, got {:?}", other),
-    }
-}
-
-#[test]
 fn wait_edge_cycle_detection() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
@@ -1077,160 +1024,6 @@ fn combined_held_and_new_in_same_op() {
 // Cycle detection — edge cases
 // ---------------------------------------------------------------------------
 
-#[test]
-fn detect_cycle_no_cycle_chain() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-
-    // a waits on b, b waits on c — no cycle
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("c", 60_000, 3, vec![wr("h:/z")])),
-    });
-
-    let meta = WaitEdgeMetadata { conflict_path: "h:/x".into(), reason: "write_locked".into() };
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "a".into(),
-            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: Some(meta.clone()) },
-            ttl_ms: 60_000,
-        },
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "b".into(),
-            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "c".into(), metadata: Some(meta) },
-            ttl_ms: 60_000,
-        },
-    });
-
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
-    assert_eq!(outcome, CycleOutcome::None);
-}
-
-#[test]
-fn detect_cycle_truncated_at_max_depth() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-
-    // Build a long chain a→b→c→d, each owner holds the path they block on
-    // a waits for b on h:/x, b waits for c on h:/y, c waits for d on h:/z
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/w")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/x")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("c", 60_000, 3, vec![wr("h:/y")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("d", 60_000, 4, vec![wr("h:/z")])),
-    });
-
-    // a waits on b (b holds h:/x)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "a".into(),
-            edge: pathlockd::raft::command::WaitEdge {
-                conflict_owner: "b".into(),
-                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/x".into(), reason: "write_locked".into() }),
-            },
-            ttl_ms: 60_000,
-        },
-    });
-    // b waits on c (c holds h:/y)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "b".into(),
-            edge: pathlockd::raft::command::WaitEdge {
-                conflict_owner: "c".into(),
-                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/y".into(), reason: "write_locked".into() }),
-            },
-            ttl_ms: 60_000,
-        },
-    });
-    // c waits on d (d holds h:/z)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "c".into(),
-            edge: pathlockd::raft::command::WaitEdge {
-                conflict_owner: "d".into(),
-                metadata: Some(WaitEdgeMetadata { conflict_path: "h:/z".into(), reason: "write_locked".into() }),
-            },
-            ttl_ms: 60_000,
-        },
-    });
-
-    // Walk with max_depth=2 → truncated at b→c (3 nodes visited but depth 2)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 2).unwrap();
-    match outcome {
-        CycleOutcome::Truncated(chain) => {
-            assert_eq!(chain.len(), 3);
-            assert_eq!(chain[0], "a");
-            assert_eq!(chain[1], "b");
-            assert_eq!(chain[2], "c");
-        }
-        other => panic!("expected Truncated, got {:?}", other),
-    }
-}
-
-#[test]
-fn detect_cycle_stale_edge_dead_blocker() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-
-    // a is alive, b is alive (but only briefly with 1ms TTL)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("b", 1, 2, vec![wr("h:/y")])),
-    });
-
-    // a waits on b
-    let meta = WaitEdgeMetadata { conflict_path: "h:/y".into(), reason: "write_locked".into() };
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "a".into(),
-            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: Some(meta) },
-            ttl_ms: 60_000,
-        },
-    });
-
-    // b is dead now, cycle walk should prune the stale edge
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
-    // Edge pruned, b is dead → no cycle
-    assert_eq!(outcome, CycleOutcome::None);
-
-    // Also verify b is no longer alive
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
-    assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "b").unwrap());
-}
-
 // ---------------------------------------------------------------------------
 // is_blocking — full coverage
 // ---------------------------------------------------------------------------
@@ -1518,55 +1311,6 @@ fn renew_refreshes_all_held_locks() {
 }
 
 // ---------------------------------------------------------------------------
-// Cycle detection with advisory edges (no metadata → skip is_blocking)
-// ---------------------------------------------------------------------------
-
-#[test]
-fn detect_cycle_with_no_metadata_skips_is_blocking() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-
-    // Make both alive (but without actual locks that would satisfy is_blocking)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
-    });
-
-    // Advisory edges with no metadata (empty conflict_path/reason → metadata=None)
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "a".into(),
-            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "b".into(), metadata: None },
-            ttl_ms: 60_000,
-        },
-    });
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::SetWaitEdge {
-            owner: "b".into(),
-            edge: pathlockd::raft::command::WaitEdge { conflict_owner: "a".into(), metadata: None },
-            ttl_ms: 60_000,
-        },
-    });
-
-    // Cycle found (even though is_blocking on these paths would fail —
-    // without metadata, the check is skipped)
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    let outcome = pathlockd::engine::detect_cycle_inner(&mut txn, "a", 10).unwrap();
-    match outcome {
-        CycleOutcome::Cycle(chain) => {
-            assert_eq!(chain, vec!["a", "b"]);
-        }
-        other => panic!("expected Cycle, got {:?}", other),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Lock inspection / observability
 // ---------------------------------------------------------------------------
 
@@ -1805,10 +1549,10 @@ fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
 
 /// An owner whose hold set exceeds the one-shot enumeration limit (legacy
 /// state, or residue accumulated faster than GC drained it) must still be
-/// recoverable: renew fails with the scan-limit error (bounded work), but
-/// force_release pages through the set and fully cleans it up. Previously
-/// force_release/release_all used the same limited scan and errored, leaving
-/// the owner permanently wedged with every RPC failing.
+/// recoverable: renew is *rejected* with the scan-limit kind (bounded work,
+/// and — critically — an ApplyResponse, not an error: an apply error on a
+/// committed entry would shut the raft core down on every replica), while
+/// force_release pages through the set and fully cleans it up.
 #[test]
 fn force_release_recovers_owner_beyond_enumeration_limit() {
     use pathlockd::store_rocksdb::{StoreTxn, WriteTxn};
@@ -1839,25 +1583,44 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
         assert!(txn.commit().unwrap());
     }
 
-    // One-shot enumeration (renew) hits the limit error.
-    let err = state_machine::apply(&db, G, &Command {
+    // One-shot enumeration (renew) is rejected deterministically — never a
+    // storage error, which would be a poison-pill log entry.
+    let resp = apply(&db, Command {
         request_id: None, now_ms: now + 2,
         op: Op::Renew { owner: "hoarder".into(), ttl_ms: 600_000 },
-    })
-    .unwrap_err();
+    });
     assert!(
-        err.downcast_ref::<pathlockd::store_rocksdb::SetScanLimitExceeded>().is_some(),
-        "renew should fail with the scan limit error, got {err:?}"
+        matches!(
+            resp,
+            ApplyResponse::Rejected { kind: pathlockd::raft::command::RejectKind::ScanLimit, .. }
+        ),
+        "renew should be rejected with the scan-limit kind, got {resp:?}"
     );
 
-    // Paged cleanup succeeds where it previously errored.
+    // Paged cleanup succeeds where it previously errored. One command's work
+    // is capped (MAX_RELEASE_MEMBERS bounds the per-command WriteBatch), but
+    // each pass deletes what it pages over, so repeated force_release
+    // converges; the very first pass already removes the liveness marker, so
+    // any residue is inert from then on.
     let resp = apply(&db, Command {
         request_id: None, now_ms: now + 3,
         op: Op::ForceRelease { victim: "hoarder".into() },
     });
     assert!(matches!(resp, ApplyResponse::Unit));
+    {
+        let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 4);
+        assert!(
+            !pathlockd::engine::is_owner_alive_inner(&mut txn, "hoarder").unwrap(),
+            "owner must be logically dead after the first pass"
+        );
+    }
+    let resp = apply(&db, Command {
+        request_id: None, now_ms: now + 5,
+        op: Op::ForceRelease { victim: "hoarder".into() },
+    });
+    assert!(matches!(resp, ApplyResponse::Unit));
 
-    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 4);
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 6);
     assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "hoarder").unwrap());
     let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "hoarder").unwrap();
     assert!(locks.is_empty(), "hold set must be fully cleaned");

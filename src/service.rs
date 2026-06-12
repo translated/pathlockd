@@ -31,6 +31,17 @@ use crate::proto::{
 fn engine_err(e: anyhow::Error) -> Status {
     if e.downcast_ref::<crate::store_rocksdb::SetScanLimitExceeded>().is_some() {
         Status::resource_exhausted("lock set too large for one request")
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::CommandRejected>() {
+        // Deterministic state-machine refusals: request faults, not faults of
+        // this server.
+        match err.kind {
+            crate::raft::command::RejectKind::ScanLimit => {
+                Status::resource_exhausted(err.detail.clone())
+            }
+            crate::raft::command::RejectKind::IdempotencyMismatch => {
+                Status::invalid_argument(err.detail.clone())
+            }
+        }
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
         Status::invalid_argument(err.to_string())
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriteQueueFull>() {

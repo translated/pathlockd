@@ -377,7 +377,11 @@ pub fn execute_read_blocking(
     group: u32,
     op: ReadOp,
 ) -> anyhow::Result<ReadResult> {
-    let now_ms = crate::store_keys::now_ms();
+    // Clamp the read clock to the group's persisted monotone apply clock so
+    // a node with a lagging wall clock cannot judge TTL liveness more
+    // generously at read time than the apply path would.
+    let now_ms =
+        crate::store_keys::now_ms().max(crate::raft::state_machine::read_last_now(db, group)?);
     let mut txn = crate::store_rocksdb::RocksDbTxn::new(db.clone(), group, now_ms);
     match op {
         ReadOp::AssertFencing {

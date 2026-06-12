@@ -751,7 +751,10 @@ impl StoreTxn for WriteTxn {
             page,
             self.now_ms,
         )?;
-        Ok((members, next.map(|n| n[4..].to_vec())))
+        Ok((
+            members,
+            next.map(|n| n[store_keys::GROUP_PREFIX_LEN..].to_vec()),
+        ))
     }
 
     fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> anyhow::Result<bool> {
@@ -865,7 +868,10 @@ impl StoreTxn for RocksDbTxn {
         let scoped_cursor = cursor.map(|c| store_keys::group_key(self.group, &c));
         let (members, next) =
             smembers_page_impl(&self.db, cf, None, &sk, scoped_cursor, page, self.now_ms)?;
-        Ok((members, next.map(|n| n[4..].to_vec())))
+        Ok((
+            members,
+            next.map(|n| n[store_keys::GROUP_PREFIX_LEN..].to_vec()),
+        ))
     }
 
     fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> anyhow::Result<bool> {

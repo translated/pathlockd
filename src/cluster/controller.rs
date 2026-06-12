@@ -76,13 +76,18 @@ impl Default for ControllerOptions {
 /// Tracks when nodes were first/last seen to implement the stability and
 /// eviction windows.
 struct Presence {
+    /// When this tracker started observing — the floor for "last seen" of
+    /// nodes never observed by this process, so a controller restart cannot
+    /// skip the eviction window for an already-dead voter.
+    started: Instant,
     first_seen: HashMap<u64, Instant>,
     last_seen: HashMap<u64, Instant>,
 }
 
 impl Presence {
-    fn new() -> Self {
+    fn new(now: Instant) -> Self {
         Self {
+            started: now,
             first_seen: HashMap::new(),
             last_seen: HashMap::new(),
         }
@@ -94,13 +99,14 @@ impl Presence {
             self.last_seen.insert(*id, now);
         }
         // A node that vanished and returns later must re-earn stability.
-        self.first_seen
-            .retain(|id, _| members.contains_key(id) || self.last_seen.contains_key(id));
-        for (id, _) in self.last_seen.clone() {
-            if !members.contains_key(&id) {
-                self.first_seen.remove(&id);
-            }
-        }
+        self.first_seen.retain(|id, _| members.contains_key(id));
+    }
+
+    /// Forget nodes gone long enough that their absence record no longer
+    /// matters (anything past the eviction window is evictable either way),
+    /// so `last_seen` does not grow without bound under node churn.
+    fn prune(&mut self, keep: Duration, now: Instant) {
+        self.last_seen.retain(|_, t| now.duration_since(*t) < keep);
     }
 
     /// Nodes continuously up for at least the stability window.
@@ -122,11 +128,10 @@ impl Presence {
     }
 
     /// True when a node has been unseen for at least the eviction window.
+    /// Nodes never observed by this process count from tracker start.
     fn evictable(&self, node: u64, window: Duration, now: Instant) -> bool {
-        match self.last_seen.get(&node) {
-            Some(t) => now.duration_since(*t) >= window,
-            None => true,
-        }
+        let last = self.last_seen.get(&node).unwrap_or(&self.started);
+        now.duration_since(*last) >= window
     }
 }
 
@@ -145,7 +150,7 @@ async fn controller_loop(
     members: ClusterMembers,
     opts: ControllerOptions,
 ) {
-    let mut presence = Presence::new();
+    let mut presence = Presence::new(Instant::now());
     let mut tick = tokio::time::interval(opts.reconcile_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_balance = Instant::now();
@@ -156,6 +161,7 @@ async fn controller_loop(
         let now = Instant::now();
         let catalog = member_rx.borrow().clone();
         presence.observe(&catalog, now);
+        presence.prune(opts.eviction_window.saturating_mul(2), now);
 
         // Bootstrap grace: a single-node cluster must not wait the stability
         // window to make itself a voter — it already is one.
@@ -361,16 +367,29 @@ async fn reconcile_group(
         }
     }
 
-    // Phase 4: refresh the directory record (best effort).
-    let learners: Vec<u64> = current_all.difference(&desired).copied().collect();
-    let record_cmd = crate::raft::command::Op::DirectoryUpdate {
-        group,
+    // Phase 4: refresh the directory record (best effort). Proposing through
+    // sys consensus every tick for an unchanged record is pure write
+    // amplification, so skip when the local sys replica already carries it
+    // (a stale local replica only costs a harmless duplicate proposal).
+    let record = directory::GroupRecord {
         voters: desired.iter().copied().collect(),
-        learners,
+        learners: current_all.difference(&desired).copied().collect(),
         leader: Some(groups.node_id()),
     };
-    if let Err(e) = router.propose_sys(record_cmd).await {
-        debug!(group, error = %e, "directory update failed");
+    let already_published = directory::read_group_record(&groups.db_handle(), group)
+        .ok()
+        .flatten()
+        .is_some_and(|current| current == record);
+    if !already_published {
+        let record_cmd = crate::raft::command::Op::DirectoryUpdate {
+            group,
+            voters: record.voters,
+            learners: record.learners,
+            leader: record.leader,
+        };
+        if let Err(e) = router.propose_sys(record_cmd).await {
+            debug!(group, error = %e, "directory update failed");
+        }
     }
 
     Ok(changed)

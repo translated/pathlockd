@@ -131,12 +131,6 @@ pub fn build_group_image_from_snapshot(
     )?)
 }
 
-/// Serialize one group's full state image.
-pub fn build_group_image(db: &Arc<DB>, group: GroupId) -> anyhow::Result<Vec<u8>> {
-    let snapshot = db.snapshot();
-    build_group_image_from_snapshot(db, &snapshot, group)
-}
-
 /// Replace one group's state with a snapshot image, atomically.
 ///
 /// The caller persists last-applied/membership (snapshot meta) and makes the

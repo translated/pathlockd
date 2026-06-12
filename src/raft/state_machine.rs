@@ -17,13 +17,56 @@ use rocksdb::DB;
 
 use crate::cluster::placement::GroupId;
 use crate::engine::{self, AcquireOutcome, RenewOutcome};
-use crate::raft::command::{ApplyResponse, Command, Op, RequestId};
+use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::store_keys;
-use crate::store_rocksdb::{decode_record, encode_record, StoredRecord, WriteTxn};
+use crate::store_rocksdb::{
+    decode_record, encode_record, SetScanLimitExceeded, StoredRecord, WriteTxn,
+};
 
 /// How long a request-id → response dedupe record is retained. Must exceed
 /// the longest plausible client/forwarding retry window.
 const DEDUPE_TTL_MS: u64 = 300_000;
+
+/// Version marker for fingerprinted dedupe records. Legacy records are raw
+/// bincode `ApplyResponse` bytes whose first byte is a small variant index,
+/// never this value.
+const DEDUPE_RECORD_V2: u8 = 0xD1;
+
+/// Deterministic fingerprint of a command's op, binding a dedupe record to
+/// the request that produced it. Every replica re-encodes the op decoded from
+/// the same log entry, so all replicas compute the same fingerprint.
+fn op_fingerprint(op: &Op) -> anyhow::Result<u64> {
+    let bytes = bincode::serde::encode_to_vec(op, bincode::config::standard())?;
+    Ok(xxhash_rust::xxh3::xxh3_64(&bytes))
+}
+
+fn encode_dedupe_record(fingerprint: u64, resp: &ApplyResponse) -> anyhow::Result<Vec<u8>> {
+    let mut buf = vec![DEDUPE_RECORD_V2];
+    buf.extend_from_slice(&bincode::serde::encode_to_vec(
+        (fingerprint, resp),
+        bincode::config::standard(),
+    )?);
+    Ok(buf)
+}
+
+/// Decode a cached dedupe record into `(fingerprint, response)`; legacy
+/// records carry no fingerprint. `None` means undecodable — the caller treats
+/// it as a cache miss (re-evaluating the command is deterministic and safe),
+/// never as a fatal storage error.
+fn decode_dedupe_record(bytes: &[u8]) -> Option<(Option<u64>, ApplyResponse)> {
+    match bytes.split_first() {
+        Some((&DEDUPE_RECORD_V2, rest)) => {
+            let ((fingerprint, resp), _): ((u64, ApplyResponse), _) =
+                bincode::serde::decode_from_slice(rest, bincode::config::standard()).ok()?;
+            Some((Some(fingerprint), resp))
+        }
+        _ => {
+            let (resp, _): (ApplyResponse, _) =
+                bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
+            Some((None, resp))
+        }
+    }
+}
 
 /// Applies a committed command to one group's RocksDB state machine.
 ///
@@ -43,7 +86,7 @@ fn dedupe_key(id: &RequestId) -> Vec<u8> {
 }
 
 /// Read the group's persisted monotone clock (raw 8-byte big-endian ms).
-fn read_last_now(db: &DB, group: GroupId) -> anyhow::Result<u64> {
+pub(crate) fn read_last_now(db: &DB, group: GroupId) -> anyhow::Result<u64> {
     let meta = db
         .cf_handle(store_keys::CF_META)
         .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
@@ -97,99 +140,51 @@ fn apply_with_meta(
 
     // A command retried after an ambiguous outcome (forward timeout, leader
     // change) must apply once: return the cached response of the committed
-    // first application. Only committed outcomes are cached — a rejected
-    // command changed nothing, so re-evaluating it afresh is correct.
-    if let Some(id) = &cmd.request_id {
+    // first application. The record carries a fingerprint of the original op,
+    // so a request id reused for a *different* command is rejected instead of
+    // answered with the other command's response. Only committed outcomes are
+    // cached — a rejected command changed nothing, so re-evaluating it afresh
+    // is correct.
+    let fingerprint = match &cmd.request_id {
+        Some(_) => Some(op_fingerprint(&cmd.op)?),
+        None => None,
+    };
+    if let (Some(id), Some(fingerprint)) = (&cmd.request_id, fingerprint) {
         if let Some(cached) = txn.get_bytes(store_keys::CF_DEDUPE, &dedupe_key(id))? {
-            let (resp, _): (ApplyResponse, _) =
-                bincode::serde::decode_from_slice(&cached, bincode::config::standard())
-                    .map_err(|e| anyhow::anyhow!("corrupt dedupe record: {e}"))?;
-            return Ok((resp, false));
+            match decode_dedupe_record(&cached) {
+                Some((Some(cached_fp), _)) if cached_fp != fingerprint => {
+                    return Ok((
+                        ApplyResponse::Rejected {
+                            kind: RejectKind::IdempotencyMismatch,
+                            detail: format!(
+                                "request id {}:{} was already used by a different command",
+                                id.client_id, id.seq
+                            ),
+                        },
+                        false,
+                    ));
+                }
+                Some((_, resp)) => return Ok((resp, false)),
+                None => tracing::warn!(
+                    client_id = %id.client_id,
+                    seq = id.seq,
+                    "undecodable dedupe record; treating as a cache miss"
+                ),
+            }
         }
     }
 
-    let resp = match &cmd.op {
-        Op::Acquire(args) => {
-            let outcome = engine::acquire_inner(&mut txn, args)?;
-            ApplyResponse::Acquire(outcome)
-        }
-        Op::Release {
-            owner,
-            reqs,
-            del_wait,
-        } => {
-            engine::release_inner(&mut txn, owner, reqs, *del_wait)?;
-            ApplyResponse::Unit
-        }
-        Op::ReleaseAll { owner, del_wait } => {
-            engine::release_all_inner(&mut txn, owner, *del_wait)?;
-            ApplyResponse::Unit
-        }
-        Op::Renew { owner, ttl_ms } => {
-            let outcome = engine::renew_inner(&mut txn, owner, *ttl_ms)?;
-            ApplyResponse::Renew(outcome)
-        }
-        Op::ForceRelease { victim } => {
-            engine::force_release_inner(&mut txn, victim)?;
-            ApplyResponse::Unit
-        }
-        Op::SetClaim {
-            path,
-            claimant,
-            ttl_ms,
-        } => {
-            let outcome = engine::set_claim_inner(&mut txn, path, claimant, *ttl_ms)?;
-            ApplyResponse::SetClaim(outcome)
-        }
-        Op::ClearClaim { path, claimant } => {
-            engine::clear_claim_inner(&mut txn, path, claimant)?;
-            ApplyResponse::Unit
-        }
-        Op::SetWaitEdge {
-            owner,
-            edge,
-            ttl_ms,
-        } => {
-            engine::set_wait_edge_inner(
-                &mut txn,
-                owner,
-                &edge.conflict_owner,
-                *ttl_ms,
-                edge.metadata.as_ref(),
-            )?;
-            ApplyResponse::Unit
-        }
-        Op::ClearWaitEdge { owner } => {
-            engine::clear_wait_edge_inner(&mut txn, owner)?;
-            ApplyResponse::Unit
-        }
-        Op::GcSweep { now_ms: _, batch } => {
-            let (scanned, reclaimed) = gc_sweep(&mut txn, now_eff, *batch)?;
-            ApplyResponse::Gc { scanned, reclaimed }
-        }
-        Op::IncrFence => {
-            let token = incr_fence_inner(&mut txn)?;
-            ApplyResponse::IncrFence(token)
-        }
-        Op::Noop => ApplyResponse::Unit,
-        Op::DirectoryUpdate {
-            group: dir_group,
-            voters,
-            learners,
-            leader,
-        } => {
-            let record = crate::cluster::directory::GroupRecord {
-                voters: voters.clone(),
-                learners: learners.clone(),
-                leader: *leader,
-            };
-            crate::cluster::directory::apply_directory_update(&mut txn, *dir_group, &record)?;
-            ApplyResponse::Unit
-        }
-        Op::SetNodeDraining { node_id, draining } => {
-            crate::cluster::directory::apply_set_draining(&mut txn, *node_id, *draining)?;
-            ApplyResponse::Unit
-        }
+    let resp = match execute_op(&mut txn, cmd, now_eff) {
+        Ok(resp) => resp,
+        // Deterministic logical limits become rejections, never storage
+        // errors: the entry is already committed, and a storage error here
+        // shuts the raft core down — on every replica, at the same index,
+        // again after every restart (a poison-pill log entry).
+        Err(e) if e.downcast_ref::<SetScanLimitExceeded>().is_some() => ApplyResponse::Rejected {
+            kind: RejectKind::ScanLimit,
+            detail: e.to_string(),
+        },
+        Err(e) => return Err(e),
     };
 
     // A rejected command must not commit: its writes (lease refreshes, lazy
@@ -201,11 +196,12 @@ fn apply_with_meta(
         ApplyResponse::Acquire(AcquireOutcome::Conflict { .. } | AcquireOutcome::Lost { .. })
             | ApplyResponse::Renew(RenewOutcome::Lost { .. })
             | ApplyResponse::SetClaim(crate::engine::ClaimOutcome::Held { .. })
+            | ApplyResponse::Rejected { .. }
     );
 
     let wrote = if commit {
-        if let Some(id) = &cmd.request_id {
-            let encoded = bincode::serde::encode_to_vec(&resp, bincode::config::standard())?;
+        if let (Some(id), Some(fingerprint)) = (&cmd.request_id, fingerprint) {
+            let encoded = encode_dedupe_record(fingerprint, &resp)?;
             txn.set_bytes(
                 store_keys::CF_DEDUPE,
                 &dedupe_key(id),
@@ -213,7 +209,10 @@ fn apply_with_meta(
                 DEDUPE_TTL_MS,
             )?;
         }
-        if now_eff > last_now {
+        // The monotone clock only matters for state-affecting commands; Noop
+        // probes (health checks) skip it so a probe persists nothing beyond
+        // the applied position.
+        if now_eff > last_now && !matches!(cmd.op, Op::Noop) {
             txn.put_raw(
                 store_keys::CF_META,
                 store_keys::META_LAST_NOW_KEY,
@@ -243,6 +242,95 @@ fn apply_with_meta(
         false
     };
     Ok((resp, wrote))
+}
+
+/// Run one command's op against the transaction. Errors bubble to
+/// [`apply_with_meta`], which separates deterministic logical rejections from
+/// genuine storage failures.
+fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result<ApplyResponse> {
+    Ok(match &cmd.op {
+        Op::Acquire(args) => {
+            let outcome = engine::acquire_inner(txn, args)?;
+            ApplyResponse::Acquire(outcome)
+        }
+        Op::Release {
+            owner,
+            reqs,
+            del_wait,
+        } => {
+            engine::release_inner(txn, owner, reqs, *del_wait)?;
+            ApplyResponse::Unit
+        }
+        Op::ReleaseAll { owner, del_wait } => {
+            engine::release_all_inner(txn, owner, *del_wait)?;
+            ApplyResponse::Unit
+        }
+        Op::Renew { owner, ttl_ms } => {
+            let outcome = engine::renew_inner(txn, owner, *ttl_ms)?;
+            ApplyResponse::Renew(outcome)
+        }
+        Op::ForceRelease { victim } => {
+            engine::force_release_inner(txn, victim)?;
+            ApplyResponse::Unit
+        }
+        Op::SetClaim {
+            path,
+            claimant,
+            ttl_ms,
+        } => {
+            let outcome = engine::set_claim_inner(txn, path, claimant, *ttl_ms)?;
+            ApplyResponse::SetClaim(outcome)
+        }
+        Op::ClearClaim { path, claimant } => {
+            engine::clear_claim_inner(txn, path, claimant)?;
+            ApplyResponse::Unit
+        }
+        Op::SetWaitEdge {
+            owner,
+            edge,
+            ttl_ms,
+        } => {
+            engine::set_wait_edge_inner(
+                txn,
+                owner,
+                &edge.conflict_owner,
+                *ttl_ms,
+                edge.metadata.as_ref(),
+            )?;
+            ApplyResponse::Unit
+        }
+        Op::ClearWaitEdge { owner } => {
+            engine::clear_wait_edge_inner(txn, owner)?;
+            ApplyResponse::Unit
+        }
+        Op::GcSweep { now_ms: _, batch } => {
+            let (scanned, reclaimed) = gc_sweep(txn, now_eff, *batch)?;
+            ApplyResponse::Gc { scanned, reclaimed }
+        }
+        Op::IncrFence => {
+            let token = incr_fence_inner(txn)?;
+            ApplyResponse::IncrFence(token)
+        }
+        Op::Noop => ApplyResponse::Unit,
+        Op::DirectoryUpdate {
+            group: dir_group,
+            voters,
+            learners,
+            leader,
+        } => {
+            let record = crate::cluster::directory::GroupRecord {
+                voters: voters.clone(),
+                learners: learners.clone(),
+                leader: *leader,
+            };
+            crate::cluster::directory::apply_directory_update(txn, *dir_group, &record)?;
+            ApplyResponse::Unit
+        }
+        Op::SetNodeDraining { node_id, draining } => {
+            crate::cluster::directory::apply_set_draining(txn, *node_id, *draining)?;
+            ApplyResponse::Unit
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -410,12 +498,6 @@ impl GroupStateMachine {
         snapshot.get_cf(&cf, &scoped).map_err(io_err)
     }
 
-    fn put_meta_raw(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        let cf = self.meta_cf()?;
-        let scoped = store_keys::group_key(self.group, key);
-        self.db.put_cf(&cf, &scoped, value).map_err(io_err)
-    }
-
     /// Persist applied-position (and optionally membership) in one batch.
     fn put_applied(
         &self,
@@ -535,7 +617,7 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
             .map_err(io_err)?;
         // An installed snapshot replaces purged log history: it must survive
         // power loss before openraft purges the log on its account.
-        self.batcher_barrier()
+        self.batcher.barrier().await
     }
 
     async fn get_current_snapshot(&mut self) -> Result<Option<RaftSnapshot>, io::Error> {
@@ -554,10 +636,6 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
 }
 
 impl GroupStateMachine {
-    fn batcher_barrier(&self) -> io::Result<()> {
-        self.batcher.barrier()
-    }
-
     fn applied_state_from_snapshot(
         &self,
         snapshot: &rocksdb::Snapshot<'_>,
@@ -607,12 +685,28 @@ impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
             snapshot_id,
         };
 
+        // Meta and data must land atomically: written separately, a crash
+        // between them (point-in-time WAL recovery keeps a prefix) could pair
+        // fresh meta with an older image, and `get_current_snapshot` would
+        // serve followers old state labeled with a newer last_log_id.
+        let cf = self.sm.meta_cf()?;
+        let mut batch = rocksdb::WriteBatch::default();
+        batch.put_cf(
+            &cf,
+            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_META_KEY),
+            encode_meta(&meta)?,
+        );
+        batch.put_cf(
+            &cf,
+            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_DATA_KEY),
+            &image,
+        );
         self.sm
-            .put_meta_raw(store_keys::META_SNAPSHOT_META_KEY, &encode_meta(&meta)?)?;
-        self.sm
-            .put_meta_raw(store_keys::META_SNAPSHOT_DATA_KEY, &image)?;
+            .db
+            .write_opt(batch, &rocksdb::WriteOptions::default())
+            .map_err(io_err)?;
         // Durable before openraft purges logs covered by this snapshot.
-        self.sm.batcher_barrier()?;
+        self.sm.batcher.barrier().await?;
 
         Ok(RaftSnapshot {
             meta,

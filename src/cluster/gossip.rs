@@ -237,14 +237,6 @@ struct OutboundDatagram {
 /// Start the SWIM layer: bind the UDP socket, join via `seed_nodes`
 /// (`host:port` gossip addresses, DNS-resolvable), and publish the member
 /// catalog.
-pub async fn start_gossip(
-    local: NodeIdentity,
-    bind_addr: SocketAddr,
-    seed_nodes: Vec<String>,
-) -> anyhow::Result<ClusterMembers> {
-    start_gossip_with_options(local, bind_addr, seed_nodes, GossipOptions::default()).await
-}
-
 pub async fn start_gossip_with_options(
     local: NodeIdentity,
     bind_addr: SocketAddr,

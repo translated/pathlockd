@@ -183,6 +183,11 @@ enum CycleKind {
 
 message DetectCycleResponse {
   CycleKind kind = 1;
+  // FOUND: the members of the detected deadlock cycle, in wait order. The
+  // cycle does not necessarily contain start_owner_id — a walk that runs
+  // *into* a downstream cycle still reports it, because the starting owner
+  // is transitively deadlocked behind it (pick a victim among `chain`).
+  // TRUNCATED: the owners visited before max_depth was exhausted.
   repeated string chain = 2;
 }
 

@@ -42,7 +42,9 @@ const MAX_EVENT_BUFFER: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// gRPC listen address.
+    /// gRPC listen address. Unauthenticated and plaintext: every client RPC
+    /// (including ForceRelease of arbitrary owners) is trusted — restrict
+    /// reachability via network policy or front it with an mTLS proxy.
     pub listen: String,
     /// Stable node identifier.
     pub node_id: String,
@@ -50,7 +52,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Public gRPC address for clients and peers.
     pub public_addr: String,
-    /// Internal Raft transport address.
+    /// Internal Raft transport address. Also unauthenticated: it accepts
+    /// protocol traffic and forwarded commands from anyone who can reach it,
+    /// so it must only be reachable from cluster peers.
     pub raft_addr: String,
     /// SWIM gossip bind address (UDP).
     pub gossip_addr: String,
@@ -106,6 +110,10 @@ pub struct Config {
     /// Raft minimum log entries before snapshot.
     pub raft_snapshot_min_log_entries: u64,
     /// Maximum snapshot image accepted or sent over the Raft transport.
+    /// A group's snapshot is built, transferred and installed as one
+    /// in-memory image and persisted as a single RocksDB value, so size this
+    /// for "lock metadata", not bulk data — tens of MB per group is a
+    /// practical ceiling even though the default cap is far larger.
     pub raft_snapshot_max_bytes: u64,
     /// Max in-flight Raft proposals.
     pub raft_max_inflight: usize,
