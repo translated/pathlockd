@@ -54,6 +54,8 @@ async fn main() -> anyhow::Result<()> {
         replication_factor = cfg.replication_factor,
         raft_addr = %cfg.raft_addr,
         gossip_addr = %cfg.gossip_addr,
+        gossip_cluster_size = cfg.gossip_cluster_size,
+        gossip_max_packet_size = cfg.gossip_max_packet_size,
         seed_nodes = ?cfg.seed_nodes,
         bootstrap = cfg.bootstrap,
         otel_traces = telemetry.traces_enabled(),
@@ -86,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         node_meta.clone(),
         raft_config(&cfg),
+        cfg.raft_snapshot_max_bytes,
         batcher,
         PeerPool::new(),
     )?;
@@ -139,7 +142,13 @@ async fn main() -> anyhow::Result<()> {
         incarnation: pathlockd::store_keys::now_ms(),
     };
     info!(%gossip_advertised, "gossip advertise address");
-    let members = gossip::start_gossip(identity, gossip_bind, cfg.seed_nodes.clone()).await?;
+    let members = gossip::start_gossip_with_options(
+        identity,
+        gossip_bind,
+        cfg.seed_nodes.clone(),
+        gossip_options(&cfg)?,
+    )
+    .await?;
 
     // Router: path→group routing, leader forwarding, fan-out.
     let router = Arc::new(Router::new(
@@ -152,6 +161,8 @@ async fn main() -> anyhow::Result<()> {
         Some(members.watch()),
     ));
     otel::register_writer_queue_depth(router.write_queue_depth());
+    otel::register_raft_group_metrics(groups.clone());
+    otel::register_gossip_metrics(members.metrics());
 
     // Bootstrap decision (split-brain guard). Initializing groups is only
     // allowed when this node has no prior raft state AND no existing cluster
@@ -303,6 +314,23 @@ fn raft_listen_addr(raft_addr: &str) -> anyhow::Result<SocketAddr> {
             .map_err(|e| anyhow::anyhow!("raft_addr port in {raft_addr}: {e}"))?,
     };
     Ok(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port))
+}
+
+fn gossip_options(cfg: &Config) -> anyhow::Result<gossip::GossipOptions> {
+    Ok(gossip::GossipOptions {
+        cluster_size: std::num::NonZeroU32::new(cfg.gossip_cluster_size)
+            .ok_or_else(|| anyhow::anyhow!("gossip_cluster_size must be > 0"))?,
+        max_packet_size: std::num::NonZeroUsize::new(cfg.gossip_max_packet_size)
+            .ok_or_else(|| anyhow::anyhow!("gossip_max_packet_size must be > 0"))?,
+        seed_announce_interval: Duration::from_millis(cfg.gossip_seed_announce_interval_ms),
+        manual_gossip_interval: if cfg.gossip_manual_gossip_interval_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(cfg.gossip_manual_gossip_interval_ms))
+        },
+        foca_periodic: cfg.gossip_foca_periodic,
+        send_queue_depth: cfg.gossip_send_queue_depth,
+    })
 }
 
 // --- Event fan-out peer sync (gossip-fed) ---

@@ -43,8 +43,9 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
 enum FsyncJob {
     /// An openraft append callback to fire once the WAL is durable.
     Flushed(IOFlushed<TypeConfig>),
-    /// A synchronous waiter (vote persistence) to release once durable.
-    Barrier(std::sync::mpsc::SyncSender<io::Result<()>>),
+    /// An async waiter (vote/truncate/snapshot persistence) released once
+    /// durable.
+    Barrier(tokio::sync::oneshot::Sender<io::Result<()>>),
 }
 
 /// One thread, one WAL, one fsync per drained batch of jobs from any number
@@ -87,13 +88,16 @@ impl FsyncBatcher {
         }
     }
 
-    /// Block until everything written so far is durable.
-    pub fn barrier(&self) -> io::Result<()> {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    /// Wait until everything written so far is durable. Awaiting (rather than
+    /// blocking on a sync channel) keeps tokio workers free while the fsync
+    /// thread drains — mass elections across many groups would otherwise park
+    /// one worker per concurrent vote persistence.
+    pub async fn barrier(&self) -> io::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(FsyncJob::Barrier(tx))
             .map_err(|_| io_err("fsync batcher unavailable"))?;
-        rx.recv().map_err(|_| io_err("fsync batcher exited"))?
+        rx.await.map_err(|_| io_err("fsync batcher exited"))?
     }
 }
 
@@ -230,7 +234,7 @@ impl RaftLogReader<TypeConfig> for GroupLogStore {
         use std::ops::Bound;
         let start_idx = match range.start_bound() {
             Bound::Included(&i) => i,
-            Bound::Excluded(&i) => i + 1,
+            Bound::Excluded(&i) => i.saturating_add(1),
             Bound::Unbounded => 0,
         };
         let end_idx = match range.end_bound() {
@@ -289,7 +293,7 @@ impl RaftLogStorage<TypeConfig> for GroupLogStore {
         // A vote must be durable before this returns (Raft safety): persist
         // unsynced, then ride the next batched fsync.
         self.put_meta(store_keys::META_VOTE_KEY, vote)?;
-        self.batcher.barrier()
+        self.batcher.barrier().await
     }
 
     async fn save_committed(&mut self, committed: Option<LogId>) -> Result<(), io::Error> {
@@ -335,7 +339,7 @@ impl RaftLogStorage<TypeConfig> for GroupLogStore {
         let to = log_range(self.group).1;
         self.db.delete_range_cf(&cf, &from, &to).map_err(io_err)?;
         // Conflicting (truncated) entries must not resurrect after a crash.
-        self.batcher.barrier()
+        self.batcher.barrier().await
     }
 
     async fn purge(&mut self, log_id: LogId) -> Result<(), io::Error> {

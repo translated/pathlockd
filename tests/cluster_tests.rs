@@ -177,6 +177,7 @@ async fn acquire(
             requests: vec![wr(path)],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .map(|r| r.into_inner().status)
@@ -229,7 +230,9 @@ async fn three_node_lifecycle() {
 
     // Fencing token issued through node 1 (forwarded sys write).
     let t1 = c1
-        .incr_fencing_token(IncrFencingTokenRequest {})
+        .incr_fencing_token(IncrFencingTokenRequest {
+            idempotency_key: String::new(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -280,7 +283,12 @@ async fn three_node_lifecycle() {
                 };
                 let mut token = 1_000; // refreshed from the sys counter when reachable
                 while !stop.load(Ordering::Relaxed) {
-                    if let Ok(resp) = client.incr_fencing_token(IncrFencingTokenRequest {}).await {
+                    if let Ok(resp) = client
+                        .incr_fencing_token(IncrFencingTokenRequest {
+                            idempotency_key: String::new(),
+                        })
+                        .await
+                    {
                         token = resp.into_inner().token;
                     }
                     match acquire(&mut client, &owner, "hot:/contended", token, 20_000).await {
@@ -302,6 +310,7 @@ async fn three_node_lifecycle() {
                                         mode: Mode::Write as i32,
                                     }],
                                     del_wait_key: false,
+                                    idempotency_key: String::new(),
                                 })
                                 .await;
                         }
@@ -366,10 +375,12 @@ async fn three_node_lifecycle() {
         || {
             let mut c2 = c2.clone();
             async move {
-                c2.incr_fencing_token(IncrFencingTokenRequest {})
-                    .await
-                    .ok()
-                    .map(|r| r.into_inner().token)
+                c2.incr_fencing_token(IncrFencingTokenRequest {
+                    idempotency_key: String::new(),
+                })
+                .await
+                .ok()
+                .map(|r| r.into_inner().token)
             }
         },
     )
@@ -428,7 +439,9 @@ async fn bootstrap_guard_refuses_second_cluster() {
 
     let mut c1 = try_client(&n1.public_addr).await.unwrap();
     let t1 = c1
-        .incr_fencing_token(IncrFencingTokenRequest {})
+        .incr_fencing_token(IncrFencingTokenRequest {
+            idempotency_key: String::new(),
+        })
         .await
         .unwrap()
         .into_inner()
@@ -489,10 +502,12 @@ async fn bootstrap_guard_refuses_second_cluster() {
         || {
             let mut c0b = c0b.clone();
             async move {
-                c0b.incr_fencing_token(IncrFencingTokenRequest {})
-                    .await
-                    .ok()
-                    .map(|r| r.into_inner().token)
+                c0b.incr_fencing_token(IncrFencingTokenRequest {
+                    idempotency_key: String::new(),
+                })
+                .await
+                .ok()
+                .map(|r| r.into_inner().token)
             }
         },
     )

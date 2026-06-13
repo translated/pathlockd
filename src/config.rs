@@ -12,6 +12,9 @@
 //! data_dir         = "/var/lib/pathlockd"
 //! public_addr      = "http://pathlockd-0.pathlockd:50051"
 //! gossip_addr      = "0.0.0.0:7946"
+//! gossip_cluster_size = 32
+//! gossip_max_packet_size = 1400
+//! gossip_seed_announce_interval_ms = 5000
 //! group_count      = 256
 //! replication_factor = 3
 //! group_gc_interval_secs = 1
@@ -20,6 +23,7 @@
 //! event_buffer     = 8192
 //! request_timeout_ms = 30000
 //! max_concurrent_requests_per_connection = 256
+//! raft_snapshot_max_bytes = 536870912
 //! max_inflight_per_group = 1024
 //! rocksdb_wal_sync = true
 //! rocksdb_max_total_wal_size_mb = 512
@@ -38,7 +42,9 @@ const MAX_EVENT_BUFFER: usize = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// gRPC listen address.
+    /// gRPC listen address. Unauthenticated and plaintext: every client RPC
+    /// (including ForceRelease of arbitrary owners) is trusted — restrict
+    /// reachability via network policy or front it with an mTLS proxy.
     pub listen: String,
     /// Stable node identifier.
     pub node_id: String,
@@ -46,7 +52,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Public gRPC address for clients and peers.
     pub public_addr: String,
-    /// Internal Raft transport address.
+    /// Internal Raft transport address. Also unauthenticated: it accepts
+    /// protocol traffic and forwarded commands from anyone who can reach it,
+    /// so it must only be reachable from cluster peers.
     pub raft_addr: String,
     /// SWIM gossip bind address (UDP).
     pub gossip_addr: String,
@@ -54,6 +62,20 @@ pub struct Config {
     /// the bind address when it names a concrete IP, else the auto-detected
     /// outbound IP with the bind port. Set explicitly behind NAT.
     pub gossip_advertise_addr: Option<String>,
+    /// Expected SWIM cluster size, used by Foca to tune dissemination and
+    /// suspicion timing.
+    pub gossip_cluster_size: u32,
+    /// Maximum Foca UDP payload size.
+    pub gossip_max_packet_size: usize,
+    /// How often lonely nodes refresh and announce DNS seeds.
+    pub gossip_seed_announce_interval_ms: u64,
+    /// Optional extra manual gossip cadence; 0 disables and relies on Foca's
+    /// own periodic gossip.
+    pub gossip_manual_gossip_interval_ms: u64,
+    /// Keep Foca's built-in periodic announce/gossip timers enabled.
+    pub gossip_foca_periodic: bool,
+    /// Bounded queue depth for UDP writes emitted by Foca.
+    pub gossip_send_queue_depth: usize,
     /// Seed nodes for initial cluster bootstrap.
     pub seed_nodes: Vec<String>,
     /// Number of Raft groups (fixed at cluster birth; changing it remaps
@@ -87,6 +109,12 @@ pub struct Config {
     pub raft_snapshot_interval_entries: u64,
     /// Raft minimum log entries before snapshot.
     pub raft_snapshot_min_log_entries: u64,
+    /// Maximum snapshot image accepted or sent over the Raft transport.
+    /// A group's snapshot is built, transferred and installed as one
+    /// in-memory image and persisted as a single RocksDB value, so size this
+    /// for "lock metadata", not bulk data — tens of MB per group is a
+    /// practical ceiling even though the default cap is far larger.
+    pub raft_snapshot_max_bytes: u64,
     /// Max in-flight Raft proposals.
     pub raft_max_inflight: usize,
     /// Raft election timeout window (ms).
@@ -136,6 +164,12 @@ impl Default for Config {
             raft_addr: "http://localhost:50052".to_string(),
             gossip_addr: "0.0.0.0:7946".to_string(),
             gossip_advertise_addr: None,
+            gossip_cluster_size: 32,
+            gossip_max_packet_size: 1400,
+            gossip_seed_announce_interval_ms: 5_000,
+            gossip_manual_gossip_interval_ms: 0,
+            gossip_foca_periodic: true,
+            gossip_send_queue_depth: 1024,
             seed_nodes: Vec::new(),
             group_count: 32,
             routing_prefix_segments: 0,
@@ -149,6 +183,7 @@ impl Default for Config {
             bootstrap: false,
             raft_snapshot_interval_entries: 10_000,
             raft_snapshot_min_log_entries: 5_000,
+            raft_snapshot_max_bytes: 512 * 1024 * 1024,
             raft_max_inflight: 256,
             raft_election_timeout_min_ms: 1_500,
             raft_election_timeout_max_ms: 3_000,
@@ -180,6 +215,12 @@ struct FileConfig {
     raft_addr: Option<String>,
     gossip_addr: Option<String>,
     gossip_advertise_addr: Option<String>,
+    gossip_cluster_size: Option<u32>,
+    gossip_max_packet_size: Option<usize>,
+    gossip_seed_announce_interval_ms: Option<u64>,
+    gossip_manual_gossip_interval_ms: Option<u64>,
+    gossip_foca_periodic: Option<bool>,
+    gossip_send_queue_depth: Option<usize>,
     seed_nodes: Option<Vec<String>>,
     group_count: Option<u32>,
     routing_prefix_segments: Option<u32>,
@@ -193,6 +234,7 @@ struct FileConfig {
     bootstrap: Option<bool>,
     raft_snapshot_interval_entries: Option<u64>,
     raft_snapshot_min_log_entries: Option<u64>,
+    raft_snapshot_max_bytes: Option<u64>,
     raft_max_inflight: Option<usize>,
     raft_election_timeout_min_ms: Option<u64>,
     raft_election_timeout_max_ms: Option<u64>,
@@ -284,8 +326,26 @@ impl Config {
         if self.group_count == u32::MAX {
             anyhow::bail!("group_count must be < u32::MAX (reserved for the system group)");
         }
+        if self.raft_snapshot_max_bytes == 0 {
+            anyhow::bail!("raft_snapshot_max_bytes must be > 0");
+        }
+        if self.raft_max_inflight == 0 {
+            anyhow::bail!("raft_max_inflight must be > 0");
+        }
         if self.node_id.is_empty() {
             anyhow::bail!("node_id must not be empty");
+        }
+        if self.gossip_cluster_size == 0 {
+            anyhow::bail!("gossip_cluster_size must be > 0");
+        }
+        if self.gossip_max_packet_size < 256 {
+            anyhow::bail!("gossip_max_packet_size must be >= 256");
+        }
+        if self.gossip_seed_announce_interval_ms == 0 {
+            anyhow::bail!("gossip_seed_announce_interval_ms must be > 0");
+        }
+        if self.gossip_send_queue_depth == 0 {
+            anyhow::bail!("gossip_send_queue_depth must be > 0");
         }
         if self.raft_heartbeat_interval_ms == 0
             || self.raft_election_timeout_min_ms <= self.raft_heartbeat_interval_ms
@@ -381,6 +441,12 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     if let Some(v) = file.gossip_advertise_addr {
         cfg.gossip_advertise_addr = Some(v);
     }
+    apply!(gossip_cluster_size);
+    apply!(gossip_max_packet_size);
+    apply!(gossip_seed_announce_interval_ms);
+    apply!(gossip_manual_gossip_interval_ms);
+    apply!(gossip_foca_periodic);
+    apply!(gossip_send_queue_depth);
     apply!(seed_nodes);
     apply!(group_count);
     apply!(routing_prefix_segments);
@@ -394,6 +460,7 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(bootstrap);
     apply!(raft_snapshot_interval_entries);
     apply!(raft_snapshot_min_log_entries);
+    apply!(raft_snapshot_max_bytes);
     apply!(raft_max_inflight);
     apply!(raft_election_timeout_min_ms);
     apply!(raft_election_timeout_max_ms);
@@ -414,37 +481,129 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
 }
 
 fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
-    if let Some(v) = env_string("PATHLOCKD_LISTEN") { cfg.listen = v; }
-    if let Some(v) = env_string("PATHLOCKD_NODE_ID") { cfg.node_id = v; }
-    if let Some(v) = env_string("PATHLOCKD_DATA_DIR") { cfg.data_dir = PathBuf::from(v); }
-    if let Some(v) = env_string("PATHLOCKD_PUBLIC_ADDR") { cfg.public_addr = v; }
-    if let Some(v) = env_string("PATHLOCKD_RAFT_ADDR") { cfg.raft_addr = v; }
-    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADDR") { cfg.gossip_addr = v; }
-    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADVERTISE_ADDR") { cfg.gossip_advertise_addr = Some(v); }
-    if let Some(v) = env_list("PATHLOCKD_SEED_NODES") { cfg.seed_nodes = v; }
-    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_COUNT")? { cfg.group_count = v; }
-    if let Some(v) = env_parse::<u32>("PATHLOCKD_ROUTING_PREFIX_SEGMENTS")? { cfg.routing_prefix_segments = v; }
-    if let Some(v) = env_parse::<u32>("PATHLOCKD_REPLICATION_FACTOR")? { cfg.replication_factor = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_GROUP_GC_INTERVAL_SECS")? { cfg.group_gc_interval_secs = v; }
-    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_GC_BATCH")? { cfg.group_gc_batch = v; }
-    if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? { cfg.event_buffer = v; }
-    if let Some(v) = env_list("PATHLOCKD_PEERS") { cfg.peers = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? { cfg.request_timeout_ms = v; }
-    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? { cfg.max_concurrent_requests_per_connection = v; }
-    if let Some(v) = env_parse::<bool>("PATHLOCKD_BOOTSTRAP")? { cfg.bootstrap = v; }
-    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_INFLIGHT_PER_GROUP")? { cfg.max_inflight_per_group = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_STABILITY_WINDOW_SECS")? { cfg.stability_window_secs = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_EVICTION_WINDOW_SECS")? { cfg.eviction_window_secs = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_LEADER_BALANCE_INTERVAL_SECS")? { cfg.leader_balance_interval_secs = v; }
-    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_RECONCILES")? { cfg.max_concurrent_reconciles = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_GC_COMPACT_INTERVAL_SECS")? { cfg.gc_compact_interval_secs = v; }
-    if let Some(v) = env_parse::<bool>("PATHLOCKD_ROCKSDB_WAL_SYNC")? { cfg.rocksdb_wal_sync = v; }
-    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_OPEN_FILES")? { cfg.rocksdb_max_open_files = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB")? { cfg.rocksdb_max_total_wal_size_mb = v; }
-    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS")? { cfg.rocksdb_max_background_jobs = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB")? { cfg.rocksdb_block_cache_mb = v; }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB")? { cfg.rocksdb_write_buffer_mb = v; }
-    if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") { cfg.log_level = v; }
+    if let Some(v) = env_string("PATHLOCKD_LISTEN") {
+        cfg.listen = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_NODE_ID") {
+        cfg.node_id = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_DATA_DIR") {
+        cfg.data_dir = PathBuf::from(v);
+    }
+    if let Some(v) = env_string("PATHLOCKD_PUBLIC_ADDR") {
+        cfg.public_addr = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_RAFT_ADDR") {
+        cfg.raft_addr = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADDR") {
+        cfg.gossip_addr = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_GOSSIP_ADVERTISE_ADDR") {
+        cfg.gossip_advertise_addr = Some(v);
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GOSSIP_CLUSTER_SIZE")? {
+        cfg.gossip_cluster_size = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_GOSSIP_MAX_PACKET_SIZE")? {
+        cfg.gossip_max_packet_size = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GOSSIP_SEED_ANNOUNCE_INTERVAL_MS")? {
+        cfg.gossip_seed_announce_interval_ms = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GOSSIP_MANUAL_GOSSIP_INTERVAL_MS")? {
+        cfg.gossip_manual_gossip_interval_ms = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_GOSSIP_FOCA_PERIODIC")? {
+        cfg.gossip_foca_periodic = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH")? {
+        cfg.gossip_send_queue_depth = v;
+    }
+    if let Some(v) = env_list("PATHLOCKD_SEED_NODES") {
+        cfg.seed_nodes = v;
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_COUNT")? {
+        cfg.group_count = v;
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_ROUTING_PREFIX_SEGMENTS")? {
+        cfg.routing_prefix_segments = v;
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_REPLICATION_FACTOR")? {
+        cfg.replication_factor = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GROUP_GC_INTERVAL_SECS")? {
+        cfg.group_gc_interval_secs = v;
+    }
+    if let Some(v) = env_parse::<u32>("PATHLOCKD_GROUP_GC_BATCH")? {
+        cfg.group_gc_batch = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_EVENT_BUFFER")? {
+        cfg.event_buffer = v;
+    }
+    if let Some(v) = env_list("PATHLOCKD_PEERS") {
+        cfg.peers = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? {
+        cfg.request_timeout_ms = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_REQUESTS_PER_CONNECTION")? {
+        cfg.max_concurrent_requests_per_connection = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_BOOTSTRAP")? {
+        cfg.bootstrap = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_RAFT_SNAPSHOT_INTERVAL_ENTRIES")? {
+        cfg.raft_snapshot_interval_entries = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_RAFT_SNAPSHOT_MIN_LOG_ENTRIES")? {
+        cfg.raft_snapshot_min_log_entries = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_RAFT_SNAPSHOT_MAX_BYTES")? {
+        cfg.raft_snapshot_max_bytes = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_RAFT_MAX_INFLIGHT")? {
+        cfg.raft_max_inflight = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_INFLIGHT_PER_GROUP")? {
+        cfg.max_inflight_per_group = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_STABILITY_WINDOW_SECS")? {
+        cfg.stability_window_secs = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_EVICTION_WINDOW_SECS")? {
+        cfg.eviction_window_secs = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_LEADER_BALANCE_INTERVAL_SECS")? {
+        cfg.leader_balance_interval_secs = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_MAX_CONCURRENT_RECONCILES")? {
+        cfg.max_concurrent_reconciles = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_GC_COMPACT_INTERVAL_SECS")? {
+        cfg.gc_compact_interval_secs = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_ROCKSDB_WAL_SYNC")? {
+        cfg.rocksdb_wal_sync = v;
+    }
+    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_OPEN_FILES")? {
+        cfg.rocksdb_max_open_files = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB")? {
+        cfg.rocksdb_max_total_wal_size_mb = v;
+    }
+    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS")? {
+        cfg.rocksdb_max_background_jobs = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB")? {
+        cfg.rocksdb_block_cache_mb = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB")? {
+        cfg.rocksdb_write_buffer_mb = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
+        cfg.log_level = v;
+    }
     Ok(())
 }
 

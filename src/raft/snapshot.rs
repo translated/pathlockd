@@ -68,11 +68,44 @@ fn scan_group_cf(
     Ok(())
 }
 
-/// Serialize one group's full state image.
-pub fn build_group_image(db: &Arc<DB>, group: GroupId) -> anyhow::Result<Vec<u8>> {
+fn scan_group_cf_snapshot(
+    db: &DB,
+    snapshot: &rocksdb::Snapshot<'_>,
+    cf_name: &str,
+    group: GroupId,
+    mut visit: impl FnMut(&[u8], &[u8]) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let handle = db
+        .cf_handle(cf_name)
+        .ok_or_else(|| anyhow::anyhow!("missing column family {cf_name}"))?;
+    let gp = store_keys::group_prefix(group);
+    let mut read_opts = rocksdb::ReadOptions::default();
+    if let Some(upper) = prefix_upper_bound(&gp) {
+        read_opts.set_iterate_upper_bound(upper);
+    }
+    let mut iter = snapshot.raw_iterator_cf_opt(&handle, read_opts);
+    iter.seek(gp);
+    while iter.valid() {
+        let key = iter.key().expect("valid iterator has a key");
+        if !key.starts_with(&gp) {
+            break;
+        }
+        visit(&key[gp.len()..], iter.value().unwrap_or_default())?;
+        iter.next();
+    }
+    iter.status()?;
+    Ok(())
+}
+
+/// Serialize one group's full state image from a single RocksDB snapshot view.
+pub fn build_group_image_from_snapshot(
+    db: &Arc<DB>,
+    snapshot: &rocksdb::Snapshot<'_>,
+    group: GroupId,
+) -> anyhow::Result<Vec<u8>> {
     let mut frames: Vec<Frame> = Vec::new();
     for (idx, cf_name) in store_keys::STATE_CFS.iter().enumerate() {
-        scan_group_cf(db, cf_name, group, |key, value| {
+        scan_group_cf_snapshot(db, snapshot, cf_name, group, |key, value| {
             frames.push(Frame {
                 cf: idx as u8,
                 key: key.to_vec(),
@@ -81,7 +114,7 @@ pub fn build_group_image(db: &Arc<DB>, group: GroupId) -> anyhow::Result<Vec<u8>
             Ok(())
         })?;
     }
-    scan_group_cf(db, store_keys::CF_META, group, |key, value| {
+    scan_group_cf_snapshot(db, snapshot, store_keys::CF_META, group, |key, value| {
         if RAFT_META_KEYS.contains(&key) {
             return Ok(());
         }
@@ -148,4 +181,40 @@ pub fn install_group_image(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store_rocksdb::{open_db, DbTuning};
+
+    #[test]
+    fn image_builder_reads_a_single_snapshot_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("db"), &DbTuning::default()).unwrap();
+        let group = 3;
+        let cf = db.cf_handle(store_keys::CF_WRITE_LOCKS).unwrap();
+
+        db.put_cf(&cf, store_keys::group_key(group, b"before"), b"one")
+            .unwrap();
+        let snapshot = db.snapshot();
+        db.put_cf(&cf, store_keys::group_key(group, b"after"), b"two")
+            .unwrap();
+
+        let image = build_group_image_from_snapshot(&db, &snapshot, group).unwrap();
+        let mut batch = rocksdb::WriteBatch::default();
+        install_group_image(&db, 7, &image, &mut batch).unwrap();
+        db.write(batch).unwrap();
+
+        assert_eq!(
+            db.get_cf(&cf, store_keys::group_key(7, b"before"))
+                .unwrap()
+                .as_deref(),
+            Some(&b"one"[..])
+        );
+        assert!(db
+            .get_cf(&cf, store_keys::group_key(7, b"after"))
+            .unwrap()
+            .is_none());
+    }
 }

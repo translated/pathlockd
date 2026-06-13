@@ -38,7 +38,11 @@ const RELEASE_PAGE: usize = 4096;
 /// Absolute safety valve on members processed by one owner-wide cleanup
 /// command. Cleanup past this point is left to TTL expiry + GC; the owner's
 /// liveness marker is still removed, so the residue stops blocking anyone.
-const MAX_RELEASE_MEMBERS: usize = 1 << 20;
+///
+/// Kept moderate on purpose: one command's deletions (plus per-member
+/// descendant-index removals) accumulate in a single WriteBatch + overlay
+/// held in memory and applied synchronously by every replica's apply loop.
+const MAX_RELEASE_MEMBERS: usize = 1 << 16;
 
 pub const REASON_PREEMPT_CLAIMED: &str = "preempt_claimed";
 
@@ -668,6 +672,10 @@ pub fn release_inner<T: StoreTxn>(
         tx.del(ALIVE_CF, &alive_k)?;
     }
 
+    // In the multi-group deployment wait edges live only in the sys group,
+    // so this delete is a no-op for lock-group releases (the router clears
+    // the sys-group edge separately); it matters for single-store embeddings
+    // and the engine test suite, where everything shares one keyspace.
     if del_wait_key {
         tx.del(WAIT_CF, &wait_key(owner))?;
     }
@@ -943,65 +951,14 @@ pub fn read_wait_edge<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<Op
 }
 
 // ---------------------------------------------------------------------------
-// DETECT_CYCLE
-// ---------------------------------------------------------------------------
-
-pub fn detect_cycle_inner<T: StoreTxn>(
-    tx: &mut T,
-    start: &str,
-    max_depth: u32,
-) -> anyhow::Result<CycleOutcome> {
-    let mut visited = std::collections::HashSet::new();
-    let mut current = start.to_string();
-    let mut chain: Vec<String> = Vec::new();
-
-    for _ in 0..=max_depth {
-        if visited.contains(&current) {
-            return Ok(CycleOutcome::None);
-        }
-        visited.insert(current.clone());
-        chain.push(current.clone());
-
-        let edge = match tx.get_str(WAIT_CF, &wait_key(&current))? {
-            None => return Ok(CycleOutcome::None),
-            Some(raw) => parse_wait_edge(raw)?,
-        };
-        let next = edge.conflict_owner;
-
-        match edge.metadata {
-            // is_blocking is authoritative when the edge carries metadata: it
-            // covers lock state (which itself checks owner liveness) and
-            // TTL-governed claims — a pure-waiter claimant has no ALIVE record
-            // but still blocks, so a bare liveness probe would wrongly prune
-            // claim edges and hide claim-involved cycles.
-            Some(meta) => {
-                if !is_blocking_inner(tx, &meta.conflict_path, &next, &meta.reason)? {
-                    tx.del(WAIT_CF, &wait_key(&current))?;
-                    return Ok(CycleOutcome::None);
-                }
-            }
-            // Legacy edge without metadata: liveness is the only staleness
-            // signal available.
-            None => {
-                if tx.get_str(ALIVE_CF, &alive_key(&next))?.is_none() {
-                    tx.del(WAIT_CF, &wait_key(&current))?;
-                    tx.del(WAIT_CF, &wait_key(&next))?;
-                    return Ok(CycleOutcome::None);
-                }
-            }
-        }
-
-        if next == start {
-            return Ok(CycleOutcome::Cycle(chain));
-        }
-        current = next;
-    }
-    Ok(CycleOutcome::Truncated(chain))
-}
-
-// ---------------------------------------------------------------------------
 // IS_BLOCKING
 // ---------------------------------------------------------------------------
+//
+// The deadlock walk itself lives in `cluster::router::detect_cycle`: wait
+// edges are cluster-global (sys group) while each hop's liveness/blocking
+// checks read the blocker's lock groups, so the walk composes `read_wait_edge`
+// with `is_blocking_inner` across groups rather than running in one engine
+// transaction.
 
 pub fn is_blocking_inner<T: StoreTxn>(
     tx: &mut T,

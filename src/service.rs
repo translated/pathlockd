@@ -31,6 +31,17 @@ use crate::proto::{
 fn engine_err(e: anyhow::Error) -> Status {
     if e.downcast_ref::<crate::store_rocksdb::SetScanLimitExceeded>().is_some() {
         Status::resource_exhausted("lock set too large for one request")
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::CommandRejected>() {
+        // Deterministic state-machine refusals: request faults, not faults of
+        // this server.
+        match err.kind {
+            crate::raft::command::RejectKind::ScanLimit => {
+                Status::resource_exhausted(err.detail.clone())
+            }
+            crate::raft::command::RejectKind::IdempotencyMismatch => {
+                Status::invalid_argument(err.detail.clone())
+            }
+        }
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
         Status::invalid_argument(err.to_string())
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriteQueueFull>() {
@@ -49,6 +60,7 @@ const MAX_TTL_MS: u64 = 7 * 86_400_000;
 const MAX_ID_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
+const MAX_PATHS_PER_STREAMED_ACQUIRE: usize = 65_536;
 const MAX_CLAIM_TTL_MS: u64 = 60_000;
 const MAX_CYCLE_DEPTH: u32 = 64;
 const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
@@ -63,6 +75,17 @@ fn check_id(label: &str, id: &str) -> Result<(), Status> {
         return Err(Status::invalid_argument(format!("{label} too long (max {MAX_ID_LEN} bytes)")));
     }
     Ok(())
+}
+
+#[allow(clippy::result_large_err)]
+fn idempotency_key(key: &str) -> Result<Option<String>, Status> {
+    if key.is_empty() {
+        return Ok(None);
+    }
+    if key.len() > MAX_ID_LEN {
+        return Err(Status::invalid_argument(format!("idempotency_key too long (max {MAX_ID_LEN} bytes)")));
+    }
+    Ok(Some(key.to_string()))
 }
 
 #[allow(clippy::result_large_err)]
@@ -200,6 +223,89 @@ impl PathLockService {
         }
         Ok(())
     }
+
+    #[allow(clippy::result_large_err)]
+    fn merge_acquire_stream_chunk(base: &mut AcquireRequest, mut chunk: AcquireRequest) -> Result<(), Status> {
+        if !chunk.owner_id.is_empty() {
+            if base.owner_id.is_empty() {
+                base.owner_id = chunk.owner_id;
+            } else if base.owner_id != chunk.owner_id {
+                return Err(Status::invalid_argument("acquire stream owner_id changed between chunks"));
+            }
+        }
+        if chunk.ttl_ms != 0 {
+            if base.ttl_ms == 0 {
+                base.ttl_ms = chunk.ttl_ms;
+            } else if base.ttl_ms != chunk.ttl_ms {
+                return Err(Status::invalid_argument("acquire stream ttl_ms changed between chunks"));
+            }
+        }
+        if chunk.fencing_token != 0 {
+            if base.fencing_token == 0 {
+                base.fencing_token = chunk.fencing_token;
+            } else if base.fencing_token != chunk.fencing_token {
+                return Err(Status::invalid_argument("acquire stream fencing_token changed between chunks"));
+            }
+        }
+        if !chunk.idempotency_key.is_empty() {
+            if base.idempotency_key.is_empty() {
+                base.idempotency_key = chunk.idempotency_key;
+            } else if base.idempotency_key != chunk.idempotency_key {
+                return Err(Status::invalid_argument("acquire stream idempotency_key changed between chunks"));
+            }
+        }
+        base.emit_release |= chunk.emit_release;
+        base.requests.append(&mut chunk.requests);
+        base.release_requests.append(&mut chunk.release_requests);
+        Ok(())
+    }
+
+    async fn handle_acquire_request(&self, req: AcquireRequest, max_paths: usize) -> Result<AcquireResponse, Status> {
+        check_id("owner_id", &req.owner_id)?;
+        check_ttl(req.ttl_ms)?;
+        let idempotency_key = idempotency_key(&req.idempotency_key)?;
+        if req.requests.len() + req.release_requests.len() > max_paths {
+            return Err(Status::invalid_argument(format!("too many paths in one request (max {max_paths})")));
+        }
+        for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
+        for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
+        if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
+            check_write_fencing_token(req.fencing_token)?;
+        }
+        let requests: Vec<LockReq> = req.requests.iter().map(|r| {
+            Ok(LockReq { path: r.path.clone(), mode: to_mode(r.mode)?, state: to_state(r.state)? })
+        }).collect::<Result<_, Status>>()?;
+        let release_requests: Vec<RelReq> = req.release_requests.iter().map(|r| {
+            Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
+        }).collect::<Result<_, Status>>()?;
+        let had_release = !release_requests.is_empty();
+
+        let args = AcquireArgs {
+            owner_id: req.owner_id.clone(),
+            ttl_ms: req.ttl_ms,
+            requests,
+            fencing_token: req.fencing_token,
+            release_requests,
+        };
+
+        let router = self.router.clone();
+        let outcome = router.acquire_with_idempotency(args, idempotency_key.as_deref()).await.map_err(engine_err)?;
+        let resp = match outcome {
+            AcquireOutcome::Ok => {
+                if had_release && req.emit_release {
+                    self.broadcaster.released(&req.owner_id);
+                }
+                AcquireResponse { status: AcquireStatus::Ok as i32, ..Default::default() }
+            }
+            AcquireOutcome::Conflict { path, owner, reason } => AcquireResponse {
+                status: AcquireStatus::Conflict as i32, path, owner, reason,
+            },
+            AcquireOutcome::Lost { path, reason } => AcquireResponse {
+                status: AcquireStatus::Lost as i32, path, owner: String::new(), reason,
+            },
+        };
+        Ok(resp)
+    }
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Status>> + Send>>;
@@ -213,50 +319,39 @@ impl PathLock for PathLockService {
     ) -> Result<Response<AcquireResponse>, Status> {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Acquire", request, |request| async move {
             let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            check_ttl(req.ttl_ms)?;
-            if req.requests.len() + req.release_requests.len() > MAX_PATHS_PER_REQUEST {
-                return Err(Status::invalid_argument(format!(
-                    "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
-                )));
-            }
-            for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-            for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-            if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
-                check_write_fencing_token(req.fencing_token)?;
-            }
-            let requests: Vec<LockReq> = req.requests.iter().map(|r| {
-                Ok(LockReq { path: r.path.clone(), mode: to_mode(r.mode)?, state: to_state(r.state)? })
-            }).collect::<Result<_, Status>>()?;
-            let release_requests: Vec<RelReq> = req.release_requests.iter().map(|r| {
-                Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
-            }).collect::<Result<_, Status>>()?;
-            let had_release = !release_requests.is_empty();
+            let resp = self.handle_acquire_request(req, MAX_PATHS_PER_REQUEST).await?;
+            Ok(Response::new(resp))
+        }).await
+    }
 
-            let args = AcquireArgs {
-                owner_id: req.owner_id.clone(),
-                ttl_ms: req.ttl_ms,
-                requests,
-                fencing_token: req.fencing_token,
-                release_requests,
-            };
+    async fn acquire_stream(
+        &self,
+        request: Request<tonic::Streaming<AcquireRequest>>,
+    ) -> Result<Response<AcquireResponse>, Status> {
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "AcquireStream", request, |request| async move {
+            let mut stream = request.into_inner();
+            let mut merged: Option<AcquireRequest> = None;
+            let mut total_paths = 0usize;
 
-            let router = self.router.clone();
-            let outcome = router.acquire(args).await.map_err(engine_err)?;
-            let resp = match outcome {
-                AcquireOutcome::Ok => {
-                    if had_release && req.emit_release {
-                        self.broadcaster.released(&req.owner_id);
-                    }
-                    AcquireResponse { status: AcquireStatus::Ok as i32, ..Default::default() }
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let chunk_paths = chunk.requests.len() + chunk.release_requests.len();
+                if chunk_paths > MAX_PATHS_PER_REQUEST {
+                    return Err(Status::invalid_argument(format!("too many paths in one streamed chunk (max {MAX_PATHS_PER_REQUEST})")));
                 }
-                AcquireOutcome::Conflict { path, owner, reason } => AcquireResponse {
-                    status: AcquireStatus::Conflict as i32, path, owner, reason,
-                },
-                AcquireOutcome::Lost { path, reason } => AcquireResponse {
-                    status: AcquireStatus::Lost as i32, path, owner: String::new(), reason,
-                },
-            };
+                total_paths = total_paths.checked_add(chunk_paths).ok_or_else(|| Status::invalid_argument("too many paths in acquire stream"))?;
+                if total_paths > MAX_PATHS_PER_STREAMED_ACQUIRE {
+                    return Err(Status::invalid_argument(format!("too many paths in acquire stream (max {MAX_PATHS_PER_STREAMED_ACQUIRE})")));
+                }
+
+                match &mut merged {
+                    Some(base) => Self::merge_acquire_stream_chunk(base, chunk)?,
+                    None => merged = Some(chunk),
+                }
+            }
+
+            let req = merged.ok_or_else(|| Status::invalid_argument("empty acquire stream"))?;
+            let resp = self.handle_acquire_request(req, MAX_PATHS_PER_STREAMED_ACQUIRE).await?;
             Ok(Response::new(resp))
         }).await
     }
@@ -268,6 +363,7 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Release", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             if req.requests.len() > MAX_PATHS_PER_REQUEST {
                 return Err(Status::invalid_argument(format!("too many paths in one request (max {MAX_PATHS_PER_REQUEST})")));
             }
@@ -278,7 +374,7 @@ impl PathLock for PathLockService {
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let del_wait_key = req.del_wait_key;
-            router.release(&owner_id, &reqs, del_wait_key).await.map_err(engine_err)?;
+            router.release_with_idempotency(&owner_id, &reqs, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.released(&req.owner_id);
             Ok(Response::new(ReleaseResponse {}))
         }).await
@@ -291,10 +387,11 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ReleaseAll", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let del_wait_key = req.del_wait_key;
-            router.release_all(&owner_id, del_wait_key).await.map_err(engine_err)?;
+            router.release_all_with_idempotency(&owner_id, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.released(&req.owner_id);
             Ok(Response::new(ReleaseResponse {}))
         }).await
@@ -308,10 +405,11 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
             check_ttl(req.ttl_ms)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let ttl_ms = req.ttl_ms;
-            let outcome = router.renew(&owner_id, ttl_ms, &req.domains).await.map_err(engine_err)?;
+            let outcome = router.renew_with_idempotency(&owner_id, ttl_ms, &req.domains, idempotency_key.as_deref()).await.map_err(engine_err)?;
             let resp = match outcome {
                 RenewOutcome::Ok => RenewResponse { status: RenewStatus::Ok as i32, ..Default::default() },
                 RenewOutcome::Lost { path, reason } => RenewResponse { status: RenewStatus::Lost as i32, path, reason },
@@ -327,9 +425,10 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ForceRelease", request, |request| async move {
             let req = request.into_inner();
             check_id("victim_id", &req.victim_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let victim_id = req.victim_id.clone();
-            router.force_release(&victim_id).await.map_err(engine_err)?;
+            router.force_release_with_idempotency(&victim_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             self.broadcaster.killed(&req.victim_id);
             Ok(Response::new(ForceReleaseResponse {}))
         }).await
@@ -395,8 +494,10 @@ impl PathLock for PathLockService {
         &self,
         request: Request<IncrFencingTokenRequest>,
     ) -> Result<Response<IncrFencingTokenResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IncrFencingToken", request, |_request| async move {
-            let token = self.router.incr_fencing_token().await.map_err(engine_err)?;
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IncrFencingToken", request, |request| async move {
+            let req = request.into_inner();
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
+            let token = self.router.incr_fencing_token_with_idempotency(idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(IncrFencingTokenResponse { token }))
         }).await
     }
@@ -410,6 +511,7 @@ impl PathLock for PathLockService {
             check_id("owner_id", &req.owner_id)?;
             check_id("conflict_owner", &req.conflict_owner)?;
             check_ttl(req.ttl_ms)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
                 None
             } else if req.conflict_path.is_empty() || req.reason.is_empty() {
@@ -420,7 +522,7 @@ impl PathLock for PathLockService {
                 Some(WaitEdgeMetadata { conflict_path: req.conflict_path, reason: req.reason })
             };
             let router = self.router.clone();
-            router.set_wait_edge(&req.owner_id, &req.conflict_owner, req.ttl_ms, metadata.as_ref()).await.map_err(engine_err)?;
+            router.set_wait_edge_with_idempotency(&req.owner_id, &req.conflict_owner, req.ttl_ms, metadata.as_ref(), idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(SetWaitEdgeResponse {}))
         }).await
     }
@@ -432,8 +534,9 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ClearWaitEdge", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            router.clear_wait_edge(&req.owner_id).await.map_err(engine_err)?;
+            router.clear_wait_edge_with_idempotency(&req.owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(ClearWaitEdgeResponse {}))
         }).await
     }
@@ -450,8 +553,9 @@ impl PathLock for PathLockService {
             if req.ttl_ms > MAX_CLAIM_TTL_MS {
                 return Err(Status::invalid_argument(format!("ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
             }
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            let outcome = router.set_claim(&req.path, &req.claimant_owner_id, req.ttl_ms).await.map_err(engine_err)?;
+            let outcome = router.set_claim_with_idempotency(&req.path, &req.claimant_owner_id, req.ttl_ms, idempotency_key.as_deref()).await.map_err(engine_err)?;
             let resp = match outcome {
                 engine::ClaimOutcome::Ok => SetClaimResponse {
                     status: SetClaimStatus::Ok as i32,
@@ -474,8 +578,9 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_path(&req.path)?;
             check_id("claimant_owner_id", &req.claimant_owner_id)?;
+            let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
-            router.clear_claim(&req.path, &req.claimant_owner_id).await.map_err(engine_err)?;
+            router.clear_claim_with_idempotency(&req.path, &req.claimant_owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
             Ok(Response::new(ClearClaimResponse {}))
         }).await
     }

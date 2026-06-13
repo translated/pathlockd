@@ -1467,7 +1467,7 @@ dependencies = [
 
 [[package]]
 name = "pathlockd"
-version = "0.8.0"
+version = "0.8.2"
 dependencies = [
  "anyhow",
  "async-stream",

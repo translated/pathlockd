@@ -10,8 +10,8 @@ use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::{
     AcquireRequest, AcquireStatus, AssertFencingRequest, AssertStatus, CycleKind,
     DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest, IsOwnerAliveRequest,
-    ListOwnerLocksRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest, RenewStatus,
-    SetWaitEdgeRequest,
+    ListOwnerLocksRequest, LockRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest,
+    RenewStatus, SetWaitEdgeRequest,
 };
 use tonic::transport::Channel;
 
@@ -74,10 +74,7 @@ log_level = "error"
             .await
         {
             let mut client = PathLockClient::new(channel);
-            if let Ok(resp) = client
-                .health(pathlockd::proto::HealthRequest {})
-                .await
-            {
+            if let Ok(resp) = client.health(pathlockd::proto::HealthRequest {}).await {
                 if resp.into_inner().ok {
                     let channel = tonic::transport::Endpoint::from_shared(addr)
                         .unwrap()
@@ -115,6 +112,7 @@ async fn e2e_acquire_and_release() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -131,6 +129,7 @@ async fn e2e_acquire_and_release() {
                 mode: Mode::Write as i32,
             }],
             del_wait_key: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -149,6 +148,7 @@ async fn e2e_acquire_and_release() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -156,6 +156,70 @@ async fn e2e_acquire_and_release() {
     assert_eq!(resp.status(), AcquireStatus::Ok);
 
     daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
+    let mut daemon = start_daemon().await;
+
+    let requests = (0..1100)
+        .map(|i| LockRequest {
+            path: format!("h:/bulk/{i}"),
+            mode: Mode::Write as i32,
+            state: LockState::New as i32,
+        })
+        .collect::<Vec<_>>();
+
+    let chunks = vec![
+        AcquireRequest {
+            owner_id: "bulk-owner".into(),
+            ttl_ms: 10000,
+            fencing_token: 10,
+            requests: requests[..600].to_vec(),
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: "bulk-acquire".into(),
+        },
+        AcquireRequest {
+            owner_id: String::new(),
+            ttl_ms: 0,
+            fencing_token: 0,
+            requests: requests[600..].to_vec(),
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: String::new(),
+        },
+    ];
+
+    let resp = daemon
+        .client
+        .acquire_stream(tokio_stream::iter(chunks))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Ok);
+
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "blocked-owner".into(),
+            ttl_ms: 10000,
+            fencing_token: 11,
+            requests: vec![LockRequest {
+                path: "h:/bulk/1099".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Conflict);
+    assert_eq!(resp.owner, "bulk-owner");
+    assert_eq!(resp.reason, "write_locked");
 }
 
 #[tokio::test]
@@ -176,6 +240,7 @@ async fn e2e_renew_and_lost() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -187,6 +252,7 @@ async fn e2e_renew_and_lost() {
             owner_id: "renew-test".into(),
             ttl_ms: 10000,
             domains: vec![],
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -209,6 +275,7 @@ async fn e2e_renew_and_lost() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -235,6 +302,7 @@ async fn e2e_force_release() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -244,6 +312,7 @@ async fn e2e_force_release() {
         .client
         .force_release(ForceReleaseRequest {
             victim_id: "victim".into(),
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -262,6 +331,7 @@ async fn e2e_force_release() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()
@@ -288,6 +358,7 @@ async fn e2e_fencing_assertion() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -345,6 +416,7 @@ async fn e2e_list_owner_locks() {
             ],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -381,6 +453,7 @@ async fn e2e_is_owner_alive() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -427,6 +500,7 @@ async fn e2e_detect_cycle() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -444,6 +518,7 @@ async fn e2e_detect_cycle() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -457,6 +532,7 @@ async fn e2e_detect_cycle() {
             ttl_ms: 30000,
             conflict_path: "h:/x".into(),
             reason: "write_locked".into(),
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -469,6 +545,7 @@ async fn e2e_detect_cycle() {
             ttl_ms: 30000,
             conflict_path: "h:/y".into(),
             reason: "write_locked".into(),
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -506,6 +583,7 @@ async fn e2e_dump_locks() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap();
@@ -625,6 +703,7 @@ async fn e2e_sigkill_restart_preserves_acknowledged_state() {
             }],
             release_requests: vec![],
             emit_release: false,
+            idempotency_key: String::new(),
         })
         .await
         .unwrap()

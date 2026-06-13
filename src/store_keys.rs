@@ -65,8 +65,11 @@ pub const META_SNAPSHOT_DATA_KEY: &[u8] = b"raft_snapshot_data";
 // 4-byte big-endian group prefix so each group owns a contiguous, range-
 // deletable keyspace.
 
+/// Length of the group prefix every scoped key carries.
+pub const GROUP_PREFIX_LEN: usize = 4;
+
 /// The 4-byte key prefix of a group's keyspace.
-pub fn group_prefix(group: GroupId) -> [u8; 4] {
+pub fn group_prefix(group: GroupId) -> [u8; GROUP_PREFIX_LEN] {
     group.to_be_bytes()
 }
 

@@ -63,6 +63,9 @@ pub enum Op {
         owner: String,
     },
     GcSweep {
+        /// Unused (the apply path uses the command's clamped `now_ms`), but
+        /// retained: removing it would change the bincode log encoding and
+        /// break replay of existing raft logs.
         now_ms: u64,
         batch: u32,
     },
@@ -91,6 +94,19 @@ pub struct WaitEdge {
     pub metadata: Option<crate::engine::WaitEdgeMetadata>,
 }
 
+/// Why the state machine refused a command without committing anything.
+/// Deterministic: every replica computes the same rejection from the same
+/// log entry, so this must never travel the fatal storage-error path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectKind {
+    /// A set enumeration inside the command exceeded the per-command scan
+    /// limit (e.g. an owner's hold set outgrew `MAX_SET_ENUM_MEMBERS`).
+    ScanLimit,
+    /// The request id was already used by a different command within the
+    /// dedupe window.
+    IdempotencyMismatch,
+}
+
 /// Responses returned by the state machine after applying an Op.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ApplyResponse {
@@ -107,4 +123,14 @@ pub enum ApplyResponse {
         reclaimed: u64,
     },
     Unit,
+    /// The command was refused and none of its writes committed. Logical
+    /// limits are rejections the proposer must surface to the client — unlike
+    /// storage errors they must not shut the raft core down, because the
+    /// entry is already committed and every replica would fail it identically
+    /// (a poison-pill log entry). Appended last so existing variant encodings
+    /// stay stable.
+    Rejected {
+        kind: RejectKind,
+        detail: String,
+    },
 }

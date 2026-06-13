@@ -39,7 +39,7 @@ use crate::engine::{
     AcquireArgs, AcquireOutcome, AssertOutcome, ClaimOutcome, CycleOutcome, LockDumpPage,
     OwnedLock, PathInfo, RelReq, RenewOutcome, WaitEdgeMetadata,
 };
-use crate::raft::command::{ApplyResponse, Command, Op, RequestId};
+use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::raft::manager::RaftGroups;
 use crate::raft::network::PeerPool;
 use crate::raft::server::execute_read_blocking;
@@ -59,10 +59,26 @@ pub struct WriterUnavailable;
 #[error("all paths in one request must share a routing domain")]
 pub struct MultiDomainUnsupported;
 
+/// A command the state machine deterministically refused (none of its writes
+/// committed). A client/request fault, not a server fault.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("{detail}")]
+pub struct CommandRejected {
+    pub kind: RejectKind,
+    pub detail: String,
+}
+
 /// Max leader-chasing hops before a write/read reports unavailable.
 const MAX_FORWARD_HOPS: usize = 4;
 /// Per-hop deadline for forwarded commands and reads.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Concurrency budget for operations that fan out across many groups
+/// (owner-wide writes, cross-group reads).
+const FANOUT_CONCURRENCY: usize = 16;
+/// Soft cap on the domain→group placement cache. Beyond it, placements are
+/// recomputed per call instead of cached, so unbounded domain cardinality
+/// (deep `routing_prefix_segments`, hostile clients) cannot grow memory.
+const DOMAIN_CACHE_MAX: usize = 16_384;
 
 #[derive(Debug, Clone)]
 pub struct RoutingOptions {
@@ -96,6 +112,8 @@ pub struct Router {
     /// Last-known leader per group, learned from local metrics and
     /// `NotLeader` rejections.
     leader_hints: RwLock<HashMap<GroupId, (u64, NodeMeta)>>,
+    /// Memoized HRW placements (`place_domain` is O(group_count) hashes).
+    domain_groups: RwLock<HashMap<String, GroupId>>,
     inflight: HashMap<GroupId, Arc<tokio::sync::Semaphore>>,
     inflight_total: Arc<AtomicUsize>,
     /// Request-id source for apply-once forwarding.
@@ -133,6 +151,7 @@ impl Router {
             pool,
             members,
             leader_hints: RwLock::new(HashMap::new()),
+            domain_groups: RwLock::new(HashMap::new()),
             inflight,
             inflight_total: Arc::new(AtomicUsize::new(0)),
             client_id,
@@ -142,10 +161,29 @@ impl Router {
 
     /// The group a path routes to.
     pub fn group_of(&self, path: &str) -> GroupId {
-        place_domain(
-            routing_prefix(path, self.routing.routing_prefix_segments),
-            self.routing.group_count,
-        )
+        self.group_of_domain(routing_prefix(path, self.routing.routing_prefix_segments))
+    }
+
+    /// The group a routing domain places onto, memoized — domains are
+    /// low-cardinality in practice while requests may carry many paths.
+    fn group_of_domain(&self, domain: &str) -> GroupId {
+        if let Some(group) = self
+            .domain_groups
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(domain)
+        {
+            return *group;
+        }
+        let group = place_domain(domain, self.routing.group_count);
+        let mut cache = self
+            .domain_groups
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() < DOMAIN_CACHE_MAX {
+            cache.insert(domain.to_string(), group);
+        }
+        group
     }
 
     /// All lock groups plus the system group.
@@ -191,9 +229,23 @@ impl Router {
         }
     }
 
+    fn request_id(&self, idempotency_key: Option<&str>) -> RequestId {
+        match idempotency_key {
+            Some(key) => RequestId {
+                client_id: format!("external:{key}"),
+                seq: 0,
+            },
+            None => self.next_request_id(),
+        }
+    }
+
     fn command(&self, op: Op) -> Command {
+        self.command_with_idempotency(op, None)
+    }
+
+    fn command_with_idempotency(&self, op: Op, idempotency_key: Option<&str>) -> Command {
         Command {
-            request_id: Some(self.next_request_id()),
+            request_id: Some(self.request_id(idempotency_key)),
             now_ms: crate::store_keys::now_ms(),
             op,
         }
@@ -274,7 +326,36 @@ impl Router {
         self.inflight_total.fetch_add(1, Ordering::Relaxed);
         let result = self.apply_inner(group, cmd).await;
         self.inflight_total.fetch_sub(1, Ordering::Relaxed);
-        result
+        match result? {
+            // Deterministic refusals (scan limits, idempotency-key misuse)
+            // surface as request errors, never as raw responses callers would
+            // misread as "unexpected response type".
+            ApplyResponse::Rejected { kind, detail } => {
+                Err(CommandRejected { kind, detail }.into())
+            }
+            resp => Ok(resp),
+        }
+    }
+
+    /// Apply one command per group with bounded concurrency. Used by the
+    /// owner-wide fan-outs; each group's command is idempotent and its lease
+    /// stands alone, so an error after partial application is safe (the
+    /// unreached groups keep their previous lease until it expires).
+    async fn fanout_apply(
+        &self,
+        cmds: Vec<(GroupId, Command)>,
+    ) -> anyhow::Result<Vec<ApplyResponse>> {
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(
+            cmds.into_iter()
+                .map(|(group, cmd)| self.apply_to(group, cmd)),
+        )
+        .buffer_unordered(FANOUT_CONCURRENCY);
+        let mut responses = Vec::new();
+        while let Some(resp) = stream.next().await {
+            responses.push(resp?);
+        }
+        Ok(responses)
     }
 
     async fn apply_inner(&self, group: GroupId, cmd: Command) -> anyhow::Result<ApplyResponse> {
@@ -348,16 +429,21 @@ impl Router {
         let channel = self
             .pool
             .channel(*leader_id, &leader.raft_addr)
-            .map_err(|e| ForwardError::Other(e.to_string()))?;
+            .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
         let mut client = RaftTransportClient::new(channel);
         let command = bincode::serde::encode_to_vec(cmd, bincode::config::standard())
             .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
         let mut request = tonic::Request::new(ForwardRequest { group, command });
         request.set_timeout(FORWARD_TIMEOUT);
+        // Transport failure means the *target* is unreachable, not that the
+        // command failed: like the read path, report `Unreachable` so the
+        // caller clears a stale leader hint and tries the next peer. (Mapped
+        // to `Other`, a dead cached leader froze every forwarded write to the
+        // group: `Other` aborts the chase and nothing ever cleared the hint.)
         let resp = client
             .forward(request)
             .await
-            .map_err(|e| ForwardError::Other(format!("transport: {e}")))?;
+            .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
         let (result, _): (Result<ApplyResponse, ForwardError>, _) =
             bincode::serde::decode_from_slice(
                 &resp.into_inner().result,
@@ -512,7 +598,14 @@ impl Router {
     /// Round-trip a no-op command through the system group's consensus.
     /// Proves this node can reach a functioning leader within `timeout`.
     pub async fn probe_writer(&self, timeout: Duration) -> anyhow::Result<()> {
-        let cmd = self.command(Op::Noop);
+        // No request id: probes run at health-poll frequency and must not
+        // leave a dedupe record (plus its expiry-index entry and eventual GC
+        // work) behind on every poll.
+        let cmd = Command {
+            request_id: None,
+            now_ms: crate::store_keys::now_ms(),
+            op: Op::Noop,
+        };
         match tokio::time::timeout(timeout, self.apply_to(SYS_GROUP, cmd)).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(e),
@@ -539,6 +632,14 @@ impl Router {
     // -----------------------------------------------------------------------
 
     pub async fn acquire(&self, args: AcquireArgs) -> anyhow::Result<AcquireOutcome> {
+        self.acquire_with_idempotency(args, None).await
+    }
+
+    pub async fn acquire_with_idempotency(
+        &self,
+        args: AcquireArgs,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<AcquireOutcome> {
         let segments = self.routing.routing_prefix_segments;
         let domains: std::collections::HashSet<&str> = args
             .requests
@@ -557,10 +658,13 @@ impl Router {
         let Some(domain) = domains.into_iter().next() else {
             return Ok(AcquireOutcome::Ok);
         };
-        let group = place_domain(domain, self.routing.group_count);
+        let group = self.group_of_domain(domain);
 
         match self
-            .apply_to(group, self.command(Op::Acquire(args)))
+            .apply_to(
+                group,
+                self.command_with_idempotency(Op::Acquire(args), idempotency_key),
+            )
             .await?
         {
             ApplyResponse::Acquire(outcome) => Ok(outcome),
@@ -576,6 +680,17 @@ impl Router {
         reqs: &[RelReq],
         del_wait: bool,
     ) -> anyhow::Result<()> {
+        self.release_with_idempotency(owner, reqs, del_wait, None)
+            .await
+    }
+
+    pub async fn release_with_idempotency(
+        &self,
+        owner: &str,
+        reqs: &[RelReq],
+        del_wait: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         if reqs.is_empty() {
             return Ok(());
         }
@@ -586,31 +701,61 @@ impl Router {
                 .or_default()
                 .push(req.clone());
         }
-        for (group, group_reqs) in by_group {
-            let cmd = self.command(Op::Release {
-                owner: owner.to_string(),
-                reqs: group_reqs,
-                del_wait,
-            });
-            self.apply_to(group, cmd).await?;
-        }
+        let cmds: Vec<(GroupId, Command)> = by_group
+            .into_iter()
+            .map(|(group, group_reqs)| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::Release {
+                            owner: owner.to_string(),
+                            reqs: group_reqs,
+                            del_wait,
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+        self.fanout_apply(cmds).await?;
         if del_wait {
-            self.clear_wait_edge(owner).await?;
+            self.clear_wait_edge_with_idempotency(owner, idempotency_key)
+                .await?;
         }
         Ok(())
     }
 
     /// Release everything an owner holds, in every group.
     pub async fn release_all(&self, owner: &str, del_wait: bool) -> anyhow::Result<()> {
-        for group in self.lock_groups() {
-            let cmd = self.command(Op::ReleaseAll {
-                owner: owner.to_string(),
-                del_wait,
-            });
-            self.apply_to(group, cmd).await?;
-        }
+        self.release_all_with_idempotency(owner, del_wait, None)
+            .await
+    }
+
+    pub async fn release_all_with_idempotency(
+        &self,
+        owner: &str,
+        del_wait: bool,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmds: Vec<(GroupId, Command)> = self
+            .lock_groups()
+            .map(|group| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::ReleaseAll {
+                            owner: owner.to_string(),
+                            del_wait,
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+        self.fanout_apply(cmds).await?;
         if del_wait {
-            self.clear_wait_edge(owner).await?;
+            self.clear_wait_edge_with_idempotency(owner, idempotency_key)
+                .await?;
         }
         Ok(())
     }
@@ -623,39 +768,70 @@ impl Router {
     /// actually holds. Without it, every lock group is probed (correct but
     /// amplified; discouraged for heartbeat-frequency renews).
     ///
-    /// Aggregation: a group where the owner holds nothing reports an
-    /// empty-path `Lost` — that is *absence*, not loss. Any path-specific loss
-    /// makes the renew `Lost` (the client releases and re-acquires).
-    /// Otherwise the renew succeeded iff at least one group renewed.
+    /// Aggregation: any path-specific loss makes the renew `Lost` (the client
+    /// releases and re-acquires). A group where the owner holds nothing
+    /// reports an empty-path `Lost`; for a broadcast renew that is mere
+    /// *absence* and is skipped, but for an explicitly declared domain it
+    /// means the declared lease expired wholesale — reported as `Lost` rather
+    /// than silently masked by another domain's success. Otherwise the renew
+    /// succeeded iff at least one group renewed.
     pub async fn renew(
         &self,
         owner: &str,
         ttl_ms: u64,
         domains: &[String],
     ) -> anyhow::Result<RenewOutcome> {
-        let groups: Vec<GroupId> = if domains.is_empty() {
-            self.lock_groups().collect()
-        } else {
+        self.renew_with_idempotency(owner, ttl_ms, domains, None)
+            .await
+    }
+
+    pub async fn renew_with_idempotency(
+        &self,
+        owner: &str,
+        ttl_ms: u64,
+        domains: &[String],
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<RenewOutcome> {
+        let declared = !domains.is_empty();
+        let groups: Vec<GroupId> = if declared {
             let mut set: std::collections::BTreeSet<GroupId> = std::collections::BTreeSet::new();
             for domain in domains {
-                set.insert(place_domain(domain, self.routing.group_count));
+                set.insert(self.group_of_domain(domain));
             }
             set.into_iter().collect()
+        } else {
+            self.lock_groups().collect()
         };
 
+        let cmds: Vec<(GroupId, Command)> = groups
+            .into_iter()
+            .map(|group| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::Renew {
+                            owner: owner.to_string(),
+                            ttl_ms,
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+
         let mut renewed_any = false;
-        for group in groups {
-            let cmd = self.command(Op::Renew {
-                owner: owner.to_string(),
-                ttl_ms,
-            });
-            match self.apply_to(group, cmd).await? {
+        for resp in self.fanout_apply(cmds).await? {
+            match resp {
                 ApplyResponse::Renew(RenewOutcome::Ok) => renewed_any = true,
                 ApplyResponse::Renew(RenewOutcome::Lost { path, reason }) => {
-                    if !path.is_empty() {
+                    // An empty path means the owner holds nothing in that
+                    // group. In a broadcast renew that is mere absence; in a
+                    // group the client *declared* it holds a lease in, the
+                    // lease expired wholesale — that is loss, and reporting
+                    // Ok would hide it behind another domain's renewal.
+                    if !path.is_empty() || declared {
                         return Ok(RenewOutcome::Lost { path, reason });
                     }
-                    // Empty path: the owner simply isn't present in this group.
                 }
                 _ => anyhow::bail!("unexpected response type"),
             }
@@ -672,13 +848,31 @@ impl Router {
 
     /// Forcibly release a victim owner everywhere (admin/deadlock breaker).
     pub async fn force_release(&self, victim: &str) -> anyhow::Result<()> {
-        for group in self.lock_groups() {
-            let cmd = self.command(Op::ForceRelease {
-                victim: victim.to_string(),
-            });
-            self.apply_to(group, cmd).await?;
-        }
-        self.clear_wait_edge(victim).await?;
+        self.force_release_with_idempotency(victim, None).await
+    }
+
+    pub async fn force_release_with_idempotency(
+        &self,
+        victim: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmds: Vec<(GroupId, Command)> = self
+            .lock_groups()
+            .map(|group| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::ForceRelease {
+                            victim: victim.to_string(),
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+        self.fanout_apply(cmds).await?;
+        self.clear_wait_edge_with_idempotency(victim, idempotency_key)
+            .await?;
         Ok(())
     }
 
@@ -689,8 +883,18 @@ impl Router {
 
     /// Issue a new fencing token from the cluster-global counter (sys group).
     pub async fn incr_fencing_token(&self) -> anyhow::Result<i64> {
+        self.incr_fencing_token_with_idempotency(None).await
+    }
+
+    pub async fn incr_fencing_token_with_idempotency(
+        &self,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<i64> {
         match self
-            .apply_to(SYS_GROUP, self.command(Op::IncrFence))
+            .apply_to(
+                SYS_GROUP,
+                self.command_with_idempotency(Op::IncrFence, idempotency_key),
+            )
             .await?
         {
             ApplyResponse::IncrFence(token) => Ok(token),
@@ -707,22 +911,48 @@ impl Router {
         ttl_ms: u64,
         metadata: Option<&WaitEdgeMetadata>,
     ) -> anyhow::Result<()> {
-        let cmd = self.command(Op::SetWaitEdge {
-            owner: owner.to_string(),
-            edge: crate::raft::command::WaitEdge {
-                conflict_owner: conflict_owner.to_string(),
-                metadata: metadata.cloned(),
+        self.set_wait_edge_with_idempotency(owner, conflict_owner, ttl_ms, metadata, None)
+            .await
+    }
+
+    pub async fn set_wait_edge_with_idempotency(
+        &self,
+        owner: &str,
+        conflict_owner: &str,
+        ttl_ms: u64,
+        metadata: Option<&WaitEdgeMetadata>,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmd = self.command_with_idempotency(
+            Op::SetWaitEdge {
+                owner: owner.to_string(),
+                edge: crate::raft::command::WaitEdge {
+                    conflict_owner: conflict_owner.to_string(),
+                    metadata: metadata.cloned(),
+                },
+                ttl_ms,
             },
-            ttl_ms,
-        });
+            idempotency_key,
+        );
         self.apply_to(SYS_GROUP, cmd).await?;
         Ok(())
     }
 
     pub async fn clear_wait_edge(&self, owner: &str) -> anyhow::Result<()> {
-        let cmd = self.command(Op::ClearWaitEdge {
-            owner: owner.to_string(),
-        });
+        self.clear_wait_edge_with_idempotency(owner, None).await
+    }
+
+    pub async fn clear_wait_edge_with_idempotency(
+        &self,
+        owner: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let cmd = self.command_with_idempotency(
+            Op::ClearWaitEdge {
+                owner: owner.to_string(),
+            },
+            idempotency_key,
+        );
         self.apply_to(SYS_GROUP, cmd).await?;
         Ok(())
     }
@@ -733,12 +963,26 @@ impl Router {
         claimant: &str,
         ttl_ms: u64,
     ) -> anyhow::Result<ClaimOutcome> {
+        self.set_claim_with_idempotency(path, claimant, ttl_ms, None)
+            .await
+    }
+
+    pub async fn set_claim_with_idempotency(
+        &self,
+        path: &str,
+        claimant: &str,
+        ttl_ms: u64,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<ClaimOutcome> {
         let group = self.group_of(path);
-        let cmd = self.command(Op::SetClaim {
-            path: path.to_string(),
-            claimant: claimant.to_string(),
-            ttl_ms,
-        });
+        let cmd = self.command_with_idempotency(
+            Op::SetClaim {
+                path: path.to_string(),
+                claimant: claimant.to_string(),
+                ttl_ms,
+            },
+            idempotency_key,
+        );
         match self.apply_to(group, cmd).await? {
             ApplyResponse::SetClaim(outcome) => Ok(outcome),
             _ => anyhow::bail!("unexpected response type"),
@@ -746,11 +990,24 @@ impl Router {
     }
 
     pub async fn clear_claim(&self, path: &str, claimant: &str) -> anyhow::Result<()> {
+        self.clear_claim_with_idempotency(path, claimant, None)
+            .await
+    }
+
+    pub async fn clear_claim_with_idempotency(
+        &self,
+        path: &str,
+        claimant: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
         let group = self.group_of(path);
-        let cmd = self.command(Op::ClearClaim {
-            path: path.to_string(),
-            claimant: claimant.to_string(),
-        });
+        let cmd = self.command_with_idempotency(
+            Op::ClearClaim {
+                path: path.to_string(),
+                claimant: claimant.to_string(),
+            },
+            idempotency_key,
+        );
         self.apply_to(group, cmd).await?;
         Ok(())
     }
@@ -794,6 +1051,11 @@ impl Router {
     /// groups, so the walk is composed here rather than inside one engine
     /// transaction. Stale edges (dead blocker, conflict gone) end the walk
     /// and are pruned best-effort.
+    ///
+    /// `Cycle` reports the members of the detected cycle. That cycle does not
+    /// necessarily include `start`: a walk can run *into* a cycle downstream
+    /// (rho shape), in which case `start` is transitively deadlocked behind
+    /// it and the cycle's members are returned so a victim can be picked.
     pub async fn detect_cycle(&self, start: &str, max_depth: u32) -> anyhow::Result<CycleOutcome> {
         let mut visited = std::collections::HashSet::new();
         let mut chain: Vec<String> = Vec::new();
@@ -801,7 +1063,17 @@ impl Router {
 
         for _ in 0..=max_depth {
             if !visited.insert(current.clone()) {
-                return Ok(CycleOutcome::None);
+                // Re-entered an owner other than `start` (start re-entry
+                // returns below, before advancing): the walk ran into a
+                // cycle that does not contain `start`. The cycle is the
+                // chain suffix from the first occurrence of the revisited
+                // owner; `start` waits behind it, so hiding it as `None`
+                // would suppress a real deadlock.
+                let pos = chain
+                    .iter()
+                    .position(|owner| owner == &current)
+                    .expect("revisited owner is in the chain");
+                return Ok(CycleOutcome::Cycle(chain.split_off(pos)));
             }
             chain.push(current.clone());
 
@@ -822,19 +1094,30 @@ impl Router {
             };
             let next = edge.conflict_owner;
 
-            if !self.is_owner_alive(&next).await? {
-                // Blocker is gone everywhere: the edge is stale.
-                let _ = self.clear_wait_edge(&current).await;
-                let _ = self.clear_wait_edge(&next).await;
-                return Ok(CycleOutcome::None);
-            }
-            if let Some(meta) = edge.metadata {
-                if !self
-                    .is_blocking(&meta.conflict_path, &next, &meta.reason)
-                    .await?
-                {
-                    let _ = self.clear_wait_edge(&current).await;
-                    return Ok(CycleOutcome::None);
+            match edge.metadata {
+                // is_blocking is authoritative when the edge carries
+                // metadata: it covers lock state (which itself checks owner
+                // liveness) and TTL-governed claims — a pure-waiter claimant
+                // has no ALIVE record but still blocks, so a bare liveness
+                // probe would wrongly prune claim edges and hide
+                // claim-involved cycles.
+                Some(meta) => {
+                    if !self
+                        .is_blocking(&meta.conflict_path, &next, &meta.reason)
+                        .await?
+                    {
+                        let _ = self.clear_wait_edge(&current).await;
+                        return Ok(CycleOutcome::None);
+                    }
+                }
+                // Legacy edge without metadata: liveness is the only
+                // staleness signal available.
+                None => {
+                    if !self.is_owner_alive(&next).await? {
+                        let _ = self.clear_wait_edge(&current).await;
+                        let _ = self.clear_wait_edge(&next).await;
+                        return Ok(CycleOutcome::None);
+                    }
                 }
             }
 
@@ -863,11 +1146,18 @@ impl Router {
 
     /// An owner is alive if it holds a live lease in any group.
     pub async fn is_owner_alive(&self, owner: &str) -> anyhow::Result<bool> {
-        for group in self.lock_groups() {
-            let op = ReadOp::IsOwnerAlive {
-                owner: owner.to_string(),
-            };
-            match self.read_on(group, op).await? {
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(self.lock_groups().map(|group| {
+            self.read_on(
+                group,
+                ReadOp::IsOwnerAlive {
+                    owner: owner.to_string(),
+                },
+            )
+        }))
+        .buffer_unordered(FANOUT_CONCURRENCY);
+        while let Some(result) = stream.next().await {
+            match result? {
                 ReadResult::Bool(true) => return Ok(true),
                 ReadResult::Bool(false) => {}
                 _ => anyhow::bail!("unexpected read result"),
@@ -889,13 +1179,20 @@ impl Router {
 
     /// Union of the owner's locks across all groups.
     pub async fn list_owner_locks(&self, owner: &str) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(self.lock_groups().map(|group| {
+            self.read_on(
+                group,
+                ReadOp::ListOwnerLocks {
+                    owner: owner.to_string(),
+                },
+            )
+        }))
+        .buffer_unordered(FANOUT_CONCURRENCY);
         let mut alive_any = false;
         let mut all_locks = Vec::new();
-        for group in self.lock_groups() {
-            let op = ReadOp::ListOwnerLocks {
-                owner: owner.to_string(),
-            };
-            match self.read_on(group, op).await? {
+        while let Some(result) = stream.next().await {
+            match result? {
                 ReadResult::OwnerLocks { alive, locks } => {
                     alive_any |= alive;
                     all_locks.extend(locks);
@@ -1002,6 +1299,7 @@ mod tests {
             1,
             meta.clone(),
             raft_config(&cfg),
+            cfg.raft_snapshot_max_bytes,
             batcher,
             crate::raft::network::PeerPool::new(),
         )
@@ -1024,6 +1322,106 @@ mod tests {
             mode: Mode::Write,
             state: State::New,
         }
+    }
+
+    fn wr_rel(path: &str) -> RelReq {
+        RelReq {
+            path: path.into(),
+            mode: Mode::Write,
+        }
+    }
+
+    #[tokio::test]
+    async fn external_idempotency_retries_incr_fence_once() {
+        let (router, _dir) = test_router().await;
+
+        let first = router
+            .incr_fencing_token_with_idempotency(Some("fence-retry-1"))
+            .await
+            .unwrap();
+        let retry = router
+            .incr_fencing_token_with_idempotency(Some("fence-retry-1"))
+            .await
+            .unwrap();
+        let next = router.incr_fencing_token().await.unwrap();
+
+        assert_eq!(first, retry);
+        assert_eq!(next, first + 1);
+    }
+
+    #[tokio::test]
+    async fn external_idempotency_retries_lock_mutations_once() {
+        let (router, _dir) = test_router().await;
+
+        let args = AcquireArgs {
+            owner_id: "idem-owner".into(),
+            ttl_ms: 30_000,
+            requests: vec![wr_req("h:/idem")],
+            fencing_token: 1,
+            release_requests: vec![],
+        };
+        assert_eq!(
+            router
+                .acquire_with_idempotency(args.clone(), Some("acquire-retry-1"))
+                .await
+                .unwrap(),
+            AcquireOutcome::Ok
+        );
+        assert_eq!(
+            router
+                .acquire_with_idempotency(args, Some("acquire-retry-1"))
+                .await
+                .unwrap(),
+            AcquireOutcome::Ok
+        );
+
+        router
+            .release_with_idempotency(
+                "idem-owner",
+                &[wr_rel("h:/idem")],
+                false,
+                Some("release-retry-1"),
+            )
+            .await
+            .unwrap();
+        router
+            .release_with_idempotency(
+                "idem-owner",
+                &[wr_rel("h:/idem")],
+                false,
+                Some("release-retry-1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            router.inspect_path("h:/idem").await.unwrap().write_owner,
+            None
+        );
+
+        for path in ["h:/force-a", "h:/force-b"] {
+            assert_eq!(
+                router
+                    .acquire(AcquireArgs {
+                        owner_id: "victim".into(),
+                        ttl_ms: 30_000,
+                        requests: vec![wr_req(path)],
+                        fencing_token: 1,
+                        release_requests: vec![],
+                    })
+                    .await
+                    .unwrap(),
+                AcquireOutcome::Ok
+            );
+        }
+        router
+            .force_release_with_idempotency("victim", Some("force-retry-1"))
+            .await
+            .unwrap();
+        router
+            .force_release_with_idempotency("victim", Some("force-retry-1"))
+            .await
+            .unwrap();
+        assert!(!router.is_owner_alive("victim").await.unwrap());
     }
 
     #[tokio::test]
