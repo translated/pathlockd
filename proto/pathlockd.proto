@@ -450,6 +450,10 @@ message HealthResponse {
 
 service PathLock {
   rpc Acquire(AcquireRequest) returns (AcquireResponse);
+  // Client-streamed form of Acquire for large path sets. The daemon buffers all
+  // chunks, validates them as one logical request, then applies a single
+  // Acquire transaction; it never acquires chunk-by-chunk.
+  rpc AcquireStream(stream AcquireRequest) returns (AcquireResponse);
   rpc Release(ReleaseLocksRequest) returns (ReleaseResponse);
   rpc ReleaseAll(ReleaseAllRequest) returns (ReleaseResponse);
   rpc Renew(RenewRequest) returns (RenewResponse);

@@ -60,6 +60,7 @@ const MAX_TTL_MS: u64 = 7 * 86_400_000;
 const MAX_ID_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
+const MAX_PATHS_PER_STREAMED_ACQUIRE: usize = 65_536;
 const MAX_CLAIM_TTL_MS: u64 = 60_000;
 const MAX_CYCLE_DEPTH: u32 = 64;
 const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
@@ -222,6 +223,89 @@ impl PathLockService {
         }
         Ok(())
     }
+
+    #[allow(clippy::result_large_err)]
+    fn merge_acquire_stream_chunk(base: &mut AcquireRequest, mut chunk: AcquireRequest) -> Result<(), Status> {
+        if !chunk.owner_id.is_empty() {
+            if base.owner_id.is_empty() {
+                base.owner_id = chunk.owner_id;
+            } else if base.owner_id != chunk.owner_id {
+                return Err(Status::invalid_argument("acquire stream owner_id changed between chunks"));
+            }
+        }
+        if chunk.ttl_ms != 0 {
+            if base.ttl_ms == 0 {
+                base.ttl_ms = chunk.ttl_ms;
+            } else if base.ttl_ms != chunk.ttl_ms {
+                return Err(Status::invalid_argument("acquire stream ttl_ms changed between chunks"));
+            }
+        }
+        if chunk.fencing_token != 0 {
+            if base.fencing_token == 0 {
+                base.fencing_token = chunk.fencing_token;
+            } else if base.fencing_token != chunk.fencing_token {
+                return Err(Status::invalid_argument("acquire stream fencing_token changed between chunks"));
+            }
+        }
+        if !chunk.idempotency_key.is_empty() {
+            if base.idempotency_key.is_empty() {
+                base.idempotency_key = chunk.idempotency_key;
+            } else if base.idempotency_key != chunk.idempotency_key {
+                return Err(Status::invalid_argument("acquire stream idempotency_key changed between chunks"));
+            }
+        }
+        base.emit_release |= chunk.emit_release;
+        base.requests.append(&mut chunk.requests);
+        base.release_requests.append(&mut chunk.release_requests);
+        Ok(())
+    }
+
+    async fn handle_acquire_request(&self, req: AcquireRequest, max_paths: usize) -> Result<AcquireResponse, Status> {
+        check_id("owner_id", &req.owner_id)?;
+        check_ttl(req.ttl_ms)?;
+        let idempotency_key = idempotency_key(&req.idempotency_key)?;
+        if req.requests.len() + req.release_requests.len() > max_paths {
+            return Err(Status::invalid_argument(format!("too many paths in one request (max {max_paths})")));
+        }
+        for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
+        for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
+        if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
+            check_write_fencing_token(req.fencing_token)?;
+        }
+        let requests: Vec<LockReq> = req.requests.iter().map(|r| {
+            Ok(LockReq { path: r.path.clone(), mode: to_mode(r.mode)?, state: to_state(r.state)? })
+        }).collect::<Result<_, Status>>()?;
+        let release_requests: Vec<RelReq> = req.release_requests.iter().map(|r| {
+            Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
+        }).collect::<Result<_, Status>>()?;
+        let had_release = !release_requests.is_empty();
+
+        let args = AcquireArgs {
+            owner_id: req.owner_id.clone(),
+            ttl_ms: req.ttl_ms,
+            requests,
+            fencing_token: req.fencing_token,
+            release_requests,
+        };
+
+        let router = self.router.clone();
+        let outcome = router.acquire_with_idempotency(args, idempotency_key.as_deref()).await.map_err(engine_err)?;
+        let resp = match outcome {
+            AcquireOutcome::Ok => {
+                if had_release && req.emit_release {
+                    self.broadcaster.released(&req.owner_id);
+                }
+                AcquireResponse { status: AcquireStatus::Ok as i32, ..Default::default() }
+            }
+            AcquireOutcome::Conflict { path, owner, reason } => AcquireResponse {
+                status: AcquireStatus::Conflict as i32, path, owner, reason,
+            },
+            AcquireOutcome::Lost { path, reason } => AcquireResponse {
+                status: AcquireStatus::Lost as i32, path, owner: String::new(), reason,
+            },
+        };
+        Ok(resp)
+    }
 }
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Status>> + Send>>;
@@ -235,51 +319,39 @@ impl PathLock for PathLockService {
     ) -> Result<Response<AcquireResponse>, Status> {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Acquire", request, |request| async move {
             let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            check_ttl(req.ttl_ms)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            if req.requests.len() + req.release_requests.len() > MAX_PATHS_PER_REQUEST {
-                return Err(Status::invalid_argument(format!(
-                    "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
-                )));
-            }
-            for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-            for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-            if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
-                check_write_fencing_token(req.fencing_token)?;
-            }
-            let requests: Vec<LockReq> = req.requests.iter().map(|r| {
-                Ok(LockReq { path: r.path.clone(), mode: to_mode(r.mode)?, state: to_state(r.state)? })
-            }).collect::<Result<_, Status>>()?;
-            let release_requests: Vec<RelReq> = req.release_requests.iter().map(|r| {
-                Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
-            }).collect::<Result<_, Status>>()?;
-            let had_release = !release_requests.is_empty();
+            let resp = self.handle_acquire_request(req, MAX_PATHS_PER_REQUEST).await?;
+            Ok(Response::new(resp))
+        }).await
+    }
 
-            let args = AcquireArgs {
-                owner_id: req.owner_id.clone(),
-                ttl_ms: req.ttl_ms,
-                requests,
-                fencing_token: req.fencing_token,
-                release_requests,
-            };
+    async fn acquire_stream(
+        &self,
+        request: Request<tonic::Streaming<AcquireRequest>>,
+    ) -> Result<Response<AcquireResponse>, Status> {
+        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "AcquireStream", request, |request| async move {
+            let mut stream = request.into_inner();
+            let mut merged: Option<AcquireRequest> = None;
+            let mut total_paths = 0usize;
 
-            let router = self.router.clone();
-            let outcome = router.acquire_with_idempotency(args, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            let resp = match outcome {
-                AcquireOutcome::Ok => {
-                    if had_release && req.emit_release {
-                        self.broadcaster.released(&req.owner_id);
-                    }
-                    AcquireResponse { status: AcquireStatus::Ok as i32, ..Default::default() }
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk?;
+                let chunk_paths = chunk.requests.len() + chunk.release_requests.len();
+                if chunk_paths > MAX_PATHS_PER_REQUEST {
+                    return Err(Status::invalid_argument(format!("too many paths in one streamed chunk (max {MAX_PATHS_PER_REQUEST})")));
                 }
-                AcquireOutcome::Conflict { path, owner, reason } => AcquireResponse {
-                    status: AcquireStatus::Conflict as i32, path, owner, reason,
-                },
-                AcquireOutcome::Lost { path, reason } => AcquireResponse {
-                    status: AcquireStatus::Lost as i32, path, owner: String::new(), reason,
-                },
-            };
+                total_paths = total_paths.checked_add(chunk_paths).ok_or_else(|| Status::invalid_argument("too many paths in acquire stream"))?;
+                if total_paths > MAX_PATHS_PER_STREAMED_ACQUIRE {
+                    return Err(Status::invalid_argument(format!("too many paths in acquire stream (max {MAX_PATHS_PER_STREAMED_ACQUIRE})")));
+                }
+
+                match &mut merged {
+                    Some(base) => Self::merge_acquire_stream_chunk(base, chunk)?,
+                    None => merged = Some(chunk),
+                }
+            }
+
+            let req = merged.ok_or_else(|| Status::invalid_argument("empty acquire stream"))?;
+            let resp = self.handle_acquire_request(req, MAX_PATHS_PER_STREAMED_ACQUIRE).await?;
             Ok(Response::new(resp))
         }).await
     }

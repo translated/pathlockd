@@ -10,8 +10,8 @@ use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::{
     AcquireRequest, AcquireStatus, AssertFencingRequest, AssertStatus, CycleKind,
     DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest, IsOwnerAliveRequest,
-    ListOwnerLocksRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest, RenewStatus,
-    SetWaitEdgeRequest,
+    ListOwnerLocksRequest, LockRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest,
+    RenewStatus, SetWaitEdgeRequest,
 };
 use tonic::transport::Channel;
 
@@ -156,6 +156,70 @@ async fn e2e_acquire_and_release() {
     assert_eq!(resp.status(), AcquireStatus::Ok);
 
     daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
+    let mut daemon = start_daemon().await;
+
+    let requests = (0..1100)
+        .map(|i| LockRequest {
+            path: format!("h:/bulk/{i}"),
+            mode: Mode::Write as i32,
+            state: LockState::New as i32,
+        })
+        .collect::<Vec<_>>();
+
+    let chunks = vec![
+        AcquireRequest {
+            owner_id: "bulk-owner".into(),
+            ttl_ms: 10000,
+            fencing_token: 10,
+            requests: requests[..600].to_vec(),
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: "bulk-acquire".into(),
+        },
+        AcquireRequest {
+            owner_id: String::new(),
+            ttl_ms: 0,
+            fencing_token: 0,
+            requests: requests[600..].to_vec(),
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: String::new(),
+        },
+    ];
+
+    let resp = daemon
+        .client
+        .acquire_stream(tokio_stream::iter(chunks))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Ok);
+
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "blocked-owner".into(),
+            ttl_ms: 10000,
+            fencing_token: 11,
+            requests: vec![LockRequest {
+                path: "h:/bulk/1099".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            emit_release: false,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Conflict);
+    assert_eq!(resp.owner, "bulk-owner");
+    assert_eq!(resp.reason, "write_locked");
 }
 
 #[tokio::test]
