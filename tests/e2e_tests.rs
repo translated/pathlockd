@@ -1,6 +1,6 @@
 //! End-to-end daemon test: starts pathlockd in single-node mode and exercises
 //! the full gRPC API surface — acquire, release, renew, fencing, deadlock
-//! detection, preemption claims, and GC. Verifies correctness end-to-end.
+//! detection, the wait queue + grant events, and GC. Verifies correctness end-to-end.
 
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -111,7 +111,7 @@ async fn e2e_acquire_and_release() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -147,7 +147,7 @@ async fn e2e_acquire_and_release() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -177,7 +177,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
             fencing_token: 10,
             requests: requests[..600].to_vec(),
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: "bulk-acquire".into(),
         },
         AcquireRequest {
@@ -186,7 +186,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
             fencing_token: 0,
             requests: requests[600..].to_vec(),
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         },
     ];
@@ -211,13 +211,13 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.status(), AcquireStatus::Conflict);
+    assert_eq!(resp.status(), AcquireStatus::Queued);
     assert_eq!(resp.owner, "bulk-owner");
     assert_eq!(resp.reason, "write_locked");
 }
@@ -239,7 +239,7 @@ async fn e2e_renew_and_lost() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -274,7 +274,7 @@ async fn e2e_renew_and_lost() {
                 state: LockState::Held as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -301,7 +301,7 @@ async fn e2e_force_release() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -330,7 +330,7 @@ async fn e2e_force_release() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -357,7 +357,7 @@ async fn e2e_fencing_assertion() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -415,7 +415,7 @@ async fn e2e_list_owner_locks() {
                 },
             ],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -452,7 +452,7 @@ async fn e2e_is_owner_alive() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -499,7 +499,7 @@ async fn e2e_detect_cycle() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -517,7 +517,7 @@ async fn e2e_detect_cycle() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -582,7 +582,7 @@ async fn e2e_dump_locks() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -702,7 +702,7 @@ async fn e2e_sigkill_restart_preserves_acknowledged_state() {
                 state: LockState::New as i32,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -734,4 +734,182 @@ async fn e2e_sigkill_restart_preserves_acknowledged_state() {
 
     child2.kill().ok();
     child2.wait().ok();
+}
+
+#[tokio::test]
+async fn e2e_grant_event_wakes_queued_waiter_on_release() {
+    let mut daemon = start_daemon().await;
+
+    // Alice holds h:/a.
+    daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "alice".into(),
+            ttl_ms: 30_000,
+            fencing_token: 1,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap();
+
+    // Bob opens his per-owner event subscription before contending.
+    let mut sub = daemon
+        .client
+        .clone()
+        .subscribe(pathlockd::proto::SubscribeRequest {
+            owner_id: "bob".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Bob's acquire is enqueued (surfaced as a wire conflict for now).
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "bob".into(),
+            ttl_ms: 30_000,
+            fencing_token: 2,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Queued);
+
+    // Alice releases → Bob is granted in place and a GRANT is pushed to him.
+    daemon
+        .client
+        .release(ReleaseLocksRequest {
+            owner_id: "alice".into(),
+            requests: vec![pathlockd::proto::ReleaseRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+            }],
+            del_wait_key: false,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), sub.message())
+        .await
+        .expect("timed out waiting for GRANT event")
+        .expect("subscription stream error")
+        .expect("subscription ended without an event");
+    assert_eq!(
+        event.r#type,
+        pathlockd::proto::EventType::Grant as i32,
+        "expected a GRANT event"
+    );
+    assert_eq!(event.owner_id, "bob");
+
+    // And Bob now actually holds the lock (held re-validation succeeds).
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "bob".into(),
+            ttl_ms: 30_000,
+            fencing_token: 2,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::Held as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.status(),
+        AcquireStatus::Ok,
+        "Bob should hold h:/a after the grant"
+    );
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+}
+
+#[tokio::test]
+async fn e2e_convoy_grants_in_fifo_across_releases() {
+    let mut daemon = start_daemon().await;
+
+    // A holds h:/c.
+    let acq = |owner: &str, fence: i64, state: LockState| AcquireRequest {
+        owner_id: owner.into(),
+        ttl_ms: 30_000,
+        fencing_token: fence,
+        requests: vec![LockRequest {
+            path: "h:/c".into(),
+            mode: Mode::Write as i32,
+            state: state as i32,
+        }],
+        release_requests: vec![],
+        queue_ttl_ms: 0,
+        idempotency_key: String::new(),
+    };
+    let rel = |owner: &str| ReleaseLocksRequest {
+        owner_id: owner.into(),
+        requests: vec![pathlockd::proto::ReleaseRequest {
+            path: "h:/c".into(),
+            mode: Mode::Write as i32,
+        }],
+        del_wait_key: false,
+        idempotency_key: String::new(),
+    };
+
+    assert_eq!(
+        daemon.client.acquire(acq("a", 1, LockState::New)).await.unwrap().into_inner().status(),
+        AcquireStatus::Ok
+    );
+    // Two waiters queue behind A, in order b then c.
+    for (owner, fence) in [("b", 2), ("c", 3)] {
+        assert_eq!(
+            daemon.client.acquire(acq(owner, fence, LockState::New)).await.unwrap().into_inner().status(),
+            AcquireStatus::Queued,
+            "{owner} should be queued behind the holder"
+        );
+    }
+
+    // A releases → B (FIFO head) is granted in place; C stays queued behind B.
+    daemon.client.release(rel("a")).await.unwrap();
+    assert_eq!(
+        daemon.client.acquire(acq("b", 2, LockState::Held)).await.unwrap().into_inner().status(),
+        AcquireStatus::Ok,
+        "B (first waiter) must hold h:/c after A releases"
+    );
+    // C is still waiting (B holds it now) — re-issuing C's acquire re-queues it,
+    // and critically does NOT block B's ownership.
+    assert_eq!(
+        daemon.client.acquire(acq("c", 3, LockState::New)).await.unwrap().into_inner().status(),
+        AcquireStatus::Queued
+    );
+
+    // B releases → C is granted next.
+    daemon.client.release(rel("b")).await.unwrap();
+    assert_eq!(
+        daemon.client.acquire(acq("c", 3, LockState::Held)).await.unwrap().into_inner().status(),
+        AcquireStatus::Ok,
+        "C (second waiter) must hold h:/c after B releases"
+    );
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
 }

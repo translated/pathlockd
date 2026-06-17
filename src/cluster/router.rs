@@ -36,7 +36,7 @@ use tracing::debug;
 use crate::cluster::gossip::MemberMap;
 use crate::cluster::placement::{place_domain, routing_prefix, GroupId, SYS_GROUP};
 use crate::engine::{
-    AcquireArgs, AcquireOutcome, AssertOutcome, ClaimOutcome, CycleOutcome, LockDumpPage,
+    AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockDumpPage,
     OwnedLock, PathInfo, RelReq, RenewOutcome, WaitEdgeMetadata,
 };
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
@@ -631,7 +631,10 @@ impl Router {
     // Lock operations
     // -----------------------------------------------------------------------
 
-    pub async fn acquire(&self, args: AcquireArgs) -> anyhow::Result<AcquireOutcome> {
+    pub async fn acquire(
+        &self,
+        args: AcquireArgs,
+    ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
         self.acquire_with_idempotency(args, None).await
     }
 
@@ -639,7 +642,7 @@ impl Router {
         &self,
         args: AcquireArgs,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<AcquireOutcome> {
+    ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
         let segments = self.routing.routing_prefix_segments;
         let domains: std::collections::HashSet<&str> = args
             .requests
@@ -656,7 +659,7 @@ impl Router {
             return Err(MultiDomainUnsupported.into());
         }
         let Some(domain) = domains.into_iter().next() else {
-            return Ok(AcquireOutcome::Ok);
+            return Ok((AcquireOutcome::Ok, Vec::new()));
         };
         let group = self.group_of_domain(domain);
 
@@ -667,7 +670,8 @@ impl Router {
             )
             .await?
         {
-            ApplyResponse::Acquire(outcome) => Ok(outcome),
+            ApplyResponse::Acquire(outcome) => Ok((outcome, Vec::new())),
+            ApplyResponse::AcquireGranted { outcome, granted } => Ok((outcome, granted)),
             _ => anyhow::bail!("unexpected response type"),
         }
     }
@@ -679,9 +683,20 @@ impl Router {
         owner: &str,
         reqs: &[RelReq],
         del_wait: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         self.release_with_idempotency(owner, reqs, del_wait, None)
             .await
+    }
+
+    /// Collect the owners granted in place across a fan-out's per-group responses.
+    fn collect_granted(responses: Vec<ApplyResponse>) -> Vec<String> {
+        responses
+            .into_iter()
+            .flat_map(|r| match r {
+                ApplyResponse::Granted(g) => g,
+                _ => Vec::new(),
+            })
+            .collect()
     }
 
     pub async fn release_with_idempotency(
@@ -690,9 +705,9 @@ impl Router {
         reqs: &[RelReq],
         del_wait: bool,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         if reqs.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let mut by_group: HashMap<GroupId, Vec<RelReq>> = HashMap::new();
         for req in reqs {
@@ -717,16 +732,16 @@ impl Router {
                 )
             })
             .collect();
-        self.fanout_apply(cmds).await?;
+        let granted = Self::collect_granted(self.fanout_apply(cmds).await?);
         if del_wait {
             self.clear_wait_edge_with_idempotency(owner, idempotency_key)
                 .await?;
         }
-        Ok(())
+        Ok(granted)
     }
 
     /// Release everything an owner holds, in every group.
-    pub async fn release_all(&self, owner: &str, del_wait: bool) -> anyhow::Result<()> {
+    pub async fn release_all(&self, owner: &str, del_wait: bool) -> anyhow::Result<Vec<String>> {
         self.release_all_with_idempotency(owner, del_wait, None)
             .await
     }
@@ -736,7 +751,7 @@ impl Router {
         owner: &str,
         del_wait: bool,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let cmds: Vec<(GroupId, Command)> = self
             .lock_groups()
             .map(|group| {
@@ -752,12 +767,12 @@ impl Router {
                 )
             })
             .collect();
-        self.fanout_apply(cmds).await?;
+        let granted = Self::collect_granted(self.fanout_apply(cmds).await?);
         if del_wait {
             self.clear_wait_edge_with_idempotency(owner, idempotency_key)
                 .await?;
         }
-        Ok(())
+        Ok(granted)
     }
 
     /// Renew the owner's per-group leases.
@@ -847,7 +862,7 @@ impl Router {
     }
 
     /// Forcibly release a victim owner everywhere (admin/deadlock breaker).
-    pub async fn force_release(&self, victim: &str) -> anyhow::Result<()> {
+    pub async fn force_release(&self, victim: &str) -> anyhow::Result<Vec<String>> {
         self.force_release_with_idempotency(victim, None).await
     }
 
@@ -855,7 +870,7 @@ impl Router {
         &self,
         victim: &str,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         let cmds: Vec<(GroupId, Command)> = self
             .lock_groups()
             .map(|group| {
@@ -870,10 +885,10 @@ impl Router {
                 )
             })
             .collect();
-        self.fanout_apply(cmds).await?;
+        let granted = Self::collect_granted(self.fanout_apply(cmds).await?);
         self.clear_wait_edge_with_idempotency(victim, idempotency_key)
             .await?;
-        Ok(())
+        Ok(granted)
     }
 
     /// Propose an arbitrary command on the system group (controller use).
@@ -954,61 +969,6 @@ impl Router {
             idempotency_key,
         );
         self.apply_to(SYS_GROUP, cmd).await?;
-        Ok(())
-    }
-
-    pub async fn set_claim(
-        &self,
-        path: &str,
-        claimant: &str,
-        ttl_ms: u64,
-    ) -> anyhow::Result<ClaimOutcome> {
-        self.set_claim_with_idempotency(path, claimant, ttl_ms, None)
-            .await
-    }
-
-    pub async fn set_claim_with_idempotency(
-        &self,
-        path: &str,
-        claimant: &str,
-        ttl_ms: u64,
-        idempotency_key: Option<&str>,
-    ) -> anyhow::Result<ClaimOutcome> {
-        let group = self.group_of(path);
-        let cmd = self.command_with_idempotency(
-            Op::SetClaim {
-                path: path.to_string(),
-                claimant: claimant.to_string(),
-                ttl_ms,
-            },
-            idempotency_key,
-        );
-        match self.apply_to(group, cmd).await? {
-            ApplyResponse::SetClaim(outcome) => Ok(outcome),
-            _ => anyhow::bail!("unexpected response type"),
-        }
-    }
-
-    pub async fn clear_claim(&self, path: &str, claimant: &str) -> anyhow::Result<()> {
-        self.clear_claim_with_idempotency(path, claimant, None)
-            .await
-    }
-
-    pub async fn clear_claim_with_idempotency(
-        &self,
-        path: &str,
-        claimant: &str,
-        idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
-        let group = self.group_of(path);
-        let cmd = self.command_with_idempotency(
-            Op::ClearClaim {
-                path: path.to_string(),
-                claimant: claimant.to_string(),
-            },
-            idempotency_key,
-        );
-        self.apply_to(group, cmd).await?;
         Ok(())
     }
 
@@ -1359,19 +1319,22 @@ mod tests {
             requests: vec![wr_req("h:/idem")],
             fencing_token: 1,
             release_requests: vec![],
+            queue_ttl_ms: 0,
         };
         assert_eq!(
             router
                 .acquire_with_idempotency(args.clone(), Some("acquire-retry-1"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             AcquireOutcome::Ok
         );
         assert_eq!(
             router
                 .acquire_with_idempotency(args, Some("acquire-retry-1"))
                 .await
-                .unwrap(),
+                .unwrap()
+                .0,
             AcquireOutcome::Ok
         );
 
@@ -1407,9 +1370,11 @@ mod tests {
                         requests: vec![wr_req(path)],
                         fencing_token: 1,
                         release_requests: vec![],
+                        queue_ttl_ms: 0,
                     })
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .0,
                 AcquireOutcome::Ok
             );
         }
@@ -1433,13 +1398,14 @@ mod tests {
             .await
             .expect("probe must round-trip consensus");
 
-        let outcome = router
+        let (outcome, _granted) = router
             .acquire(AcquireArgs {
                 owner_id: "owner-1".into(),
                 ttl_ms: 5_000,
                 requests: vec![wr_req("h:/r")],
                 fencing_token: 1,
                 release_requests: vec![],
+                queue_ttl_ms: 0,
             })
             .await
             .unwrap();
@@ -1469,9 +1435,11 @@ mod tests {
                         requests: vec![wr_req("h:/contended")],
                         fencing_token: 1,
                         release_requests: vec![],
+                        queue_ttl_ms: 0,
                     })
                     .await
                     .unwrap()
+                    .0
             }));
         }
         let mut winners = 0;
@@ -1489,13 +1457,14 @@ mod tests {
 
         // Same owner locks paths in two different routing domains.
         for path in ["alpha:/a", "beta:/b"] {
-            let outcome = router
+            let (outcome, _granted) = router
                 .acquire(AcquireArgs {
                     owner_id: "spanner".into(),
                     ttl_ms: 30_000,
                     requests: vec![wr_req(path)],
                     fencing_token: 1,
                     release_requests: vec![],
+                    queue_ttl_ms: 0,
                 })
                 .await
                 .unwrap();
@@ -1552,6 +1521,7 @@ mod tests {
                     requests: vec![wr_req(&format!("{domain}:/x"))],
                     fencing_token: 1,
                     release_requests: vec![],
+                    queue_ttl_ms: 0,
                 })
                 .await
                 .unwrap();

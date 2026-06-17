@@ -54,8 +54,12 @@ struct SubSender {
 
 impl Registry {
     fn new(capacity: usize) -> anyhow::Result<Arc<Self>> {
-        if capacity == 0 { anyhow::bail!("event_buffer must be > 0"); }
-        if capacity > MAX_SUBSCRIBER_QUEUE { anyhow::bail!("event_buffer too large (max {MAX_SUBSCRIBER_QUEUE})"); }
+        if capacity == 0 {
+            anyhow::bail!("event_buffer must be > 0");
+        }
+        if capacity > MAX_SUBSCRIBER_QUEUE {
+            anyhow::bail!("event_buffer too large (max {MAX_SUBSCRIBER_QUEUE})");
+        }
         Ok(Arc::new(Self {
             subs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
@@ -64,7 +68,9 @@ impl Registry {
     }
 
     fn lock_subs(&self) -> MutexGuard<'_, HashMap<String, Vec<SubSender>>> {
-        self.subs.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.subs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn route(&self, ev: &Event) {
@@ -79,15 +85,25 @@ impl Registry {
     fn register(self: &Arc<Self>, owner: &str) -> Subscription {
         let (tx, rx) = mpsc::channel(self.capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.lock_subs().entry(owner.to_string()).or_default().push(SubSender { id, tx });
-        Subscription { rx, registry: Arc::clone(self), owner: owner.to_string(), id }
+        self.lock_subs()
+            .entry(owner.to_string())
+            .or_default()
+            .push(SubSender { id, tx });
+        Subscription {
+            rx,
+            registry: Arc::clone(self),
+            owner: owner.to_string(),
+            id,
+        }
     }
 
     fn unregister(&self, owner: &str, id: u64) {
         let mut subs = self.lock_subs();
         if let Some(list) = subs.get_mut(owner) {
             list.retain(|s| s.id != id);
-            if list.is_empty() { subs.remove(owner); }
+            if list.is_empty() {
+                subs.remove(owner);
+            }
         }
     }
 }
@@ -143,12 +159,20 @@ impl Broadcaster {
     }
 
     pub fn reconcile_dynamic_peers(&self, endpoints: &[String]) {
-        let mut peers = self.inner.dynamic_peer_txs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut peers = self
+            .inner
+            .dynamic_peer_txs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         peers.retain(|url, _| endpoints.iter().any(|e| e == url));
         for ep in endpoints {
-            if peers.contains_key(ep) { continue; }
+            if peers.contains_key(ep) {
+                continue;
+            }
             match spawn_peer(ep) {
-                Ok(tx) => { peers.insert(ep.clone(), tx); }
+                Ok(tx) => {
+                    peers.insert(ep.clone(), tx);
+                }
                 Err(e) => {
                     tracing::warn!(endpoint = %ep, error = %e, "skipping invalid discovered peer");
                 }
@@ -165,7 +189,11 @@ impl Broadcaster {
         for ptx in &self.inner.static_peer_txs {
             let _ = ptx.try_send(ev.clone());
         }
-        let peers = self.inner.dynamic_peer_txs.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peers = self
+            .inner
+            .dynamic_peer_txs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for ptx in peers.values() {
             let _ = ptx.try_send(ev.clone());
         }
@@ -175,16 +203,25 @@ impl Broadcaster {
         self.inner.registry.route(&ev);
     }
 
-    pub fn released(&self, owner: &str) {
-        self.publish_local(Event { r#type: EventType::Released as i32, owner_id: owner.to_string() });
-    }
-
     pub fn killed(&self, owner: &str) {
-        self.publish_local(Event { r#type: EventType::Killed as i32, owner_id: owner.to_string() });
+        self.publish_local(Event {
+            r#type: EventType::Killed as i32,
+            owner_id: owner.to_string(),
+        });
     }
 
     pub fn revoke(&self, owner: &str) {
-        self.publish_local(Event { r#type: EventType::Revoke as i32, owner_id: owner.to_string() });
+        self.publish_local(Event {
+            r#type: EventType::Revoke as i32,
+            owner_id: owner.to_string(),
+        });
+    }
+
+    pub fn grant(&self, owner: &str) {
+        self.publish_local(Event {
+            r#type: EventType::Grant as i32,
+            owner_id: owner.to_string(),
+        });
     }
 }
 
@@ -193,7 +230,10 @@ async fn peer_forwarder(channel: Channel, mut rx: mpsc::Receiver<Event>) {
     while let Some(ev) = rx.recv().await {
         let owner_id = ev.owner_id.clone();
         let event_type = ev.r#type;
-        if let Err(e) = client.publish_event(PublishEventRequest { event: Some(ev) }).await {
+        if let Err(e) = client
+            .publish_event(PublishEventRequest { event: Some(ev) })
+            .await
+        {
             tracing::debug!(owner_id = %owner_id, event_type, error = %e, "peer event forward failed");
         }
     }
@@ -213,9 +253,15 @@ mod tests {
     #[tokio::test]
     async fn reconcile_dynamic_peers_adds_and_removes() {
         let b = Broadcaster::new(8, &[]).unwrap();
-        b.reconcile_dynamic_peers(&["http://10.0.0.1:50051".into(), "http://10.0.0.2:50051".into()]);
+        b.reconcile_dynamic_peers(&[
+            "http://10.0.0.1:50051".into(),
+            "http://10.0.0.2:50051".into(),
+        ]);
         assert_eq!(b.inner.dynamic_peer_txs.lock().unwrap().len(), 2);
-        b.reconcile_dynamic_peers(&["http://10.0.0.2:50051".into(), "http://10.0.0.3:50051".into()]);
+        b.reconcile_dynamic_peers(&[
+            "http://10.0.0.2:50051".into(),
+            "http://10.0.0.3:50051".into(),
+        ]);
         let peers = b.inner.dynamic_peer_txs.lock().unwrap();
         assert_eq!(peers.len(), 2);
         assert!(peers.contains_key("http://10.0.0.2:50051"));

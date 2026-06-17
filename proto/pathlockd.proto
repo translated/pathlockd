@@ -8,7 +8,7 @@ package pathlockd.v1;
 //
 // Each lock is owned by a caller-supplied owner id, leases a set of hierarchical
 // paths (read or write), renews its lease to stay alive, and observes lifecycle
-// events (release / kill / revoke) for its own owner id over a server stream.
+// events (kill / revoke) for its own owner id over a server stream.
 // The RPCs below are the complete primitive surface; higher-level orchestration
 // (renewal cadence, contention waiting, deadlock resolution policy) lives in the
 // client.
@@ -56,16 +56,25 @@ message AcquireRequest {
   int64 fencing_token = 4;
   // Releases folded into the same atomic transaction (shadowing transitions).
   repeated ReleaseRequest release_requests = 5;
-  // When true and releases were applied, publish a RELEASED event for owner_id.
-  bool emit_release = 6;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 7;
+  // If this acquire is queued (contended), how long its wait-queue entry lives
+  // without being granted — the caller's own acquire deadline. 0 selects a
+  // server default. Lets an abandoned waiter self-evict at the client's
+  // threshold rather than a fixed server TTL.
+  uint64 queue_ttl_ms = 8;
+  reserved 6; // was emit_release (RELEASED events removed)
 }
 
 enum AcquireStatus {
   ACQUIRE_STATUS_OK = 0;
   ACQUIRE_STATUS_CONFLICT = 1;
   ACQUIRE_STATUS_LOST = 2;
+  // The request was enqueued in the wait queue (contended). It will be granted
+  // in place when the contended path frees; the caller waits for a GRANT event
+  // rather than retrying. `path`/`owner`/`reason` describe what it is queued
+  // behind (same fields as a conflict).
+  ACQUIRE_STATUS_QUEUED = 3;
 }
 
 message AcquireResponse {
@@ -259,65 +268,15 @@ message IsOwnerAliveResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Claims (anti-starvation path reservations)
-//
-// A claim reserves a path for a claimant without granting the lock: new
-// acquires by other owners that overlap the claimed path (exact, ancestor, or
-// — for write requests — descendant) are refused with `preempt_claimed` while
-// existing holders drain. The claimant's own acquire consumes its claim
-// atomically on grant. Claims are TTL-governed only — they never require the
-// claimant to hold a lease, so a pure waiter (holding nothing yet) can reserve
-// the path it is queued for; a crashed claimant's reservation simply expires.
-// ---------------------------------------------------------------------------
-
-message SetClaimRequest {
-  // Path form "<handlerType>:<normalizedPath>".
-  string path = 1;
-  string claimant_owner_id = 2;
-  // Reservation TTL; 0 selects a short server default. Capped at the server's
-  // max claim TTL. Refreshing one's own claim re-arms the TTL.
-  uint64 ttl_ms = 3;
-  // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 4;
-}
-
-enum SetClaimStatus {
-  SET_CLAIM_STATUS_OK = 0;
-  // Another live claimant already reserves this path: the claim was NOT
-  // overwritten (claim-if-absent semantics). claim_owner names the holder.
-  SET_CLAIM_STATUS_HELD = 1;
-}
-
-message SetClaimResponse {
-  SetClaimStatus status = 1;
-  // The current claimant when status is HELD; empty on OK.
-  string claim_owner = 2;
-}
-
-message ClearClaimRequest {
-  string path = 1;
-  // Only this claimant's own claim is cleared; a foreign claim is untouched.
-  string claimant_owner_id = 2;
-  // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 3;
-}
-
-message ClearClaimResponse {}
-
-// ---------------------------------------------------------------------------
 // Cooperative revoke (publish a REVOKE event for an owner)
 // ---------------------------------------------------------------------------
 
 message RequestRevokeRequest {
   string owner_id = 1;
-  // Optional preemption claim. When claim_path and claimant_owner_id are both
-  // set, the daemon reserves claim_path for claimant_owner_id (for
-  // claim_ttl_ms, or a short default when 0) before publishing the REVOKE, so
-  // the revoked victim cannot re-acquire the path before the winner does.
-  // Omitting them yields the legacy pure-notification behavior.
-  string claim_path = 2;
-  string claimant_owner_id = 3;
-  uint64 claim_ttl_ms = 4;
+  // 2,3,4 were a preemption claim (claim_path / claimant_owner_id /
+  // claim_ttl_ms), removed: the wait queue's FIFO admission keeps the revoked
+  // victim queued behind the winner, so no reservation is needed.
+  reserved 2, 3, 4;
 }
 
 message RequestRevokeResponse {}
@@ -326,15 +285,19 @@ message RequestRevokeResponse {}
 // Event stream — scoped to a single owner.
 //
 // A subscription is bound to exactly one owner id and receives ONLY that owner's
-// lifecycle events: a cooperative REVOKE request, a forced KILL, or its own
-// RELEASED notification. Nothing about any other owner is delivered on the
-// stream — a lock's channel carries only that lock's information.
+// lifecycle events: a cooperative REVOKE request, a forced KILL, or a GRANT of
+// its queued acquire. Nothing about any other owner is delivered on the stream
+// — a lock's channel carries only that lock's information.
 // ---------------------------------------------------------------------------
 
 enum EventType {
-  EVENT_TYPE_RELEASED = 0;
+  // No event; never emitted. Present only as the proto3 zero default.
+  EVENT_TYPE_UNSPECIFIED = 0;
   EVENT_TYPE_KILLED = 1;
   EVENT_TYPE_REVOKE = 2;
+  // The owner's queued acquire was granted in place: it now holds the lock and
+  // can stop waiting (delivered to the owner whose request was granted).
+  EVENT_TYPE_GRANT = 3;
 }
 
 message SubscribeRequest {
@@ -383,8 +346,8 @@ message InspectPathResponse {
   bool has_fence = 3;
   // The persisted fencing token. Meaningful only when has_fence is true.
   int64 fence = 4;
-  // Live preemption claimant reserving this path for an in-flight revoke, or
-  // empty if none.
+  // Retained for wire compatibility; always empty (path claims were removed in
+  // favour of the wait queue).
   string claim_owner = 5;
 }
 
@@ -464,8 +427,6 @@ service PathLock {
   rpc IncrFencingToken(IncrFencingTokenRequest) returns (IncrFencingTokenResponse);
   rpc SetWaitEdge(SetWaitEdgeRequest) returns (SetWaitEdgeResponse);
   rpc ClearWaitEdge(ClearWaitEdgeRequest) returns (ClearWaitEdgeResponse);
-  rpc SetClaim(SetClaimRequest) returns (SetClaimResponse);
-  rpc ClearClaim(ClearClaimRequest) returns (ClearClaimResponse);
   rpc IsOwnerAlive(IsOwnerAliveRequest) returns (IsOwnerAliveResponse);
   rpc RequestRevoke(RequestRevokeRequest) returns (RequestRevokeResponse);
 

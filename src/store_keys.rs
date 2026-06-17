@@ -49,6 +49,10 @@ pub const EXPIRY_INDEX_QUANTUM_MS: u64 = 3_600_000;
 
 pub const META_FENCE_COUNTER_KEY: &[u8] = b"fence_counter";
 pub const META_GC_CURSOR_KEY: &[u8] = b"gc_cursor";
+/// Per-group monotonic counter handing out FIFO sequence numbers to wait-queue
+/// entries. Bumped deterministically in the apply path, so every replica
+/// assigns identical ordering (= Raft log order).
+pub const META_QUEUE_SEQ_KEY: &[u8] = b"queue_seq";
 pub const META_LAST_NOW_KEY: &[u8] = b"last_now_ms";
 pub const META_VOTE_KEY: &[u8] = b"raft_vote";
 pub const META_COMMITTED_KEY: &[u8] = b"raft_committed";
@@ -107,6 +111,13 @@ pub const CF_EXPIRY: &str = "expiry";
 /// Request-id → cached ApplyResponse, so a command retried after an
 /// ambiguous timeout (e.g. re-forwarded after a leader change) applies once.
 pub const CF_DEDUPE: &str = "request_dedupe";
+/// Persisted FIFO wait queue. Two key shapes share the CF, disambiguated by a
+/// 1-byte tag: entry keys (`'e' ++ be_u64(seq)`) hold the serialized waiter
+/// (owner + full AcquireArgs) and iterate in seq order; owner keys
+/// (`'o' ++ owner`) map an owner to its seq for O(1) dequeue/dedupe. Entries
+/// are TTL-governed (GC-reaped), so an abandoned waiter — or one stranded by a
+/// whole-cluster shutdown — self-evicts and can never wedge a path.
+pub const CF_QUEUE: &str = "lock_queue";
 
 /// All state-machine column families (excluding CF_RAFT_LOG and CF_META which
 /// are owned by openraft's storage wrappers).
@@ -123,6 +134,9 @@ pub const STATE_CFS: &[&str] = &[
     CF_WAIT_EDGES,
     CF_EXPIRY,
     CF_DEDUPE,
+    // Appended last: snapshot frames index into STATE_CFS by position, so new
+    // CFs must extend the tail to keep existing frame encodings stable.
+    CF_QUEUE,
 ];
 
 /// All column families including raft internals.
@@ -142,6 +156,7 @@ pub const ALL_CFS: &[&str] = &[
     CF_WAIT_EDGES,
     CF_EXPIRY,
     CF_DEDUPE,
+    CF_QUEUE,
 ];
 
 // --- key encoding ---
@@ -208,6 +223,48 @@ pub fn claimdesc_key(anc: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(anc.len() + 1);
     buf.extend_from_slice(anc.as_bytes());
     buf.push(0);
+    buf
+}
+
+// --- wait-queue key encoding (CF_QUEUE) ---
+
+/// 1-byte tag distinguishing the two key shapes that share `CF_QUEUE`.
+const QUEUE_ENTRY_TAG: u8 = b'e';
+const QUEUE_OWNER_TAG: u8 = b'o';
+
+/// Queue entry key: `'e' ++ be_u64(seq)`. Big-endian seq makes a prefix scan
+/// of all entry keys iterate in FIFO (ascending seq) order.
+pub fn queue_entry_key(seq: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8);
+    buf.push(QUEUE_ENTRY_TAG);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+/// Inclusive lower / exclusive upper bound covering every entry key, for an
+/// ordered `scan_merged` over the whole queue.
+pub fn queue_entry_lower() -> Vec<u8> {
+    vec![QUEUE_ENTRY_TAG]
+}
+pub fn queue_entry_upper() -> Vec<u8> {
+    vec![QUEUE_ENTRY_TAG + 1]
+}
+
+/// Decode the seq from a queue entry key, or `None` if it is not one.
+pub fn decode_queue_entry_seq(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key[0] != QUEUE_ENTRY_TAG {
+        return None;
+    }
+    Some(u64::from_be_bytes([
+        key[1], key[2], key[3], key[4], key[5], key[6], key[7], key[8],
+    ]))
+}
+
+/// Owner → seq index key: `'o' ++ owner`, for O(1) dequeue/dedupe.
+pub fn queue_owner_key(owner: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + owner.len());
+    buf.push(QUEUE_OWNER_TAG);
+    buf.extend_from_slice(owner.as_bytes());
     buf
 }
 

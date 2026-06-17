@@ -12,8 +12,7 @@ use std::time::Duration;
 use pathlockd::cluster::placement::SYS_GROUP;
 use pathlockd::cluster::router::{Router, RoutingOptions};
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, ClaimOutcome, CycleOutcome, LockReq, Mode, State,
-    WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, CycleOutcome, LockReq, Mode, State, WaitEdgeMetadata,
 };
 use pathlockd::raft::log_store::FsyncBatcher;
 use pathlockd::raft::manager::{raft_config, RaftGroups};
@@ -60,7 +59,7 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
 }
 
 async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str) {
-    let outcome = router
+    let (outcome, _granted) = router
         .acquire(AcquireArgs {
             owner_id: owner.into(),
             ttl_ms,
@@ -71,6 +70,7 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
             }],
             fencing_token: fence,
             release_requests: vec![],
+            queue_ttl_ms: 0,
         })
         .await
         .unwrap();
@@ -89,36 +89,6 @@ async fn edge(router: &Router, owner: &str, blocker: &str, meta: Option<(&str, &
         .set_wait_edge(owner, blocker, 60_000, metadata.as_ref())
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn cycle_detection_traverses_pure_waiter_claim_edges() {
-    let (router, _dir) = test_router().await;
-
-    // Holder "bob" holds h:/a/b and is blocked by pure-waiter "alice"'s claim
-    // on h:/a (he wants to extend upward). Alice, in turn, waits on Bob's
-    // held descendant lock. Alice holds NOTHING (no ALIVE record): the cycle
-    // walk must still traverse the claim edge via is_blocking instead of
-    // pruning it on the liveness probe.
-    lock(&router, "bob", 60_000, 1, "h:/a/b").await;
-    let claim = router.set_claim("h:/a", "alice", 60_000).await.unwrap();
-    assert!(matches!(claim, ClaimOutcome::Ok));
-
-    edge(
-        &router,
-        "alice",
-        "bob",
-        Some(("h:/a/b", "descendant_write_locked")),
-    )
-    .await;
-    edge(&router, "bob", "alice", Some(("h:/a", "preempt_claimed"))).await;
-
-    match router.detect_cycle("alice", 16).await.unwrap() {
-        CycleOutcome::Cycle(chain) => {
-            assert_eq!(chain, vec!["alice".to_string(), "bob".to_string()])
-        }
-        other => panic!("expected Cycle, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -155,7 +125,10 @@ async fn detect_cycle_truncated_at_max_depth() {
 
     match router.detect_cycle("a", 2).await.unwrap() {
         CycleOutcome::Truncated(chain) => {
-            assert_eq!(chain, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+            assert_eq!(
+                chain,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
         }
         other => panic!("expected Truncated, got {other:?}"),
     }

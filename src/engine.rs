@@ -14,13 +14,11 @@
 use tracing::warn;
 
 use crate::store_keys::{
-    alive_key, claim_key, claimdesc_key, fence_key, own_prefix, rd_prefix, rddesc_prefix, wait_key,
-    wr_key, wrdesc_key, FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
+    alive_key, fence_key, own_prefix, rd_prefix, rddesc_prefix, wait_key, wr_key, wrdesc_key,
+    FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
 
-use crate::store_keys::CF_CLAIMS as CLAIM_CF;
-use crate::store_keys::CF_DESC_CLAIM as CLAIMDESC_CF;
 use crate::store_keys::CF_DESC_READ as RDDESC_CF;
 use crate::store_keys::CF_DESC_WRITE as WRDESC_CF;
 use crate::store_keys::CF_FENCES as FENCE_CF;
@@ -31,7 +29,6 @@ use crate::store_keys::CF_WAIT_EDGES as WAIT_CF;
 use crate::store_keys::CF_WRITE_LOCKS as WR_CF;
 
 const SCAN_WARN_THRESHOLD: usize = 1024;
-const CLAIM_DEFAULT_TTL_MS: u64 = 3000;
 
 /// Page size for owner-wide cleanup scans (`release_all`, `force_release`).
 const RELEASE_PAGE: usize = 4096;
@@ -43,8 +40,6 @@ const RELEASE_PAGE: usize = 4096;
 /// descendant-index removals) accumulate in a single WriteBatch + overlay
 /// held in memory and applied synchronously by every replica's apply loop.
 const MAX_RELEASE_MEMBERS: usize = 1 << 16;
-
-pub const REASON_PREEMPT_CLAIMED: &str = "preempt_claimed";
 
 // ---------------------------------------------------------------------------
 // Public value types
@@ -91,6 +86,11 @@ pub struct AcquireArgs {
     pub requests: Vec<LockReq>,
     pub fencing_token: i64,
     pub release_requests: Vec<RelReq>,
+    /// If this acquire is queued, how long its wait-queue entry lives without
+    /// being granted — the client's own acquire deadline. `0` selects a server
+    /// default. Bounds an abandoned waiter so it self-evicts at the client's
+    /// threshold instead of lingering on a fixed server TTL.
+    pub queue_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,6 +103,17 @@ pub enum AcquireOutcome {
     },
     Lost {
         path: String,
+        reason: String,
+    },
+    /// Like `Conflict`, but the request was *enqueued* in the wait queue rather
+    /// than refused: it will be granted in place once the contended path frees.
+    /// Carries the same `(path, owner, reason)` as the conflict that parked it,
+    /// so the wire response is identical to a conflict for clients that have not
+    /// yet adopted grant events. The engine never returns this — it is produced
+    /// by the apply-layer queue wiring in `state_machine`.
+    Queued {
+        path: String,
+        owner: String,
         reason: String,
     },
 }
@@ -124,16 +135,6 @@ pub enum CycleOutcome {
     None,
     Cycle(Vec<String>),
     Truncated(Vec<String>),
-}
-
-/// Outcome of planting a claim (claim-if-absent semantics).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ClaimOutcome {
-    Ok,
-    /// Another live claimant already reserves the path; nothing was written.
-    Held {
-        claimant: String,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -215,48 +216,6 @@ fn get_live_write_owner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<O
     tx.del(WR_CF, &wr_key(path))?;
     remove_descendant_indexes(tx, Mode::Write, path)?;
     Ok(None)
-}
-
-/// Claims are TTL-governed only: a claim is live until its key expires,
-/// independent of any liveness lease. This is deliberate — the claimant is
-/// typically a *waiter* that holds nothing yet (so it has no ALIVE record),
-/// and a crashed claimant's reservation self-expires within the claim TTL.
-fn get_live_claim<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<String>> {
-    tx.get_str(CLAIM_CF, &claim_key(path))
-}
-
-fn find_blocking_claim<T: StoreTxn>(
-    tx: &mut T,
-    owner: &str,
-    path: &str,
-) -> anyhow::Result<Option<AcquireOutcome>> {
-    if let Some(claimant) = get_live_claim(tx, path)? {
-        if claimant != *owner {
-            return Ok(Some(conflict(path, &claimant, REASON_PREEMPT_CLAIMED)));
-        }
-    }
-    for anc in get_ancestors(path) {
-        if let Some(claimant) = get_live_claim(tx, &anc)? {
-            if claimant != *owner {
-                return Ok(Some(conflict(&anc, &claimant, REASON_PREEMPT_CLAIMED)));
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn add_claim_indexes<T: StoreTxn>(tx: &mut T, path: &str, ttl_ms: u64) -> anyhow::Result<()> {
-    for anc in get_ancestors(path) {
-        tx.sadd(CLAIMDESC_CF, &claimdesc_key(&anc), path, ttl_ms)?;
-    }
-    Ok(())
-}
-
-fn remove_claim_indexes<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<()> {
-    for anc in get_ancestors(path) {
-        tx.srem(CLAIMDESC_CF, &claimdesc_key(&anc), path)?;
-    }
-    Ok(())
 }
 
 fn add_descendant_indexes<T: StoreTxn>(
@@ -348,58 +307,6 @@ fn find_descendant_read_conflict<T: StoreTxn>(
     Ok(None)
 }
 
-fn find_descendant_claim_conflict<T: StoreTxn>(
-    tx: &mut T,
-    owner_id: &str,
-    path: &str,
-) -> anyhow::Result<Option<AcquireOutcome>> {
-    let idx = claimdesc_key(path);
-    let candidates = tx.smembers_limited(CLAIMDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
-    if candidates.len() > SCAN_WARN_THRESHOLD {
-        warn!(key = ?path, count = candidates.len(), "large claimdesc scan");
-    }
-    for candidate in candidates {
-        match get_live_claim(tx, &candidate)? {
-            None => {
-                tx.srem(CLAIMDESC_CF, &idx, &candidate)?;
-                remove_claim_indexes(tx, &candidate)?;
-            }
-            Some(claimant) if claimant != owner_id => {
-                return Ok(Some(conflict(
-                    &candidate,
-                    &claimant,
-                    REASON_PREEMPT_CLAIMED,
-                )));
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(None)
-}
-
-fn remove_owned_descendant_claims<T: StoreTxn>(
-    tx: &mut T,
-    owner_id: &str,
-    path: &str,
-) -> anyhow::Result<()> {
-    let idx = claimdesc_key(path);
-    let candidates = tx.smembers_limited(CLAIMDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
-    for candidate in candidates {
-        match get_live_claim(tx, &candidate)? {
-            None => {
-                tx.srem(CLAIMDESC_CF, &idx, &candidate)?;
-                remove_claim_indexes(tx, &candidate)?;
-            }
-            Some(claimant) if claimant == owner_id => {
-                tx.del(CLAIM_CF, &claim_key(&candidate))?;
-                remove_claim_indexes(tx, &candidate)?;
-            }
-            Some(_) => {}
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // ACQUIRE
 // ---------------------------------------------------------------------------
@@ -463,13 +370,7 @@ pub fn acquire_inner<T: StoreTxn>(
                         return Ok(conflict(path, &wr_owner, "write_locked"));
                     }
                 }
-                if let Some(outcome) = find_blocking_claim(tx, owner, path)? {
-                    return Ok(outcome);
-                }
                 if req.mode == Mode::Write {
-                    if let Some(outcome) = find_descendant_claim_conflict(tx, owner, path)? {
-                        return Ok(outcome);
-                    }
                     let rd_owners = prune_dead_read_owners(tx, path)?;
                     if rd_owners.is_empty() {
                         remove_descendant_indexes(tx, Mode::Read, path)?;
@@ -515,12 +416,6 @@ pub fn acquire_inner<T: StoreTxn>(
         let member = format!("{}:{}", req.mode.as_str(), path);
         tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
 
-        let claim_k = claim_key(path);
-        if tx.get_str(CLAIM_CF, &claim_k)?.as_deref() == Some(owner.as_str()) {
-            tx.del(CLAIM_CF, &claim_k)?;
-            remove_claim_indexes(tx, path)?;
-        }
-
         if req.mode == Mode::Write {
             let wr_k = wr_key(path);
             let fence_k = fence_key(path);
@@ -547,7 +442,6 @@ pub fn acquire_inner<T: StoreTxn>(
                     }
                 }
             }
-            remove_owned_descendant_claims(tx, owner, path)?;
         } else {
             let rd_pfx = rd_prefix(path);
             tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
@@ -966,10 +860,6 @@ pub fn is_blocking_inner<T: StoreTxn>(
     conflict_owner: &str,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    if reason == REASON_PREEMPT_CLAIMED {
-        return Ok(get_live_claim(tx, conflict_path)?.as_deref() == Some(conflict_owner));
-    }
-
     let is_read = reason == "read_locked" || reason == "descendant_read_locked";
 
     if is_read {
@@ -1007,45 +897,6 @@ pub fn set_wait_edge_inner<T: StoreTxn>(
 
 pub fn clear_wait_edge_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<()> {
     tx.del(WAIT_CF, &wait_key(owner))
-}
-
-/// Plant a claim with claim-if-absent semantics: a live claim by another
-/// claimant is never overwritten (it is returned instead), while re-planting
-/// one's own claim re-arms its TTL.
-pub fn set_claim_inner<T: StoreTxn>(
-    tx: &mut T,
-    path: &str,
-    claimant: &str,
-    ttl_ms: u64,
-) -> anyhow::Result<ClaimOutcome> {
-    let ttl = if ttl_ms == 0 {
-        CLAIM_DEFAULT_TTL_MS
-    } else {
-        ttl_ms
-    };
-    if let Some(current) = get_live_claim(tx, path)? {
-        if current != claimant {
-            return Ok(ClaimOutcome::Held { claimant: current });
-        }
-    }
-    tx.set_str(CLAIM_CF, &claim_key(path), claimant, ttl)?;
-    add_claim_indexes(tx, path, ttl)?;
-    Ok(ClaimOutcome::Ok)
-}
-
-/// Clear a claimant's own claim. A foreign claim is left untouched, so a
-/// late/duplicated clear can never erase a competitor's reservation.
-pub fn clear_claim_inner<T: StoreTxn>(
-    tx: &mut T,
-    path: &str,
-    claimant: &str,
-) -> anyhow::Result<()> {
-    let claim_k = claim_key(path);
-    if tx.get_str(CLAIM_CF, &claim_k)?.as_deref() == Some(claimant) {
-        tx.del(CLAIM_CF, &claim_k)?;
-        remove_claim_indexes(tx, path)?;
-    }
-    Ok(())
 }
 
 pub fn is_owner_alive_inner<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<bool> {
@@ -1100,15 +951,13 @@ pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
 
     let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?);
 
-    // Claims are TTL-governed only; an unexpired claim is live regardless of
-    // whether the claimant holds a lease (pure waiters hold nothing).
-    let claim_owner = tx.get_str(CLAIM_CF, &claim_key(path))?;
-
     Ok(PathInfo {
         write_owner,
         read_owners,
         fence,
-        claim_owner,
+        // Path claims were removed in favour of the wait queue; retained on the
+        // inspection struct (always None) for wire/API stability.
+        claim_owner: None,
     })
 }
 

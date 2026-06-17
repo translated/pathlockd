@@ -32,15 +32,30 @@ fn open_temp_db() -> (Arc<rocksdb::DB>, tempfile::TempDir) {
 }
 
 fn wr(path: &str) -> LockReq {
-    LockReq { path: path.to_string(), mode: Mode::Write, state: State::New }
+    LockReq {
+        path: path.to_string(),
+        mode: Mode::Write,
+        state: State::New,
+    }
 }
 
 fn rd(path: &str) -> LockReq {
-    LockReq { path: path.to_string(), mode: Mode::Read, state: State::New }
+    LockReq {
+        path: path.to_string(),
+        mode: Mode::Read,
+        state: State::New,
+    }
 }
 
 fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) -> AcquireArgs {
-    AcquireArgs { owner_id: owner.to_string(), ttl_ms, requests: reqs, fencing_token: fence_token, release_requests: vec![] }
+    AcquireArgs {
+        owner_id: owner.to_string(),
+        ttl_ms,
+        requests: reqs,
+        fencing_token: fence_token,
+        release_requests: vec![],
+        queue_ttl_ms: 0,
+    }
 }
 
 fn apply(db: &Arc<rocksdb::DB>, cmd: Command) -> ApplyResponse {
@@ -65,12 +80,23 @@ fn high_domain_cardinality_throughput() {
 
         for op in 0..ops_per_domain {
             let path = format!("{domain}:/file-{op}");
-            let resp = apply(&db, Command {
-                request_id: None, now_ms: now,
-                op: Op::Acquire(acquire_args(&owner, 10_000, (d * ops_per_domain + op + 1) as i64, vec![wr(&path)])),
-            });
-            assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
-                "failed at domain {domain} op {op}");
+            let resp = apply(
+                &db,
+                Command {
+                    request_id: None,
+                    now_ms: now,
+                    op: Op::Acquire(acquire_args(
+                        &owner,
+                        10_000,
+                        (d * ops_per_domain + op + 1) as i64,
+                        vec![wr(&path)],
+                    )),
+                },
+            );
+            assert!(
+                matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+                "failed at domain {domain} op {op}"
+            );
         }
     }
 
@@ -80,7 +106,8 @@ fn high_domain_cardinality_throughput() {
 
     println!(
         "high_domain_cardinality: {total_ops} ops in {:.2}s = {:.0} ops/sec",
-        elapsed.as_secs_f64(), ops_per_sec
+        elapsed.as_secs_f64(),
+        ops_per_sec
     );
 
     // No strict performance threshold, just verify completion
@@ -101,10 +128,14 @@ fn hot_subtree_contention_rate() {
     let mut successes = 0u64;
 
     // First, one owner locks the root of the hot domain
-    apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("root-owner", 60_000, 1, vec![wr("hot:/")])),
-    });
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: Op::Acquire(acquire_args("root-owner", 60_000, 1, vec![wr("hot:/")])),
+        },
+    );
 
     let started = Instant::now();
 
@@ -114,14 +145,25 @@ fn hot_subtree_contention_rate() {
         for op in 0..ops {
             let path = format!("hot:/sub-{op}");
 
-            let resp = apply(&db, Command {
-                request_id: None, now_ms: now,
-                op: Op::Acquire(acquire_args(&owner, 5_000, (o * ops + op + 2) as i64, vec![wr(&path)])),
-            });
+            let resp = apply(
+                &db,
+                Command {
+                    request_id: None,
+                    now_ms: now,
+                    op: Op::Acquire(acquire_args(
+                        &owner,
+                        5_000,
+                        (o * ops + op + 2) as i64,
+                        vec![wr(&path)],
+                    )),
+                },
+            );
 
             match resp {
                 ApplyResponse::Acquire(AcquireOutcome::Ok) => successes += 1,
-                ApplyResponse::Acquire(AcquireOutcome::Conflict { .. }) => conflicts += 1,
+                ApplyResponse::Acquire(
+                    AcquireOutcome::Conflict { .. } | AcquireOutcome::Queued { .. },
+                ) => conflicts += 1,
                 _ => {}
             }
         }
@@ -154,12 +196,18 @@ fn read_heavy_workload() {
     for r in 0..readers {
         let owner = format!("reader-{r}");
 
-        let resp = apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
-        });
-        assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
-            "reader {r} should get shared read lock");
+        let resp = apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
+            },
+        );
+        assert!(
+            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+            "reader {r} should get shared read lock"
+        );
     }
 
     let elapsed = started.elapsed();
@@ -190,19 +238,29 @@ fn read_write_mixed_conflict_rate() {
     // 10 readers acquire the read lock
     for r in 0..10 {
         let owner = format!("r-{r}");
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
+            },
+        );
     }
 
     // A writer tries to acquire — should conflict with readers
-    let resp = apply(&db, Command {
-        request_id: None, now_ms: now,
-        op: Op::Acquire(acquire_args("writer", 10_000, 1, vec![wr(path)])),
-    });
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) if reason == "read_locked"),
-        "writer should be blocked by readers");
+    let resp = apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: Op::Acquire(acquire_args("writer", 10_000, 1, vec![wr(path)])),
+        },
+    );
+    assert!(
+        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. }) if reason == "read_locked"),
+        "writer should be blocked by readers"
+    );
 
     // Reader count exceeds what we can scan, but all should be alive
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
@@ -227,20 +285,36 @@ fn acquire_release_throughput() {
         let path = format!("t:/f-{c}");
 
         // Acquire
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(acquire_args(&owner, 10_000, (c + 1) as i64, vec![wr(&path)])),
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(acquire_args(
+                    &owner,
+                    10_000,
+                    (c + 1) as i64,
+                    vec![wr(&path)],
+                )),
+            },
+        );
 
         // Release
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Release {
-                owner,
-                reqs: vec![RelReq { path, mode: Mode::Write }],
-                del_wait: false,
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Release {
+                    owner,
+                    reqs: vec![RelReq {
+                        path,
+                        mode: Mode::Write,
+                    }],
+                    del_wait: false,
+                },
             },
-        });
+        );
     }
 
     let elapsed = started.elapsed();
@@ -266,27 +340,52 @@ fn gc_reclaims_expired_locks() {
     // Create short-lived locks (1ms TTL)
     for i in 0..ephemeral_count {
         let owner = format!("eph-{i}");
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(acquire_args(&owner, 1, (i + 1) as i64, vec![wr(&format!("gc:/e-{i}"))])),
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(acquire_args(
+                    &owner,
+                    1,
+                    (i + 1) as i64,
+                    vec![wr(&format!("gc:/e-{i}"))],
+                )),
+            },
+        );
     }
 
     // Create long-lived locks
     for i in 0..permanent_count {
         let owner = format!("perm-{i}");
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(acquire_args(&owner, 300_000, (ephemeral_count + i + 1) as i64, vec![wr(&format!("gc:/p-{i}"))])),
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(acquire_args(
+                    &owner,
+                    300_000,
+                    (ephemeral_count + i + 1) as i64,
+                    vec![wr(&format!("gc:/p-{i}"))],
+                )),
+            },
+        );
     }
 
     // Run GC sweep after all ephemeral locks have expired
     let future = now + 100;
-    apply(&db, Command {
-        request_id: None, now_ms: future,
-        op: Op::GcSweep { now_ms: future, batch: 1024 },
-    });
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: future,
+            op: Op::GcSweep {
+                now_ms: future,
+                batch: 1024,
+            },
+        },
+    );
 
     // Verify: ephemeral owners are dead, permanent owners are alive
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, future + 1);
@@ -297,7 +396,10 @@ fn gc_reclaims_expired_locks() {
             expired += 1;
         }
     }
-    assert_eq!(expired, ephemeral_count, "all ephemeral locks should have expired");
+    assert_eq!(
+        expired, ephemeral_count,
+        "all ephemeral locks should have expired"
+    );
 
     let mut alive_after_gc = 0u32;
     for i in 0..permanent_count {
@@ -305,7 +407,10 @@ fn gc_reclaims_expired_locks() {
             alive_after_gc += 1;
         }
     }
-    assert_eq!(alive_after_gc, permanent_count, "all permanent locks should survive GC");
+    assert_eq!(
+        alive_after_gc, permanent_count,
+        "all permanent locks should survive GC"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -321,10 +426,14 @@ fn fencing_token_increment_throughput() {
     let mut last = 0i64;
 
     for _ in 0..increments {
-        let resp = apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::IncrFence,
-        });
+        let resp = apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::IncrFence,
+            },
+        );
         if let ApplyResponse::IncrFence(t) = resp {
             assert!(t > last);
             last = t;
@@ -353,20 +462,25 @@ fn many_owner_release_all_throughput() {
     // Each owner acquires 3 locks
     for o in 0..owners {
         let owner = format!("fan-{o}");
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::Acquire(AcquireArgs {
-                owner_id: owner.clone(),
-                ttl_ms: 60_000,
-                fencing_token: (o + 1) as i64,
-                requests: vec![
-                    wr(&format!("x:/{o}/a")),
-                    wr(&format!("x:/{o}/b")),
-                    rd(&format!("x:/{o}/c")),
-                ],
-                release_requests: vec![],
-            }),
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::Acquire(AcquireArgs {
+                    owner_id: owner.clone(),
+                    ttl_ms: 60_000,
+                    fencing_token: (o + 1) as i64,
+                    requests: vec![
+                        wr(&format!("x:/{o}/a")),
+                        wr(&format!("x:/{o}/b")),
+                        rd(&format!("x:/{o}/c")),
+                    ],
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                }),
+            },
+        );
     }
 
     let started = Instant::now();
@@ -374,10 +488,17 @@ fn many_owner_release_all_throughput() {
     // Release-all each owner
     for o in 0..owners {
         let owner = format!("fan-{o}");
-        apply(&db, Command {
-            request_id: None, now_ms: now,
-            op: Op::ReleaseAll { owner, del_wait: true },
-        });
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::ReleaseAll {
+                    owner,
+                    del_wait: true,
+                },
+            },
+        );
     }
 
     let elapsed = started.elapsed();
@@ -389,7 +510,9 @@ fn many_owner_release_all_throughput() {
     // Verify all are gone
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     for o in 0..owners {
-        assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, &format!("fan-{o}")).unwrap(),
-            "owner fan-{o} should be released");
+        assert!(
+            !pathlockd::engine::is_owner_alive_inner(&mut txn, &format!("fan-{o}")).unwrap(),
+            "owner fan-{o} should be released"
+        );
     }
 }

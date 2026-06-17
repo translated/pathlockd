@@ -10,26 +10,27 @@ use tonic::{Request, Response, Status};
 
 use crate::cluster::router::Router;
 use crate::engine::{
-    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, RelReq,
-    RenewOutcome, WaitEdgeMetadata,
+    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, RelReq, RenewOutcome,
+    WaitEdgeMetadata,
 };
 use crate::events::Broadcaster;
 use crate::proto::{
     self, path_lock_server::PathLock, AcquireRequest, AcquireResponse, AcquireStatus,
-    AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearClaimRequest,
-    ClearClaimResponse, ClearWaitEdgeRequest, ClearWaitEdgeResponse, CycleKind,
-    DetectCycleRequest, DetectCycleResponse, DumpLocksRequest, DumpLocksResponse, Event,
-    ForceReleaseRequest, ForceReleaseResponse, HealthRequest, HealthResponse,
-    IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest, InspectPathResponse,
-    IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse,
-    ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock, PublishEventRequest,
-    PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
-    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetClaimRequest,
-    SetClaimResponse, SetClaimStatus, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
+    AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearWaitEdgeRequest,
+    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, DumpLocksRequest,
+    DumpLocksResponse, Event, ForceReleaseRequest, ForceReleaseResponse, HealthRequest,
+    HealthResponse, IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest,
+    InspectPathResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
+    IsOwnerAliveResponse, ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock,
+    PublishEventRequest, PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest,
+    ReleaseResponse, RenewRequest, RenewResponse, RenewStatus, RequestRevokeRequest,
+    RequestRevokeResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
 };
 
 fn engine_err(e: anyhow::Error) -> Status {
-    if e.downcast_ref::<crate::store_rocksdb::SetScanLimitExceeded>().is_some() {
+    if e.downcast_ref::<crate::store_rocksdb::SetScanLimitExceeded>()
+        .is_some()
+    {
         Status::resource_exhausted("lock set too large for one request")
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::CommandRejected>() {
         // Deterministic state-machine refusals: request faults, not faults of
@@ -61,7 +62,6 @@ const MAX_ID_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4096;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
 const MAX_PATHS_PER_STREAMED_ACQUIRE: usize = 65_536;
-const MAX_CLAIM_TTL_MS: u64 = 60_000;
 const MAX_CYCLE_DEPTH: u32 = 64;
 const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
 const MAX_DUMP_OWNER_PAGE: u32 = 512;
@@ -69,10 +69,14 @@ const MAX_DUMP_OWNER_PAGE: u32 = 512;
 #[allow(clippy::result_large_err)]
 fn check_id(label: &str, id: &str) -> Result<(), Status> {
     if id.is_empty() {
-        return Err(Status::invalid_argument(format!("{label} must not be empty")));
+        return Err(Status::invalid_argument(format!(
+            "{label} must not be empty"
+        )));
     }
     if id.len() > MAX_ID_LEN {
-        return Err(Status::invalid_argument(format!("{label} too long (max {MAX_ID_LEN} bytes)")));
+        return Err(Status::invalid_argument(format!(
+            "{label} too long (max {MAX_ID_LEN} bytes)"
+        )));
     }
     Ok(())
 }
@@ -83,7 +87,9 @@ fn idempotency_key(key: &str) -> Result<Option<String>, Status> {
         return Ok(None);
     }
     if key.len() > MAX_ID_LEN {
-        return Err(Status::invalid_argument(format!("idempotency_key too long (max {MAX_ID_LEN} bytes)")));
+        return Err(Status::invalid_argument(format!(
+            "idempotency_key too long (max {MAX_ID_LEN} bytes)"
+        )));
     }
     Ok(Some(key.to_string()))
 }
@@ -94,7 +100,9 @@ fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
         return Err(Status::invalid_argument("ttl_ms must be > 0"));
     }
     if ttl_ms > MAX_TTL_MS {
-        return Err(Status::invalid_argument(format!("ttl_ms too large (max {MAX_TTL_MS} ms)")));
+        return Err(Status::invalid_argument(format!(
+            "ttl_ms too large (max {MAX_TTL_MS} ms)"
+        )));
     }
     Ok(())
 }
@@ -105,40 +113,51 @@ fn check_path(path: &str) -> Result<(), Status> {
         return Err(Status::invalid_argument("path empty or too long"));
     }
     let colon = path.find(':').ok_or_else(|| {
-        Status::invalid_argument(format!("path must be \"<handler>:<normalizedPath>\": {path}"))
+        Status::invalid_argument(format!(
+            "path must be \"<handler>:<normalizedPath>\": {path}"
+        ))
     })?;
     let handler = &path[..colon];
     let p = &path[colon + 1..];
     if handler.is_empty() || handler.contains('/') {
-        return Err(Status::invalid_argument(format!("path has an empty or invalid handler: {path}")));
+        return Err(Status::invalid_argument(format!(
+            "path has an empty or invalid handler: {path}"
+        )));
     }
     if !p.starts_with('/') {
-        return Err(Status::invalid_argument(format!("normalized path must start with '/': {path}")));
+        return Err(Status::invalid_argument(format!(
+            "normalized path must start with '/': {path}"
+        )));
     }
     if p == "/" {
         return Ok(());
     }
     if p.ends_with('/') {
-        return Err(Status::invalid_argument(format!("normalized path must not end with '/': {path}")));
+        return Err(Status::invalid_argument(format!(
+            "normalized path must not end with '/': {path}"
+        )));
     }
     for seg in p[1..].split('/') {
         if seg.is_empty() {
-            return Err(Status::invalid_argument(format!("normalized path has an empty segment ('//'): {path}")));
+            return Err(Status::invalid_argument(format!(
+                "normalized path has an empty segment ('//'): {path}"
+            )));
         }
         if seg == "." || seg == ".." {
-            return Err(Status::invalid_argument(format!("normalized path has a '.'/'..' segment: {path}")));
+            return Err(Status::invalid_argument(format!(
+                "normalized path has a '.'/'..' segment: {path}"
+            )));
         }
     }
     Ok(())
 }
 
-const BLOCKING_REASONS: [&str; 6] = [
+const BLOCKING_REASONS: [&str; 5] = [
     "ancestor_locked",
     "write_locked",
     "read_locked",
     "descendant_write_locked",
     "descendant_read_locked",
-    engine::REASON_PREEMPT_CLAIMED,
 ];
 
 #[allow(clippy::result_large_err)]
@@ -155,7 +174,9 @@ fn check_blocking_reason(reason: &str) -> Result<(), Status> {
 #[allow(clippy::result_large_err)]
 fn check_write_fencing_token(fencing_token: i64) -> Result<(), Status> {
     if fencing_token <= 0 {
-        return Err(Status::invalid_argument("fencing_token must be > 0 for write locks"));
+        return Err(Status::invalid_argument(
+            "fencing_token must be > 0 for write locks",
+        ));
     }
     Ok(())
 }
@@ -164,8 +185,14 @@ fn check_write_fencing_token(fencing_token: i64) -> Result<(), Status> {
 fn check_event(ev: &Event) -> Result<(), Status> {
     check_id("event.owner_id", &ev.owner_id)?;
     match proto::EventType::try_from(ev.r#type) {
-        Ok(proto::EventType::Released | proto::EventType::Killed | proto::EventType::Revoke) => Ok(()),
-        Err(_) => Err(Status::invalid_argument(format!("invalid event type value {}", ev.r#type))),
+        Ok(proto::EventType::Killed | proto::EventType::Revoke | proto::EventType::Grant) => Ok(()),
+        Ok(proto::EventType::Unspecified) => {
+            Err(Status::invalid_argument("event type unspecified"))
+        }
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid event type value {}",
+            ev.r#type
+        ))),
     }
 }
 
@@ -190,7 +217,9 @@ fn to_state(i: i32) -> Result<engine::State, Status> {
     match proto::LockState::try_from(i) {
         Ok(proto::LockState::Held) => Ok(engine::State::Held),
         Ok(proto::LockState::New) => Ok(engine::State::New),
-        Err(_) => Err(Status::invalid_argument(format!("invalid lock state value {i}"))),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid lock state value {i}"
+        ))),
     }
 }
 
@@ -208,7 +237,11 @@ pub struct PathLockService {
 
 impl PathLockService {
     pub fn new(router: Arc<Router>, broadcaster: Broadcaster, min_lock_depth: u32) -> Self {
-        Self { router, broadcaster, min_lock_depth }
+        Self {
+            router,
+            broadcaster,
+            min_lock_depth,
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -225,60 +258,100 @@ impl PathLockService {
     }
 
     #[allow(clippy::result_large_err)]
-    fn merge_acquire_stream_chunk(base: &mut AcquireRequest, mut chunk: AcquireRequest) -> Result<(), Status> {
+    fn merge_acquire_stream_chunk(
+        base: &mut AcquireRequest,
+        mut chunk: AcquireRequest,
+    ) -> Result<(), Status> {
         if !chunk.owner_id.is_empty() {
             if base.owner_id.is_empty() {
                 base.owner_id = chunk.owner_id;
             } else if base.owner_id != chunk.owner_id {
-                return Err(Status::invalid_argument("acquire stream owner_id changed between chunks"));
+                return Err(Status::invalid_argument(
+                    "acquire stream owner_id changed between chunks",
+                ));
             }
         }
         if chunk.ttl_ms != 0 {
             if base.ttl_ms == 0 {
                 base.ttl_ms = chunk.ttl_ms;
             } else if base.ttl_ms != chunk.ttl_ms {
-                return Err(Status::invalid_argument("acquire stream ttl_ms changed between chunks"));
+                return Err(Status::invalid_argument(
+                    "acquire stream ttl_ms changed between chunks",
+                ));
             }
         }
         if chunk.fencing_token != 0 {
             if base.fencing_token == 0 {
                 base.fencing_token = chunk.fencing_token;
             } else if base.fencing_token != chunk.fencing_token {
-                return Err(Status::invalid_argument("acquire stream fencing_token changed between chunks"));
+                return Err(Status::invalid_argument(
+                    "acquire stream fencing_token changed between chunks",
+                ));
             }
         }
         if !chunk.idempotency_key.is_empty() {
             if base.idempotency_key.is_empty() {
                 base.idempotency_key = chunk.idempotency_key;
             } else if base.idempotency_key != chunk.idempotency_key {
-                return Err(Status::invalid_argument("acquire stream idempotency_key changed between chunks"));
+                return Err(Status::invalid_argument(
+                    "acquire stream idempotency_key changed between chunks",
+                ));
             }
         }
-        base.emit_release |= chunk.emit_release;
         base.requests.append(&mut chunk.requests);
         base.release_requests.append(&mut chunk.release_requests);
         Ok(())
     }
 
-    async fn handle_acquire_request(&self, req: AcquireRequest, max_paths: usize) -> Result<AcquireResponse, Status> {
+    async fn handle_acquire_request(
+        &self,
+        req: AcquireRequest,
+        max_paths: usize,
+    ) -> Result<AcquireResponse, Status> {
         check_id("owner_id", &req.owner_id)?;
         check_ttl(req.ttl_ms)?;
         let idempotency_key = idempotency_key(&req.idempotency_key)?;
         if req.requests.len() + req.release_requests.len() > max_paths {
-            return Err(Status::invalid_argument(format!("too many paths in one request (max {max_paths})")));
+            return Err(Status::invalid_argument(format!(
+                "too many paths in one request (max {max_paths})"
+            )));
         }
-        for r in &req.requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-        for r in &req.release_requests { check_path(&r.path)?; self.check_lockable_depth(&r.path)?; }
-        if req.requests.iter().any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write)) {
+        for r in &req.requests {
+            check_path(&r.path)?;
+            self.check_lockable_depth(&r.path)?;
+        }
+        for r in &req.release_requests {
+            check_path(&r.path)?;
+            self.check_lockable_depth(&r.path)?;
+        }
+        if req
+            .requests
+            .iter()
+            .any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write))
+        {
             check_write_fencing_token(req.fencing_token)?;
         }
-        let requests: Vec<LockReq> = req.requests.iter().map(|r| {
-            Ok(LockReq { path: r.path.clone(), mode: to_mode(r.mode)?, state: to_state(r.state)? })
-        }).collect::<Result<_, Status>>()?;
-        let release_requests: Vec<RelReq> = req.release_requests.iter().map(|r| {
-            Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
-        }).collect::<Result<_, Status>>()?;
-        let had_release = !release_requests.is_empty();
+        let requests: Vec<LockReq> = req
+            .requests
+            .iter()
+            .map(|r| {
+                Ok(LockReq {
+                    path: r.path.clone(),
+                    mode: to_mode(r.mode)?,
+                    state: to_state(r.state)?,
+                })
+            })
+            .collect::<Result<_, Status>>()?;
+        let release_requests: Vec<RelReq> = req
+            .release_requests
+            .iter()
+            .map(|r| {
+                Ok(RelReq {
+                    path: r.path.clone(),
+                    mode: to_mode(r.mode)?,
+                })
+            })
+            .collect::<Result<_, Status>>()?;
 
         let args = AcquireArgs {
             owner_id: req.owner_id.clone(),
@@ -286,22 +359,51 @@ impl PathLockService {
             requests,
             fencing_token: req.fencing_token,
             release_requests,
+            queue_ttl_ms: req.queue_ttl_ms,
         };
 
         let router = self.router.clone();
-        let outcome = router.acquire_with_idempotency(args, idempotency_key.as_deref()).await.map_err(engine_err)?;
+        let (outcome, granted) = router
+            .acquire_with_idempotency(args, idempotency_key.as_deref())
+            .await
+            .map_err(engine_err)?;
+        // An acquire's inline releases may have granted queued waiters in place.
+        for owner in &granted {
+            self.broadcaster.grant(owner);
+        }
         let resp = match outcome {
-            AcquireOutcome::Ok => {
-                if had_release && req.emit_release {
-                    self.broadcaster.released(&req.owner_id);
-                }
-                AcquireResponse { status: AcquireStatus::Ok as i32, ..Default::default() }
-            }
-            AcquireOutcome::Conflict { path, owner, reason } => AcquireResponse {
-                status: AcquireStatus::Conflict as i32, path, owner, reason,
+            AcquireOutcome::Ok => AcquireResponse {
+                status: AcquireStatus::Ok as i32,
+                ..Default::default()
+            },
+            AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            } => AcquireResponse {
+                status: AcquireStatus::Conflict as i32,
+                path,
+                owner,
+                reason,
+            },
+            // Enqueued: the client waits for a GRANT event. Clients that don't
+            // recognize QUEUED treat it as a conflict and keep converging via
+            // their recheck path.
+            AcquireOutcome::Queued {
+                path,
+                owner,
+                reason,
+            } => AcquireResponse {
+                status: AcquireStatus::Queued as i32,
+                path,
+                owner,
+                reason,
             },
             AcquireOutcome::Lost { path, reason } => AcquireResponse {
-                status: AcquireStatus::Lost as i32, path, owner: String::new(), reason,
+                status: AcquireStatus::Lost as i32,
+                path,
+                owner: String::new(),
+                reason,
             },
         };
         Ok(resp)
@@ -317,11 +419,19 @@ impl PathLock for PathLockService {
         &self,
         request: Request<AcquireRequest>,
     ) -> Result<Response<AcquireResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Acquire", request, |request| async move {
-            let req = request.into_inner();
-            let resp = self.handle_acquire_request(req, MAX_PATHS_PER_REQUEST).await?;
-            Ok(Response::new(resp))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "Acquire",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                let resp = self
+                    .handle_acquire_request(req, MAX_PATHS_PER_REQUEST)
+                    .await?;
+                Ok(Response::new(resp))
+            },
+        )
+        .await
     }
 
     async fn acquire_stream(
@@ -360,41 +470,83 @@ impl PathLock for PathLockService {
         &self,
         request: Request<ReleaseLocksRequest>,
     ) -> Result<Response<ReleaseResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Release", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            if req.requests.len() > MAX_PATHS_PER_REQUEST {
-                return Err(Status::invalid_argument(format!("too many paths in one request (max {MAX_PATHS_PER_REQUEST})")));
-            }
-            for r in &req.requests { check_path(&r.path)?; }
-            let reqs: Vec<RelReq> = req.requests.iter().map(|r| {
-                Ok(RelReq { path: r.path.clone(), mode: to_mode(r.mode)? })
-            }).collect::<Result<_, Status>>()?;
-            let router = self.router.clone();
-            let owner_id = req.owner_id.clone();
-            let del_wait_key = req.del_wait_key;
-            router.release_with_idempotency(&owner_id, &reqs, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            self.broadcaster.released(&req.owner_id);
-            Ok(Response::new(ReleaseResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "Release",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                if req.requests.len() > MAX_PATHS_PER_REQUEST {
+                    return Err(Status::invalid_argument(format!(
+                        "too many paths in one request (max {MAX_PATHS_PER_REQUEST})"
+                    )));
+                }
+                for r in &req.requests {
+                    check_path(&r.path)?;
+                }
+                let reqs: Vec<RelReq> = req
+                    .requests
+                    .iter()
+                    .map(|r| {
+                        Ok(RelReq {
+                            path: r.path.clone(),
+                            mode: to_mode(r.mode)?,
+                        })
+                    })
+                    .collect::<Result<_, Status>>()?;
+                let router = self.router.clone();
+                let owner_id = req.owner_id.clone();
+                let del_wait_key = req.del_wait_key;
+                let granted = router
+                    .release_with_idempotency(
+                        &owner_id,
+                        &reqs,
+                        del_wait_key,
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    .map_err(engine_err)?;
+                for owner in &granted {
+                    self.broadcaster.grant(owner);
+                }
+                Ok(Response::new(ReleaseResponse {}))
+            },
+        )
+        .await
     }
 
     async fn release_all(
         &self,
         request: Request<ReleaseAllRequest>,
     ) -> Result<Response<ReleaseResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ReleaseAll", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let router = self.router.clone();
-            let owner_id = req.owner_id.clone();
-            let del_wait_key = req.del_wait_key;
-            router.release_all_with_idempotency(&owner_id, del_wait_key, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            self.broadcaster.released(&req.owner_id);
-            Ok(Response::new(ReleaseResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "ReleaseAll",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                let router = self.router.clone();
+                let owner_id = req.owner_id.clone();
+                let del_wait_key = req.del_wait_key;
+                let granted = router
+                    .release_all_with_idempotency(
+                        &owner_id,
+                        del_wait_key,
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    .map_err(engine_err)?;
+                for owner in &granted {
+                    self.broadcaster.grant(owner);
+                }
+                Ok(Response::new(ReleaseResponse {}))
+            },
+        )
+        .await
     }
 
     async fn renew(
@@ -409,192 +561,270 @@ impl PathLock for PathLockService {
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
             let ttl_ms = req.ttl_ms;
-            let outcome = router.renew_with_idempotency(&owner_id, ttl_ms, &req.domains, idempotency_key.as_deref()).await.map_err(engine_err)?;
+            let outcome = router
+                .renew_with_idempotency(&owner_id, ttl_ms, &req.domains, idempotency_key.as_deref())
+                .await
+                .map_err(engine_err)?;
             let resp = match outcome {
-                RenewOutcome::Ok => RenewResponse { status: RenewStatus::Ok as i32, ..Default::default() },
-                RenewOutcome::Lost { path, reason } => RenewResponse { status: RenewStatus::Lost as i32, path, reason },
+                RenewOutcome::Ok => RenewResponse {
+                    status: RenewStatus::Ok as i32,
+                    ..Default::default()
+                },
+                RenewOutcome::Lost { path, reason } => RenewResponse {
+                    status: RenewStatus::Lost as i32,
+                    path,
+                    reason,
+                },
             };
             Ok(Response::new(resp))
-        }).await
+        })
+        .await
     }
 
     async fn force_release(
         &self,
         request: Request<ForceReleaseRequest>,
     ) -> Result<Response<ForceReleaseResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ForceRelease", request, |request| async move {
-            let req = request.into_inner();
-            check_id("victim_id", &req.victim_id)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let router = self.router.clone();
-            let victim_id = req.victim_id.clone();
-            router.force_release_with_idempotency(&victim_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            self.broadcaster.killed(&req.victim_id);
-            Ok(Response::new(ForceReleaseResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "ForceRelease",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("victim_id", &req.victim_id)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                let router = self.router.clone();
+                let victim_id = req.victim_id.clone();
+                let granted = router
+                    .force_release_with_idempotency(&victim_id, idempotency_key.as_deref())
+                    .await
+                    .map_err(engine_err)?;
+                self.broadcaster.killed(&req.victim_id);
+                for owner in &granted {
+                    self.broadcaster.grant(owner);
+                }
+                Ok(Response::new(ForceReleaseResponse {}))
+            },
+        )
+        .await
     }
 
     async fn assert_fencing(
         &self,
         request: Request<AssertFencingRequest>,
     ) -> Result<Response<AssertFencingResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "AssertFencing", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            if req.paths.len() > MAX_PATHS_PER_REQUEST {
-                return Err(Status::invalid_argument(format!("too many paths (max {MAX_PATHS_PER_REQUEST})")));
-            }
-            for p in &req.paths { check_path(p)?; }
-            if !req.paths.is_empty() { check_write_fencing_token(req.fencing_token)?; }
-            let router = self.router.clone();
-            let outcome = router.assert_fencing(&req.owner_id, req.fencing_token, &req.paths).await.map_err(engine_err)?;
-            let resp = match outcome {
-                AssertOutcome::Ok => AssertFencingResponse { status: AssertStatus::Ok as i32, ..Default::default() },
-                AssertOutcome::Fail { path, reason } => AssertFencingResponse { status: AssertStatus::Fail as i32, path, reason },
-            };
-            Ok(Response::new(resp))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "AssertFencing",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                if req.paths.len() > MAX_PATHS_PER_REQUEST {
+                    return Err(Status::invalid_argument(format!(
+                        "too many paths (max {MAX_PATHS_PER_REQUEST})"
+                    )));
+                }
+                for p in &req.paths {
+                    check_path(p)?;
+                }
+                if !req.paths.is_empty() {
+                    check_write_fencing_token(req.fencing_token)?;
+                }
+                let router = self.router.clone();
+                let outcome = router
+                    .assert_fencing(&req.owner_id, req.fencing_token, &req.paths)
+                    .await
+                    .map_err(engine_err)?;
+                let resp = match outcome {
+                    AssertOutcome::Ok => AssertFencingResponse {
+                        status: AssertStatus::Ok as i32,
+                        ..Default::default()
+                    },
+                    AssertOutcome::Fail { path, reason } => AssertFencingResponse {
+                        status: AssertStatus::Fail as i32,
+                        path,
+                        reason,
+                    },
+                };
+                Ok(Response::new(resp))
+            },
+        )
+        .await
     }
 
     async fn detect_cycle(
         &self,
         request: Request<DetectCycleRequest>,
     ) -> Result<Response<DetectCycleResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "DetectCycle", request, |request| async move {
-            let req = request.into_inner();
-            check_id("start_owner_id", &req.start_owner_id)?;
-            let depth = req.max_depth.min(MAX_CYCLE_DEPTH);
-            let router = self.router.clone();
-            let outcome = router.detect_cycle(&req.start_owner_id, depth).await.map_err(engine_err)?;
-            let resp = match outcome {
-                CycleOutcome::None => DetectCycleResponse { kind: CycleKind::None as i32, chain: vec![] },
-                CycleOutcome::Cycle(chain) => DetectCycleResponse { kind: CycleKind::Found as i32, chain },
-                CycleOutcome::Truncated(chain) => DetectCycleResponse { kind: CycleKind::Truncated as i32, chain },
-            };
-            Ok(Response::new(resp))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "DetectCycle",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("start_owner_id", &req.start_owner_id)?;
+                let depth = req.max_depth.min(MAX_CYCLE_DEPTH);
+                let router = self.router.clone();
+                let outcome = router
+                    .detect_cycle(&req.start_owner_id, depth)
+                    .await
+                    .map_err(engine_err)?;
+                let resp = match outcome {
+                    CycleOutcome::None => DetectCycleResponse {
+                        kind: CycleKind::None as i32,
+                        chain: vec![],
+                    },
+                    CycleOutcome::Cycle(chain) => DetectCycleResponse {
+                        kind: CycleKind::Found as i32,
+                        chain,
+                    },
+                    CycleOutcome::Truncated(chain) => DetectCycleResponse {
+                        kind: CycleKind::Truncated as i32,
+                        chain,
+                    },
+                };
+                Ok(Response::new(resp))
+            },
+        )
+        .await
     }
 
     async fn is_blocking(
         &self,
         request: Request<IsBlockingRequest>,
     ) -> Result<Response<IsBlockingResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IsBlocking", request, |request| async move {
-            let req = request.into_inner();
-            check_path(&req.conflict_path)?;
-            check_id("conflict_owner", &req.conflict_owner)?;
-            check_blocking_reason(&req.reason)?;
-            let router = self.router.clone();
-            let blocking = router.is_blocking(&req.conflict_path, &req.conflict_owner, &req.reason).await.map_err(engine_err)?;
-            Ok(Response::new(IsBlockingResponse { blocking }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "IsBlocking",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_path(&req.conflict_path)?;
+                check_id("conflict_owner", &req.conflict_owner)?;
+                check_blocking_reason(&req.reason)?;
+                let router = self.router.clone();
+                let blocking = router
+                    .is_blocking(&req.conflict_path, &req.conflict_owner, &req.reason)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(IsBlockingResponse { blocking }))
+            },
+        )
+        .await
     }
 
     async fn incr_fencing_token(
         &self,
         request: Request<IncrFencingTokenRequest>,
     ) -> Result<Response<IncrFencingTokenResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IncrFencingToken", request, |request| async move {
-            let req = request.into_inner();
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let token = self.router.incr_fencing_token_with_idempotency(idempotency_key.as_deref()).await.map_err(engine_err)?;
-            Ok(Response::new(IncrFencingTokenResponse { token }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "IncrFencingToken",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                let token = self
+                    .router
+                    .incr_fencing_token_with_idempotency(idempotency_key.as_deref())
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(IncrFencingTokenResponse { token }))
+            },
+        )
+        .await
     }
 
     async fn set_wait_edge(
         &self,
         request: Request<SetWaitEdgeRequest>,
     ) -> Result<Response<SetWaitEdgeResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "SetWaitEdge", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            check_id("conflict_owner", &req.conflict_owner)?;
-            check_ttl(req.ttl_ms)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
-                None
-            } else if req.conflict_path.is_empty() || req.reason.is_empty() {
-                return Err(Status::invalid_argument("conflict_path and reason must be provided together"));
-            } else {
-                check_path(&req.conflict_path)?;
-                check_blocking_reason(&req.reason)?;
-                Some(WaitEdgeMetadata { conflict_path: req.conflict_path, reason: req.reason })
-            };
-            let router = self.router.clone();
-            router.set_wait_edge_with_idempotency(&req.owner_id, &req.conflict_owner, req.ttl_ms, metadata.as_ref(), idempotency_key.as_deref()).await.map_err(engine_err)?;
-            Ok(Response::new(SetWaitEdgeResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "SetWaitEdge",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                check_id("conflict_owner", &req.conflict_owner)?;
+                check_ttl(req.ttl_ms)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
+                    None
+                } else if req.conflict_path.is_empty() || req.reason.is_empty() {
+                    return Err(Status::invalid_argument(
+                        "conflict_path and reason must be provided together",
+                    ));
+                } else {
+                    check_path(&req.conflict_path)?;
+                    check_blocking_reason(&req.reason)?;
+                    Some(WaitEdgeMetadata {
+                        conflict_path: req.conflict_path,
+                        reason: req.reason,
+                    })
+                };
+                let router = self.router.clone();
+                router
+                    .set_wait_edge_with_idempotency(
+                        &req.owner_id,
+                        &req.conflict_owner,
+                        req.ttl_ms,
+                        metadata.as_ref(),
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(SetWaitEdgeResponse {}))
+            },
+        )
+        .await
     }
 
     async fn clear_wait_edge(
         &self,
         request: Request<ClearWaitEdgeRequest>,
     ) -> Result<Response<ClearWaitEdgeResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ClearWaitEdge", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let router = self.router.clone();
-            router.clear_wait_edge_with_idempotency(&req.owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            Ok(Response::new(ClearWaitEdgeResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "ClearWaitEdge",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                let router = self.router.clone();
+                router
+                    .clear_wait_edge_with_idempotency(&req.owner_id, idempotency_key.as_deref())
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(ClearWaitEdgeResponse {}))
+            },
+        )
+        .await
     }
 
-    async fn set_claim(
-        &self,
-        request: Request<SetClaimRequest>,
-    ) -> Result<Response<SetClaimResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "SetClaim", request, |request| async move {
-            let req = request.into_inner();
-            check_path(&req.path)?;
-            self.check_lockable_depth(&req.path)?;
-            check_id("claimant_owner_id", &req.claimant_owner_id)?;
-            if req.ttl_ms > MAX_CLAIM_TTL_MS {
-                return Err(Status::invalid_argument(format!("ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
-            }
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let router = self.router.clone();
-            let outcome = router.set_claim_with_idempotency(&req.path, &req.claimant_owner_id, req.ttl_ms, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            let resp = match outcome {
-                engine::ClaimOutcome::Ok => SetClaimResponse {
-                    status: SetClaimStatus::Ok as i32,
-                    claim_owner: String::new(),
-                },
-                engine::ClaimOutcome::Held { claimant } => SetClaimResponse {
-                    status: SetClaimStatus::Held as i32,
-                    claim_owner: claimant,
-                },
-            };
-            Ok(Response::new(resp))
-        }).await
-    }
-
-    async fn clear_claim(
-        &self,
-        request: Request<ClearClaimRequest>,
-    ) -> Result<Response<ClearClaimResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ClearClaim", request, |request| async move {
-            let req = request.into_inner();
-            check_path(&req.path)?;
-            check_id("claimant_owner_id", &req.claimant_owner_id)?;
-            let idempotency_key = idempotency_key(&req.idempotency_key)?;
-            let router = self.router.clone();
-            router.clear_claim_with_idempotency(&req.path, &req.claimant_owner_id, idempotency_key.as_deref()).await.map_err(engine_err)?;
-            Ok(Response::new(ClearClaimResponse {}))
-        }).await
-    }
 
     async fn is_owner_alive(
         &self,
         request: Request<IsOwnerAliveRequest>,
     ) -> Result<Response<IsOwnerAliveResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "IsOwnerAlive", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            let alive = self.router.is_owner_alive(&req.owner_id).await.map_err(engine_err)?;
-            Ok(Response::new(IsOwnerAliveResponse { alive }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "IsOwnerAlive",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let alive = self
+                    .router
+                    .is_owner_alive(&req.owner_id)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(IsOwnerAliveResponse { alive }))
+            },
+        )
+        .await
     }
 
     async fn request_revoke(
@@ -604,30 +834,6 @@ impl PathLock for PathLockService {
         crate::otel::observe_rpc(PATH_LOCK_SERVICE, "RequestRevoke", request, |request| async move {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
-            let wants_claim = !req.claim_path.is_empty() || !req.claimant_owner_id.is_empty();
-            if wants_claim {
-                if req.claim_path.is_empty() || req.claimant_owner_id.is_empty() {
-                    return Err(Status::invalid_argument("claim_path and claimant_owner_id must be provided together"));
-                }
-                check_path(&req.claim_path)?;
-                self.check_lockable_depth(&req.claim_path)?;
-                check_id("claimant_owner_id", &req.claimant_owner_id)?;
-                if req.claim_ttl_ms > MAX_CLAIM_TTL_MS {
-                    return Err(Status::invalid_argument(format!("claim_ttl_ms too large (max {MAX_CLAIM_TTL_MS} ms)")));
-                }
-                let router = self.router.clone();
-                match router.set_claim(&req.claim_path, &req.claimant_owner_id, req.claim_ttl_ms).await {
-                    Ok(engine::ClaimOutcome::Ok) => {}
-                    Ok(engine::ClaimOutcome::Held { claimant }) => {
-                        // Another waiter already reserved the path; the revoke
-                        // still proceeds — the victim cannot barge back either way.
-                        tracing::debug!(owner_id = %req.owner_id, claim_path = %req.claim_path, claimant = %claimant, "preemption claim already reserved by another claimant");
-                    }
-                    Err(e) => {
-                        tracing::warn!(owner_id = %req.owner_id, claim_path = %req.claim_path, error = %e, "failed to plant preemption claim");
-                    }
-                }
-            }
             self.broadcaster.revoke(&req.owner_id);
             Ok(Response::new(RequestRevokeResponse {}))
         }).await
@@ -637,54 +843,105 @@ impl PathLock for PathLockService {
         &self,
         request: Request<InspectPathRequest>,
     ) -> Result<Response<InspectPathResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "InspectPath", request, |request| async move {
-            let req = request.into_inner();
-            check_path(&req.path)?;
-            let info = self.router.inspect_path(&req.path).await.map_err(engine_err)?;
-            Ok(Response::new(InspectPathResponse {
-                write_owner: info.write_owner.unwrap_or_default(),
-                read_owners: info.read_owners,
-                has_fence: info.fence.is_some(),
-                fence: info.fence.unwrap_or(0),
-                claim_owner: info.claim_owner.unwrap_or_default(),
-            }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "InspectPath",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_path(&req.path)?;
+                let info = self
+                    .router
+                    .inspect_path(&req.path)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(InspectPathResponse {
+                    write_owner: info.write_owner.unwrap_or_default(),
+                    read_owners: info.read_owners,
+                    has_fence: info.fence.is_some(),
+                    fence: info.fence.unwrap_or(0),
+                    claim_owner: String::new(),
+                }))
+            },
+        )
+        .await
     }
 
     async fn list_owner_locks(
         &self,
         request: Request<ListOwnerLocksRequest>,
     ) -> Result<Response<ListOwnerLocksResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "ListOwnerLocks", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            let (alive, locks) = self.router.list_owner_locks(&req.owner_id).await.map_err(engine_err)?;
-            Ok(Response::new(ListOwnerLocksResponse {
-                alive,
-                locks: locks.into_iter().map(|l| OwnedLock { path: l.path, mode: mode_to_proto(l.mode) }).collect(),
-            }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "ListOwnerLocks",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                let (alive, locks) = self
+                    .router
+                    .list_owner_locks(&req.owner_id)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(ListOwnerLocksResponse {
+                    alive,
+                    locks: locks
+                        .into_iter()
+                        .map(|l| OwnedLock {
+                            path: l.path,
+                            mode: mode_to_proto(l.mode),
+                        })
+                        .collect(),
+                }))
+            },
+        )
+        .await
     }
 
     async fn dump_locks(
         &self,
         request: Request<DumpLocksRequest>,
     ) -> Result<Response<DumpLocksResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "DumpLocks", request, |request| async move {
-            let req = request.into_inner();
-            let owner_page = if req.owner_page == 0 { DEFAULT_DUMP_OWNER_PAGE } else { req.owner_page.min(MAX_DUMP_OWNER_PAGE) };
-            let cursor = if req.cursor.is_empty() { None } else { Some(req.cursor) };
-            let page = self.router.dump_locks(cursor, owner_page).await.map_err(engine_err)?;
-            let done = page.next_cursor.is_none();
-            Ok(Response::new(DumpLocksResponse {
-                entries: page.entries.into_iter().map(|e| LockEntry {
-                    owner: e.owner, path: e.path, mode: mode_to_proto(e.mode),
-                    has_fence: e.fence.is_some(), fence: e.fence.unwrap_or(0),
-                }).collect(),
-                next_cursor: page.next_cursor.unwrap_or_default(),
-                done,
-            }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "DumpLocks",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                let owner_page = if req.owner_page == 0 {
+                    DEFAULT_DUMP_OWNER_PAGE
+                } else {
+                    req.owner_page.min(MAX_DUMP_OWNER_PAGE)
+                };
+                let cursor = if req.cursor.is_empty() {
+                    None
+                } else {
+                    Some(req.cursor)
+                };
+                let page = self
+                    .router
+                    .dump_locks(cursor, owner_page)
+                    .await
+                    .map_err(engine_err)?;
+                let done = page.next_cursor.is_none();
+                Ok(Response::new(DumpLocksResponse {
+                    entries: page
+                        .entries
+                        .into_iter()
+                        .map(|e| LockEntry {
+                            owner: e.owner,
+                            path: e.path,
+                            mode: mode_to_proto(e.mode),
+                            has_fence: e.fence.is_some(),
+                            fence: e.fence.unwrap_or(0),
+                        })
+                        .collect(),
+                    next_cursor: page.next_cursor.unwrap_or_default(),
+                    done,
+                }))
+            },
+        )
+        .await
     }
 
     type SubscribeStream = EventStream;
@@ -693,35 +950,59 @@ impl PathLock for PathLockService {
         &self,
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Subscribe", request, |request| async move {
-            let owner = request.into_inner().owner_id;
-            check_id("owner_id", &owner)?;
-            let stream: Self::SubscribeStream =
-                Box::pin(self.broadcaster.subscribe(&owner).map(Ok::<Event, Status>));
-            Ok(Response::new(stream))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "Subscribe",
+            request,
+            |request| async move {
+                let owner = request.into_inner().owner_id;
+                check_id("owner_id", &owner)?;
+                let stream: Self::SubscribeStream =
+                    Box::pin(self.broadcaster.subscribe(&owner).map(Ok::<Event, Status>));
+                Ok(Response::new(stream))
+            },
+        )
+        .await
     }
 
     async fn publish_event(
         &self,
         request: Request<PublishEventRequest>,
     ) -> Result<Response<PublishEventResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "PublishEvent", request, |request| async move {
-            let ev = request.into_inner().event.ok_or_else(|| Status::invalid_argument("event is required"))?;
-            check_event(&ev)?;
-            self.broadcaster.publish_from_peer(ev);
-            Ok(Response::new(PublishEventResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "PublishEvent",
+            request,
+            |request| async move {
+                let ev = request
+                    .into_inner()
+                    .event
+                    .ok_or_else(|| Status::invalid_argument("event is required"))?;
+                check_event(&ev)?;
+                self.broadcaster.publish_from_peer(ev);
+                Ok(Response::new(PublishEventResponse {}))
+            },
+        )
+        .await
     }
 
     async fn health(
         &self,
         request: Request<HealthRequest>,
     ) -> Result<Response<HealthResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "Health", request, |_request| async move {
-            let status = crate::cluster::health::check_ready(&self.router).await;
-            Ok(Response::new(HealthResponse { ok: status.ready, detail: status.detail }))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "Health",
+            request,
+            |_request| async move {
+                let status = crate::cluster::health::check_ready(&self.router).await;
+                Ok(Response::new(HealthResponse {
+                    ok: status.ready,
+                    detail: status.detail,
+                }))
+            },
+        )
+        .await
     }
 }
 

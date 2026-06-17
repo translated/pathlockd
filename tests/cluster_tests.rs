@@ -176,7 +176,7 @@ async fn acquire(
             fencing_token: token,
             requests: vec![wr(path)],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await

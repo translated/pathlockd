@@ -62,7 +62,7 @@ async fn live_cluster_mutual_exclusion() {
             fencing_token: token,
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -78,7 +78,7 @@ async fn live_cluster_mutual_exclusion() {
             fencing_token: token + 1,
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -143,7 +143,7 @@ async fn live_cluster_state_survives_on_survivors() {
                 fencing_token: 999_999,
                 requests: vec![wr(&path)],
                 release_requests: vec![],
-                emit_release: false,
+                queue_ttl_ms: 0,
                 idempotency_key: String::new(),
             })
             .await
@@ -176,7 +176,7 @@ async fn live_cluster_take_lock() {
             fencing_token: token,
             requests: vec![wr(&path)],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await

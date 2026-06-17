@@ -189,13 +189,11 @@ fn apply_with_meta(
 
     // A rejected command must not commit: its writes (lease refreshes, lazy
     // prunes, partially-executed grants) were made under the assumption the
-    // whole operation would succeed. A claim refused by claim-if-absent wrote
-    // nothing either.
+    // whole operation would succeed.
     let commit = !matches!(
         &resp,
         ApplyResponse::Acquire(AcquireOutcome::Conflict { .. } | AcquireOutcome::Lost { .. })
             | ApplyResponse::Renew(RenewOutcome::Lost { .. })
-            | ApplyResponse::SetClaim(crate::engine::ClaimOutcome::Held { .. })
             | ApplyResponse::Rejected { .. }
     );
 
@@ -244,14 +242,92 @@ fn apply_with_meta(
     Ok((resp, wrote))
 }
 
+/// Whether a conflict reason represents *waiting for a held lock to free* — the
+/// only conflicts the queue parks. `stale_fencing_token` (refresh-and-retry) is
+/// not a held-lock wait and is returned as a conflict instead.
+fn is_queueable_conflict(reason: &str) -> bool {
+    matches!(
+        reason,
+        "write_locked"
+            | "read_locked"
+            | "ancestor_locked"
+            | "descendant_write_locked"
+            | "descendant_read_locked"
+    )
+}
+
+/// After any operation that frees lock state, grant queued waiters that can now
+/// proceed — in place (their lock keys are written by re-running the engine's
+/// acquire), in per-resource FIFO order. Returns the granted owners; a later
+/// increment emits a GRANT event per owner via the service layer.
+fn sweep_grants(txn: &mut WriteTxn) -> anyhow::Result<Vec<String>> {
+    crate::queue::grant_sweep(txn, engine::acquire_inner)
+}
+
+/// `Granted(..)` only when the sweep actually granted someone; otherwise `Unit`,
+/// so grant-less releases keep their existing response shape.
+fn granted_response(granted: Vec<String>) -> ApplyResponse {
+    if granted.is_empty() {
+        ApplyResponse::Unit
+    } else {
+        ApplyResponse::Granted(granted)
+    }
+}
+
 /// Run one command's op against the transaction. Errors bubble to
 /// [`apply_with_meta`], which separates deterministic logical rejections from
 /// genuine storage failures.
 fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result<ApplyResponse> {
     Ok(match &cmd.op {
         Op::Acquire(args) => {
-            let outcome = engine::acquire_inner(txn, args)?;
-            ApplyResponse::Acquire(outcome)
+            // FIFO admission: a newcomer yields to any earlier waiter it
+            // conflicts with, queueing behind them instead of barging ahead.
+            if let Some((owner, path, reason)) = crate::queue::blocked_by_earlier(txn, args)? {
+                crate::queue::enqueue(txn, args)?;
+                ApplyResponse::Acquire(AcquireOutcome::Queued {
+                    path,
+                    owner,
+                    reason,
+                })
+            } else {
+                match engine::acquire_inner(txn, args)? {
+                    AcquireOutcome::Ok => {
+                        // No longer waiting; inline releases may free paths and
+                        // grant queued waiters — surface them so a GRANT fires.
+                        crate::queue::dequeue(txn, &args.owner_id)?;
+                        let granted = sweep_grants(txn)?;
+                        if granted.is_empty() {
+                            ApplyResponse::Acquire(AcquireOutcome::Ok)
+                        } else {
+                            ApplyResponse::AcquireGranted {
+                                outcome: AcquireOutcome::Ok,
+                                granted,
+                            }
+                        }
+                    }
+                    AcquireOutcome::Conflict {
+                        path,
+                        owner,
+                        reason,
+                    } => {
+                        if is_queueable_conflict(&reason) {
+                            crate::queue::enqueue(txn, args)?;
+                            ApplyResponse::Acquire(AcquireOutcome::Queued {
+                                path,
+                                owner,
+                                reason,
+                            })
+                        } else {
+                            ApplyResponse::Acquire(AcquireOutcome::Conflict {
+                                path,
+                                owner,
+                                reason,
+                            })
+                        }
+                    }
+                    other => ApplyResponse::Acquire(other),
+                }
+            }
         }
         Op::Release {
             owner,
@@ -259,11 +335,12 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
             del_wait,
         } => {
             engine::release_inner(txn, owner, reqs, *del_wait)?;
-            ApplyResponse::Unit
+            granted_response(sweep_grants(txn)?)
         }
         Op::ReleaseAll { owner, del_wait } => {
             engine::release_all_inner(txn, owner, *del_wait)?;
-            ApplyResponse::Unit
+            crate::queue::dequeue(txn, owner)?;
+            granted_response(sweep_grants(txn)?)
         }
         Op::Renew { owner, ttl_ms } => {
             let outcome = engine::renew_inner(txn, owner, *ttl_ms)?;
@@ -271,19 +348,8 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
         }
         Op::ForceRelease { victim } => {
             engine::force_release_inner(txn, victim)?;
-            ApplyResponse::Unit
-        }
-        Op::SetClaim {
-            path,
-            claimant,
-            ttl_ms,
-        } => {
-            let outcome = engine::set_claim_inner(txn, path, claimant, *ttl_ms)?;
-            ApplyResponse::SetClaim(outcome)
-        }
-        Op::ClearClaim { path, claimant } => {
-            engine::clear_claim_inner(txn, path, claimant)?;
-            ApplyResponse::Unit
+            crate::queue::dequeue(txn, victim)?;
+            granted_response(sweep_grants(txn)?)
         }
         Op::SetWaitEdge {
             owner,
@@ -305,6 +371,8 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
         }
         Op::GcSweep { now_ms: _, batch } => {
             let (scanned, reclaimed) = gc_sweep(txn, now_eff, *batch)?;
+            // Reaping an expired lock frees its path; grant any waiter behind it.
+            sweep_grants(txn)?;
             ApplyResponse::Gc { scanned, reclaimed }
         }
         Op::IncrFence => {

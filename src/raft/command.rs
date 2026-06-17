@@ -45,15 +45,6 @@ pub enum Op {
     ForceRelease {
         victim: String,
     },
-    SetClaim {
-        path: String,
-        claimant: String,
-        ttl_ms: u64,
-    },
-    ClearClaim {
-        path: String,
-        claimant: String,
-    },
     SetWaitEdge {
         owner: String,
         edge: WaitEdge,
@@ -113,7 +104,6 @@ pub enum ApplyResponse {
     Acquire(crate::engine::AcquireOutcome),
     Renew(crate::engine::RenewOutcome),
     AssertFencing(crate::engine::AssertOutcome),
-    SetClaim(crate::engine::ClaimOutcome),
     IncrFence(i64),
     /// Outcome of a `GcSweep` pass. `scanned` is the number of expiry-index
     /// entries processed (a full batch means more backlog remains); `reclaimed`
@@ -132,5 +122,18 @@ pub enum ApplyResponse {
     Rejected {
         kind: RejectKind,
         detail: String,
+    },
+    /// Owners whose queued acquire was granted in place by this command's grant
+    /// sweep (release / release-all / force-release). The service layer emits a
+    /// GRANT event for each. Appended last so existing variant encodings stay
+    /// stable.
+    Granted(Vec<String>),
+    /// An acquire that succeeded *and*, via its inline releases, granted queued
+    /// waiters in place: the acquire outcome plus the granted owners. The
+    /// service layer emits a GRANT event for each. Appended last to keep
+    /// existing variant encodings stable.
+    AcquireGranted {
+        outcome: crate::engine::AcquireOutcome,
+        granted: Vec<String>,
     },
 }
