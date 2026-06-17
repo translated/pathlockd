@@ -106,13 +106,12 @@ This prevents state/log divergence after a process crash.
 | `write_locks` | Exclusive write lock state | Yes |
 | `read_locks` | Shared read lock state | Yes |
 | `fences` | Per-path fencing tokens | Yes (long-lived) |
-| `claims` | Preemption claims | Transient but include |
 | `desc_write` | Write descendant indexes | Yes |
 | `desc_read` | Read descendant indexes | Yes |
-| `desc_claim` | Claim descendant indexes | Transient but include |
 | `owner_alive` | Owner liveness leases | Yes |
 | `owner_holds` | Owner-to-locks mappings | Yes |
 | `wait_edges` | Deadlock-detection wait edges | Advisory but include |
+| `lock_queue` | FIFO wait queue (queued waiters) | Yes — preserves wait order |
 | `expiry` | Expiry index for active GC | No — rebuilt on restart |
 
 ## Verification after restore

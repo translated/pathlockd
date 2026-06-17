@@ -53,7 +53,8 @@ inline `release_requests`.
 Remove the owner's `wr`/`rd` membership for the given paths (or all paths in
 `own:<owner>`), prune now-empty read sets, fix descendant indexes, and when the
 owner set empties, drop `own` + `alive`. `release` optionally deletes the wait
-edge. Both publish `RELEASED` for the owner.
+edge. After freeing keys, the apply layer runs the **grant sweep** (below) and
+publishes a `GRANT` to every waiter it grants in place.
 
 ## `renew`
 
@@ -86,16 +87,35 @@ produce a false cycle.
 
 ## `is_blocking`
 
-Cheap re-check used by a waiter: is `conflict_owner` still holding
-`conflict_path` for the given reason? Prunes a dead read owner if found. This is
-the predicate a waiter polls to decide when to retry an acquire.
+Cheap re-check: is `conflict_owner` still holding `conflict_path` for the given
+reason? Prunes a dead read owner if found. With the wait queue this is no longer
+the primary wake path (waiters wake on `GRANT`); it backs the client's coarse
+safety-net recheck.
+
+## Wait queue & grant-in-place (apply layer — `src/queue.rs`)
+
+The engine primitives above stay pure; the **wait queue** lives one layer up, in
+the Raft apply (`src/queue.rs` + `state_machine.rs`), so it can use the
+deterministic transaction and the persisted clock:
+
+- On a conflict that is *waitable* (held-lock conflict, not `stale_fencing_token`),
+  the apply **enqueues** the request (`CF_QUEUE`) and returns `Queued` instead of
+  discarding the conflict. FIFO admission makes a newcomer yield to strictly
+  earlier waiters whose scope covers its path (anti-starvation).
+- After any release/force-release/GC frees keys, the **grant sweep** walks the
+  queue in FIFO order and re-runs `acquire_inner` for each head waiter; an `Ok`
+  writes its lock keys in place and dequeues it; a stale-fencing head is woken to
+  refresh-and-retry. Granted/woken owners get a `GRANT` event.
+- Entries are TTL'd (the caller's `queue_ttl_ms`) and GC-reaped, and are
+  snapshotted with the group, so the queue is durable and survives failover /
+  rebalancing / full restart.
 
 ## Single-key helpers
 
 `incr_fencing_token` (monotonic counter in `CF_META`), `set_wait_edge` /
 `clear_wait_edge` (the wait-for graph in `CF_WAIT_EDGES`), `is_owner_alive`
-(liveness probe in `CF_OWNER_ALIVE`), `set_claim` (preemption reservation in
-`CF_CLAIMS`). These are simple single-column-family operations.
+(liveness probe in `CF_OWNER_ALIVE`). These are simple single-column-family
+operations.
 
 ## Concurrency
 

@@ -86,7 +86,7 @@ async fn live_cluster_mutual_exclusion() {
         .into_inner();
     assert_eq!(
         resp.status,
-        AcquireStatus::Conflict as i32,
+        AcquireStatus::Queued as i32,
         "node B must see node A's lock: {resp:?}"
     );
     assert_eq!(resp.owner, "live-owner-1");
@@ -149,7 +149,7 @@ async fn live_cluster_state_survives_on_survivors() {
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resp.status, AcquireStatus::Conflict as i32, "via {node}");
+        assert_eq!(resp.status, AcquireStatus::Queued as i32, "via {node}");
     }
 }
 

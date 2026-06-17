@@ -82,9 +82,14 @@ subtree):
 ancestor_locked → write_locked → read_locked → descendant_write_locked → descendant_read_locked → stale_fencing_token
 ```
 
-A `CONFLICT` outcome carries `{ path, owner, reason }`: the conflicting path, the
-owner that holds it, and the reason. For `stale_fencing_token` the `owner` field
-carries the *persisted fence value* rather than an owner id.
+The outcome carries `{ path, owner, reason }`: the conflicting path, the owner
+that holds it, and the reason. A **waitable** conflict (any held-lock reason
+above) does not refuse the request — it **enqueues** it in the per-group FIFO
+wait queue and returns `QUEUED`; the daemon grants it in place and sends a
+`GRANT` event when the path frees (FIFO admission also means a newcomer yields to
+earlier waiters, so no one is starved). `CONFLICT` is reserved for the
+non-waitable `stale_fencing_token`, where `owner` carries the *persisted fence
+value* rather than an owner id and the caller should refresh its token and retry.
 
 ## Same-owner re-entrancy
 

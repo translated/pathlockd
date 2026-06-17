@@ -251,7 +251,7 @@ async fn three_node_lifecycle() {
         .unwrap();
     assert_eq!(
         status,
-        AcquireStatus::Conflict as i32,
+        AcquireStatus::Queued as i32,
         "node 2 must observe node 0's lock"
     );
 
@@ -366,7 +366,7 @@ async fn three_node_lifecycle() {
     let status = acquire(&mut c2, "gamma", "ha:/failover", t1 + 2, 30_000)
         .await
         .unwrap();
-    assert_eq!(status, AcquireStatus::Conflict as i32);
+    assert_eq!(status, AcquireStatus::Queued as i32);
 
     // Fencing stays monotonic across the failover.
     let t2 = eventually(

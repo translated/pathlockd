@@ -203,13 +203,12 @@ families:
 | `write_locks` | `path -> LockRecord` |
 | `read_locks` | `path:NUL:owner -> LockRecord` |
 | `fences` | `path -> FenceRecord` |
-| `claims` | `path -> ClaimRecord` |
 | `desc_write` | `ancestor:NUL:path -> ExpiringIndexRecord` |
 | `desc_read` | `ancestor:NUL:path:NUL:owner -> ExpiringIndexRecord` |
-| `desc_claim` | `ancestor:NUL:path -> ExpiringIndexRecord` |
 | `owner_alive` | `owner -> AliveRecord` |
 | `owner_holds` | `owner:NUL:mode:NUL:path -> OwnedLockRecord` |
 | `wait_edges` | `owner -> WaitEdgeRecord` |
+| `lock_queue` | `'e':be64(seq) -> QueueEntry` (FIFO waiters); `'o':owner -> seq` |
 | `expiry` | `be64(expires_at):NUL:kind:NUL:primary_key -> ExpiryRecord` |
 | `request_dedupe` | `request_id -> cached ApplyResponse` (apply-once forwarding) |
 

@@ -46,8 +46,8 @@ cargo test --test engine_tests                    # run directly (host cargo)
 
 Spawns a `pathlockd` binary as a child process in single-node mode and drives it
 over gRPC via `PathLockClient`. Tests acquire, release, renew, fencing token
-verification, deadlock detection, preemption claims, and GC drain — all through
-the public gRPC API.
+verification, deadlock detection, the wait queue (grant-in-place + `GRANT`
+events, FIFO convoy), and GC drain — all through the public gRPC API.
 
 ```bash
 ./scripts/test-e2e-safety.sh

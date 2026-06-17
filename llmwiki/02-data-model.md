@@ -6,24 +6,26 @@ and the serialized Raft state machine.
 
 ## Column families
 
-All lock metadata lives across 14 RocksDB column families:
+All lock metadata lives across these RocksDB column families:
 
 | CF constant | Purpose |
 |---|---|
 | `CF_WRITE_LOCKS` | Active write lock: path → owner |
 | `CF_READ_LOCKS` | Active read locks: path\0owner → presence (set) |
 | `CF_FENCES` | Write-lock fencing tokens: path → token (min 24h TTL) |
-| `CF_CLAIMS` | Preemption reservations: path → claimant |
 | `CF_DESC_WRITE` | Descendant write index: ancestor\0path (reverse index) |
 | `CF_DESC_READ` | Descendant read index: ancestor\0path |
-| `CF_DESC_CLAIM` | Descendant claim index: ancestor\0path |
 | `CF_OWNER_ALIVE` | Liveness marker: owner → "1" |
 | `CF_OWNER_HOLDS` | Owner's held locks set: owner\0mode\0path → member |
 | `CF_WAIT_EDGES` | Deadlock-graph edges: owner → encoded WaitEdge |
+| `CF_QUEUE` | Wait queue: entry keys (`'e'`+be_u64(seq) → owner+AcquireArgs) iterate FIFO; owner keys (`'o'`+owner → seq) for O(1) dequeue |
 | `CF_EXPIRY` | TTL index: expires_at\0cf\0primary_key (shadow records) |
-| `CF_META` | Global metadata: fence_counter (monotonic) |
+| `CF_META` | Global metadata: fence_counter (monotonic), per-group queue sequence |
 | `CF_RAFT_LOG` | Raft log entries (managed by openraft) |
 | `CF_DEFAULT` | Catch-all safety net |
+
+> The `CF_CLAIMS` / `CF_DESC_CLAIM` claim families were removed in 0.9.0; the
+> wait queue (`CF_QUEUE`) subsumes anti-starvation reservations.
 
 ## Values (`StoredRecord`)
 

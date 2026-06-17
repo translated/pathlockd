@@ -32,9 +32,9 @@ clients ──gRPC──▶ pathlockd (N replicas)
 4. The state machine's `apply()` decodes the command, opens a RocksDB
    `WriteBatch`, calls `engine::acquire_inner()` (synchronous, deterministic),
    and commits the batch atomically.
-5. The outcome (OK / CONFLICT / LOST) maps back to a proto response. If an
-   inline release happened and the caller asked for it, a `RELEASED` event is
-   published.
+5. The outcome (OK / QUEUED / CONFLICT / LOST) maps back to a proto response. A
+   waitable conflict is enqueued (QUEUED); any release the command performed runs
+   the grant sweep, and each waiter granted in place gets a `GRANT` event.
 
 ## Concurrency model
 

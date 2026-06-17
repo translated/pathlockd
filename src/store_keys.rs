@@ -100,10 +100,8 @@ pub const CF_RAFT_LOG: &str = "raft_log";
 pub const CF_WRITE_LOCKS: &str = "write_locks";
 pub const CF_READ_LOCKS: &str = "read_locks";
 pub const CF_FENCES: &str = "fences";
-pub const CF_CLAIMS: &str = "claims";
 pub const CF_DESC_WRITE: &str = "desc_write";
 pub const CF_DESC_READ: &str = "desc_read";
-pub const CF_DESC_CLAIM: &str = "desc_claim";
 pub const CF_OWNER_ALIVE: &str = "owner_alive";
 pub const CF_OWNER_HOLDS: &str = "owner_holds";
 pub const CF_WAIT_EDGES: &str = "wait_edges";
@@ -125,17 +123,13 @@ pub const STATE_CFS: &[&str] = &[
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
     CF_FENCES,
-    CF_CLAIMS,
     CF_DESC_WRITE,
     CF_DESC_READ,
-    CF_DESC_CLAIM,
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
     CF_EXPIRY,
     CF_DEDUPE,
-    // Appended last: snapshot frames index into STATE_CFS by position, so new
-    // CFs must extend the tail to keep existing frame encodings stable.
     CF_QUEUE,
 ];
 
@@ -147,10 +141,8 @@ pub const ALL_CFS: &[&str] = &[
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
     CF_FENCES,
-    CF_CLAIMS,
     CF_DESC_WRITE,
     CF_DESC_READ,
-    CF_DESC_CLAIM,
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
@@ -197,11 +189,6 @@ pub fn wait_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
-/// Encode a claim key: `path`
-pub fn claim_key(path: &str) -> Vec<u8> {
-    path.as_bytes().to_vec()
-}
-
 /// Encode a write-descendant index key: `ancestor:NUL:path`
 pub fn wrdesc_key(anc: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(anc.len() + 1);
@@ -212,14 +199,6 @@ pub fn wrdesc_key(anc: &str) -> Vec<u8> {
 
 /// Prefix for all read-descendant entries under an ancestor.
 pub fn rddesc_prefix(anc: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(anc.len() + 1);
-    buf.extend_from_slice(anc.as_bytes());
-    buf.push(0);
-    buf
-}
-
-/// Encode a claim-descendant index key: `ancestor:NUL:path`
-pub fn claimdesc_key(anc: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(anc.len() + 1);
     buf.extend_from_slice(anc.as_bytes());
     buf.push(0);
@@ -441,11 +420,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_key_is_path_bytes() {
-        assert_eq!(claim_key("h:/a"), b"h:/a");
-    }
-
-    #[test]
     fn own_prefix_is_owner_plus_nul() {
         assert_eq!(own_prefix("alice"), b"alice\x00");
     }
@@ -474,12 +448,6 @@ mod tests {
     fn rddesc_prefix_is_anc_plus_nul() {
         let prefix = rddesc_prefix("h:/a");
         assert_eq!(prefix, b"h:/a\x00");
-    }
-
-    #[test]
-    fn claimdesc_key_is_anc_nul_prefix() {
-        let key = claimdesc_key("h:/a");
-        assert_eq!(key, b"h:/a\x00");
     }
 
     // --- expiry key encoding ---
@@ -545,13 +513,16 @@ mod tests {
         assert!(names.contains("write_locks"));
         assert!(names.contains("read_locks"));
         assert!(names.contains("fences"));
-        assert!(names.contains("claims"));
         assert!(names.contains("owner_alive"));
         assert!(names.contains("owner_holds"));
         assert!(names.contains("wait_edges"));
         assert!(names.contains("expiry"));
+        assert!(names.contains("lock_queue"));
         assert!(names.contains("meta"));
         assert!(names.contains("raft_log"));
+        // Claim CFs were removed in 0.9.0 (the wait queue subsumes them).
+        assert!(!names.contains("claims"));
+        assert!(!names.contains("desc_claim"));
     }
 
     #[test]

@@ -376,16 +376,25 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
 `PathLock` service: `Acquire`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
 `AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
-`ClearWaitEdge`, `SetClaim`, `ClearClaim`, `IsOwnerAlive`, `RequestRevoke`,
-`Subscribe` (server stream), `Health`.
+`ClearWaitEdge`, `IsOwnerAlive`, `RequestRevoke`, `Subscribe` (server stream),
+`Health`.
 
-Claims (`SetClaim`/`ClearClaim`) are TTL-governed anti-starvation reservations:
-a waiter plants a claim on the path it is queued for, new overlapping acquires
-by other owners bounce with `preempt_claimed` while existing holders drain, and
-the claimant's own acquire consumes the claim atomically on grant. `SetClaim`
-is claim-if-absent — a live foreign claim is reported, never overwritten — and
-claims require no liveness lease, so a pure waiter (holding nothing yet) can
-reserve, and a crashed claimant's reservation simply expires.
+### Wait queue & grant-in-place
+
+A contended acquire is **enqueued** (answered with `ACQUIRE_STATUS_QUEUED`) in a
+durable, Raft-replicated per-group FIFO wait queue rather than refused. When the
+contended path frees, the daemon **grants queued waiters in place** — writing
+their lock keys by re-running the acquire in the release transaction, in
+per-resource FIFO order — and pushes a `GRANT` event to each granted owner over
+its `Subscribe` stream. So a waiting client blocks on an event, not a retry loop.
+
+- FIFO admission gives **anti-starvation** for free: a newcomer yields to
+  strictly-earlier waiters whose scope covers its path, so descendant traffic
+  can't starve a pending ancestor writer.
+- Queue entries are durable (snapshotted with their group, so they survive
+  failover, rebalancing and full-cluster restart) and TTL-governed
+  (`AcquireRequest.queue_ttl_ms`, the caller's acquire deadline), so an abandoned
+  waiter self-evicts via GC and never wedges a path.
 
 ## Building
 

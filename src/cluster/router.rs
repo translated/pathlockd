@@ -1240,6 +1240,10 @@ mod tests {
     /// A single-node cluster: every group bootstrapped with this node as the
     /// sole voter.
     async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
+        test_router_with_segments(0).await
+    }
+
+    async fn test_router_with_segments(segments: u32) -> (Arc<Router>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::store_rocksdb::open_db(
             &dir.path().join("db"),
@@ -1266,7 +1270,7 @@ mod tests {
         .unwrap();
         let routing = RoutingOptions {
             group_count: 8,
-            routing_prefix_segments: 0,
+            routing_prefix_segments: segments,
             max_inflight_per_group: 64,
         };
         let voters = std::collections::BTreeMap::from([(1u64, meta)]);
@@ -1551,5 +1555,58 @@ mod tests {
             assert!(token > last, "tokens must increase");
             last = token;
         }
+    }
+
+    // The wait queue is per-group, so it is correct under sharding only if a
+    // path and its whole *comparable* (ancestor/descendant) lockable subtree
+    // always route to one group. With routing_prefix_segments=K, containment
+    // closure (locks below depth K are rejected; the prefix is the first K
+    // segments) guarantees exactly that. This pins it down: an ancestor write
+    // and a descendant write share a shard, the descendant queues behind the
+    // ancestor, and is granted in place when the ancestor releases.
+    #[tokio::test]
+    async fn queue_shards_with_locks_under_routing_prefix_segments() {
+        let (router, _dir) = test_router_with_segments(1).await;
+
+        // With K=1 the shard key is the first segment, so a subtree and all its
+        // descendants live in one group.
+        let anc = "h:/a/parent";
+        let desc = "h:/a/parent/child";
+        assert_eq!(
+            router.group_of(anc),
+            router.group_of(desc),
+            "an ancestor and its descendant must share a group under K=1"
+        );
+
+        let acq = |owner: &str, fence: i64, path: &str, state: State| AcquireArgs {
+            owner_id: owner.into(),
+            ttl_ms: 30_000,
+            requests: vec![LockReq { path: path.into(), mode: Mode::Write, state }],
+            fencing_token: fence,
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+        };
+
+        // Owner A holds the ancestor write (covers the subtree).
+        assert_eq!(
+            router.acquire(acq("a", 1, anc, State::New)).await.unwrap().0,
+            AcquireOutcome::Ok
+        );
+        // A descendant write by B is enqueued in the same group (covered by A).
+        assert!(
+            matches!(
+                router.acquire(acq("b", 2, desc, State::New)).await.unwrap().0,
+                AcquireOutcome::Queued { .. }
+            ),
+            "descendant write must queue behind the covering ancestor"
+        );
+
+        // A releases → B is granted in place (same-group grant sweep).
+        router.release("a", &[RelReq { path: anc.into(), mode: Mode::Write }], false).await.unwrap();
+        assert_eq!(
+            router.acquire(acq("b", 2, desc, State::Held)).await.unwrap().0,
+            AcquireOutcome::Ok,
+            "B must hold the descendant after the ancestor releases"
+        );
     }
 }
