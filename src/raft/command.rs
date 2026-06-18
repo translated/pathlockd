@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{AcquireArgs, RelReq};
+use crate::engine::{AcquireArgs, LockAlgorithm, RelReq};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
@@ -76,6 +76,23 @@ pub enum Op {
     SetNodeDraining {
         node_id: u64,
         draining: bool,
+    },
+    /// Set the lock algorithm for a namespace in this group's policy table.
+    SetNamespacePolicy {
+        namespace: String,
+        algorithm: LockAlgorithm,
+    },
+    /// Delete an explicit namespace policy/routing row from this group's
+    /// namespace-settings table. Missing rows are a no-op.
+    DeleteNamespacePolicy {
+        namespace: String,
+    },
+    /// Acquire using the router-resolved namespace. Kept separate from
+    /// `Acquire` so older logs that used handler-only policy lookup still
+    /// replay with their original semantics.
+    AcquireInNamespace {
+        namespace: String,
+        args: AcquireArgs,
     },
 }
 

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use rocksdb::DB;
 
 use crate::cluster::placement::GroupId;
-use crate::engine::{self, AcquireOutcome, RenewOutcome};
+use crate::engine::{self, AcquireArgs, AcquireOutcome, LockAlgorithm, RenewOutcome};
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::store_keys;
 use crate::store_rocksdb::{
@@ -261,7 +261,9 @@ fn is_queueable_conflict(reason: &str) -> bool {
 /// acquire), in per-resource FIFO order. Returns the granted owners; a later
 /// increment emits a GRANT event per owner via the service layer.
 fn sweep_grants(txn: &mut WriteTxn) -> anyhow::Result<Vec<String>> {
-    crate::queue::grant_sweep(txn, engine::acquire_inner)
+    crate::queue::grant_sweep(txn, |txn, args, algorithm| {
+        engine::acquire_inner_with_policy(txn, args, algorithm)
+    })
 }
 
 /// `Granted(..)` only when the sweep actually granted someone; otherwise `Unit`,
@@ -274,60 +276,92 @@ fn granted_response(granted: Vec<String>) -> ApplyResponse {
     }
 }
 
+fn execute_acquire(
+    txn: &mut WriteTxn,
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<ApplyResponse> {
+    // FIFO admission: a newcomer yields to any earlier waiter it
+    // conflicts with, queueing behind them instead of barging ahead.
+    if let Some((owner, path, reason)) = crate::queue::blocked_by_earlier(txn, args, algorithm)? {
+        crate::queue::enqueue(txn, args, algorithm)?;
+        return Ok(ApplyResponse::Acquire(AcquireOutcome::Queued {
+            path,
+            owner,
+            reason,
+        }));
+    }
+
+    Ok(
+        match engine::acquire_inner_with_policy(txn, args, algorithm)? {
+            AcquireOutcome::Ok => {
+                // No longer waiting; inline releases may free paths and
+                // grant queued waiters — surface them so a GRANT fires.
+                crate::queue::dequeue(txn, &args.owner_id)?;
+                let granted = sweep_grants(txn)?;
+                if granted.is_empty() {
+                    ApplyResponse::Acquire(AcquireOutcome::Ok)
+                } else {
+                    ApplyResponse::AcquireGranted {
+                        outcome: AcquireOutcome::Ok,
+                        granted,
+                    }
+                }
+            }
+            AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            } => {
+                if is_queueable_conflict(&reason) {
+                    crate::queue::enqueue(txn, args, algorithm)?;
+                    ApplyResponse::Acquire(AcquireOutcome::Queued {
+                        path,
+                        owner,
+                        reason,
+                    })
+                } else {
+                    ApplyResponse::Acquire(AcquireOutcome::Conflict {
+                        path,
+                        owner,
+                        reason,
+                    })
+                }
+            }
+            other => ApplyResponse::Acquire(other),
+        },
+    )
+}
+
+fn resolve_acquire_policy(txn: &mut WriteTxn, args: &AcquireArgs) -> anyhow::Result<LockAlgorithm> {
+    let namespace = args
+        .requests
+        .iter()
+        .map(|r| crate::store_keys::handler_of(&r.path))
+        .chain(
+            args.release_requests
+                .iter()
+                .map(|r| crate::store_keys::handler_of(&r.path)),
+        )
+        .next();
+    match namespace {
+        Some(namespace) => engine::get_namespace_policy_inner(txn, namespace).map(|(a, _)| a),
+        None => Ok(LockAlgorithm::default()),
+    }
+}
+
+fn resolve_namespace_policy(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<LockAlgorithm> {
+    engine::get_namespace_policy_inner(txn, namespace).map(|(algorithm, _)| algorithm)
+}
+
 /// Run one command's op against the transaction. Errors bubble to
 /// [`apply_with_meta`], which separates deterministic logical rejections from
 /// genuine storage failures.
 fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result<ApplyResponse> {
     Ok(match &cmd.op {
         Op::Acquire(args) => {
-            // FIFO admission: a newcomer yields to any earlier waiter it
-            // conflicts with, queueing behind them instead of barging ahead.
-            if let Some((owner, path, reason)) = crate::queue::blocked_by_earlier(txn, args)? {
-                crate::queue::enqueue(txn, args)?;
-                ApplyResponse::Acquire(AcquireOutcome::Queued {
-                    path,
-                    owner,
-                    reason,
-                })
-            } else {
-                match engine::acquire_inner(txn, args)? {
-                    AcquireOutcome::Ok => {
-                        // No longer waiting; inline releases may free paths and
-                        // grant queued waiters — surface them so a GRANT fires.
-                        crate::queue::dequeue(txn, &args.owner_id)?;
-                        let granted = sweep_grants(txn)?;
-                        if granted.is_empty() {
-                            ApplyResponse::Acquire(AcquireOutcome::Ok)
-                        } else {
-                            ApplyResponse::AcquireGranted {
-                                outcome: AcquireOutcome::Ok,
-                                granted,
-                            }
-                        }
-                    }
-                    AcquireOutcome::Conflict {
-                        path,
-                        owner,
-                        reason,
-                    } => {
-                        if is_queueable_conflict(&reason) {
-                            crate::queue::enqueue(txn, args)?;
-                            ApplyResponse::Acquire(AcquireOutcome::Queued {
-                                path,
-                                owner,
-                                reason,
-                            })
-                        } else {
-                            ApplyResponse::Acquire(AcquireOutcome::Conflict {
-                                path,
-                                owner,
-                                reason,
-                            })
-                        }
-                    }
-                    other => ApplyResponse::Acquire(other),
-                }
-            }
+            let algorithm = resolve_acquire_policy(txn, args)?;
+            execute_acquire(txn, args, algorithm)?
         }
         Op::Release {
             owner,
@@ -397,6 +431,21 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
         Op::SetNodeDraining { node_id, draining } => {
             crate::cluster::directory::apply_set_draining(txn, *node_id, *draining)?;
             ApplyResponse::Unit
+        }
+        Op::SetNamespacePolicy {
+            namespace,
+            algorithm,
+        } => {
+            engine::set_namespace_policy_inner(txn, namespace, *algorithm)?;
+            ApplyResponse::Unit
+        }
+        Op::DeleteNamespacePolicy { namespace } => {
+            engine::delete_namespace_policy_inner(txn, namespace)?;
+            ApplyResponse::Unit
+        }
+        Op::AcquireInNamespace { namespace, args } => {
+            let algorithm = resolve_namespace_policy(txn, namespace)?;
+            execute_acquire(txn, args, algorithm)?
         }
     })
 }

@@ -27,6 +27,7 @@
 //! cf:owner_alive      owner -> liveness record
 //! cf:owner_holds      owner\0 \0mode:path -> member record
 //! cf:wait_edges       owner -> wait edge record
+//! cf:namespace_settings namespace -> lock algorithm policy / explicit route root
 //! cf:expiry           be_u64(expires_at)\0cf_name\0primary_key -> expiry record
 //! cf:request_dedupe   request_id -> cached ApplyResponse record
 //! ```
@@ -105,6 +106,7 @@ pub const CF_DESC_READ: &str = "desc_read";
 pub const CF_OWNER_ALIVE: &str = "owner_alive";
 pub const CF_OWNER_HOLDS: &str = "owner_holds";
 pub const CF_WAIT_EDGES: &str = "wait_edges";
+pub const CF_NAMESPACE_SETTINGS: &str = "namespace_settings";
 pub const CF_EXPIRY: &str = "expiry";
 /// Request-id → cached ApplyResponse, so a command retried after an
 /// ambiguous timeout (e.g. re-forwarded after a leader change) applies once.
@@ -128,6 +130,7 @@ pub const STATE_CFS: &[&str] = &[
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
+    CF_NAMESPACE_SETTINGS,
     CF_EXPIRY,
     CF_DEDUPE,
     CF_QUEUE,
@@ -146,6 +149,7 @@ pub const ALL_CFS: &[&str] = &[
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
+    CF_NAMESPACE_SETTINGS,
     CF_EXPIRY,
     CF_DEDUPE,
     CF_QUEUE,
@@ -187,6 +191,24 @@ pub fn own_prefix(owner: &str) -> Vec<u8> {
 /// Encode a wait edge key: `owner`
 pub fn wait_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
+}
+
+/// Per-held-lock algorithm metadata, stored in the lock group's meta CF and
+/// expiring with the held lock. `mode` is the engine mode string.
+pub fn hold_algorithm_key(owner: &str, mode: &str, path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10 + owner.len() + mode.len() + path.len());
+    buf.extend_from_slice(b"hold_alg:");
+    buf.extend_from_slice(owner.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(mode.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(path.as_bytes());
+    buf
+}
+
+/// Per-namespace lock policy, stored in each group's namespace-settings CF.
+pub fn namespace_policy_key(namespace: &str) -> Vec<u8> {
+    namespace.as_bytes().to_vec()
 }
 
 /// Encode a write-descendant index key: `ancestor:NUL:path`
@@ -306,10 +328,18 @@ pub fn handler_of(path: &str) -> &str {
     }
 }
 
-/// The lock domain of a path (the segment before the first `:`), used as the
-/// sharding key for Raft group placement.
+/// The default lock domain of a path: handler plus the first path segment.
 pub fn lock_domain(path: &str) -> &str {
-    handler_of(path)
+    let Some(colon) = path.find(':') else {
+        return path;
+    };
+    let rest = &path[colon + 1..];
+    for (i, b) in rest.bytes().enumerate() {
+        if b == b'/' && i > 0 {
+            return &path[..colon + 1 + i];
+        }
+    }
+    path
 }
 
 // --- time helpers ---
@@ -386,8 +416,9 @@ mod tests {
 
     #[test]
     fn lock_domain_equals_handler() {
-        assert_eq!(lock_domain("vol_9:/a/b"), "vol_9");
-        assert_eq!(lock_domain("workspace_123:/jobs/10"), "workspace_123");
+        assert_eq!(lock_domain("vol_9:/a/b"), "vol_9:/a");
+        assert_eq!(lock_domain("workspace_123:/jobs/10"), "workspace_123:/jobs");
+        assert_eq!(lock_domain("workspace_123:/"), "workspace_123:/");
     }
 
     // --- key encoding round-trips ---

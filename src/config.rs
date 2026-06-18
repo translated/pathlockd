@@ -79,12 +79,12 @@ pub struct Config {
     /// Seed nodes for initial cluster bootstrap.
     pub seed_nodes: Vec<String>,
     /// Number of Raft groups (fixed at cluster birth; changing it remaps
-    /// every routing domain).
+    /// every routing namespace).
     pub group_count: u32,
-    /// Path segments (beyond the handler) included in the routing domain.
-    /// 0 = shard by handler only (every operation single-group, no
-    /// restrictions). K > 0 shards deeper for write parallelism within one
-    /// handler, at the cost of rejecting locks at depth < K.
+    /// Path segments (beyond the handler) included in the fallback routing
+    /// namespace when no explicit namespace root exists. The default, 1,
+    /// routes `handler:/a/b` by `handler:/a`. 0 keeps the legacy handler-only
+    /// fallback.
     pub routing_prefix_segments: u32,
     /// Voters per Raft group (must be odd).
     pub replication_factor: u32,
@@ -172,7 +172,7 @@ impl Default for Config {
             gossip_send_queue_depth: 1024,
             seed_nodes: Vec::new(),
             group_count: 32,
-            routing_prefix_segments: 0,
+            routing_prefix_segments: 1,
             replication_factor: 3,
             group_gc_interval_secs: 1,
             group_gc_batch: 1024,

@@ -111,6 +111,7 @@ This prevents state/log divergence after a process crash.
 | `owner_alive` | Owner liveness leases | Yes |
 | `owner_holds` | Owner-to-locks mappings | Yes |
 | `wait_edges` | Deadlock-detection wait edges | Advisory but include |
+| `namespace_settings` | Namespace lock algorithm policies and explicit route roots | Yes |
 | `lock_queue` | FIFO wait queue (queued waiters) | Yes — preserves wait order |
 | `expiry` | Expiry index for active GC | No — rebuilt on restart |
 

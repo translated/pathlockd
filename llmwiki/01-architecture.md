@@ -6,17 +6,18 @@
 clients ──gRPC──▶ pathlockd (N replicas)
                      │
                      ├── Multi-Raft (openraft) ── consensus log
-                     ├── RocksDB              ── durable storage (14 CFs)
+                     ├── RocksDB              ── durable storage (15 CFs)
                      └── SWIM gossip (foca)   ── cluster membership
 ```
 
 - **pathlockd** is a single binary. Every node runs its own Raft group
   instances, its own RocksDB database, and its own gossip participant. There are
   no external coordination or storage services.
-- **Multi-Raft** provides consensus. Each lock domain (handler prefix) maps to a
-  Raft group via Rendezvous Hashing (`xxh3_64`). The group leader applies
-  commands through a deterministic state machine backed by RocksDB WriteBatch.
-- **RocksDB** stores all lock metadata across 14 column families with per-key
+- **Multi-Raft** provides consensus. Each routing namespace (first path segment
+  by default, or an explicit namespace root) maps to a Raft group via
+  Rendezvous Hashing (`xxh3_64`). The group leader applies commands through a
+  deterministic state machine backed by RocksDB WriteBatch.
+- **RocksDB** stores all lock metadata across 15 column families with per-key
   TTL, background GC sweeps, and configurable WAL fsync.
 - **SWIM gossip** (via `foca`) discovers cluster nodes from a static `seed_nodes`
   list and propagates membership changes.
@@ -27,8 +28,8 @@ clients ──gRPC──▶ pathlockd (N replicas)
    fencing token.
 2. `service.rs` maps the proto request to engine types, validates inputs, and
    calls the router.
-3. The router hashes the handler to a Raft group, builds a `Command`, and sends
-   it to the group leader for apply.
+3. The router resolves the path's routing namespace, hashes it to a Raft group,
+   builds a `Command`, and sends it to the group leader for apply.
 4. The state machine's `apply()` decodes the command, opens a RocksDB
    `WriteBatch`, calls `engine::acquire_inner()` (synchronous, deterministic),
    and commits the batch atomically.
@@ -46,8 +47,9 @@ clients ──gRPC──▶ pathlockd (N replicas)
   stamped by the leader. All TTL expiry checks use this deterministic clock, not
   wall-clock time. Fencing tokens come from a monotonic counter in the `meta`
   column family.
-- **Parallelism across groups.** Different handler domains map to different Raft
-  groups, so writes on disjoint handlers proceed in parallel without contention.
+- **Parallelism across groups.** Different routing namespaces can map to
+  different Raft groups, so writes on disjoint namespaces proceed in parallel
+  without contention.
 - **Read-only operations** (inspect, list, dump, detect_cycle, is_blocking) use a
   RocksDB snapshot. They skip the Raft apply path and serve locally.
 

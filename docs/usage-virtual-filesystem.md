@@ -28,7 +28,8 @@ remote drive, DB rows); pathlockd makes that I/O safe under concurrency.
 
 | Concept | In your VFS |
 |---|---|
-| **Handler** | A backend/namespace, e.g. `google_drive`, `s3`, `local`. The segment before the first `:` in a path. Locks in different handlers never conflict and run fully in parallel. |
+| **Handler** | A backend prefix, e.g. `google_drive`, `s3`, `local`. The segment before the first `:` in a path. |
+| **Routing namespace** | The shard/conflict domain. By default `google_drive:/team/report` routes by `google_drive:/team`; operators can define deeper roots such as `google_drive:/team/archive` with `SetNamespacePolicy`. |
 | **Path** | `"<handler>:<normalizedPath>"`, e.g. `google_drive:/team/reports/q3.xlsx`. Must be rooted (`/…`), no trailing slash, no `//`, `.` or `..`. |
 | **Owner** | One logical lock session = one owner id = ideally one connection. All paths you take under that owner id share **one lease**. Use a fresh UUID per operation (e.g. `mv-7f3a…`). |
 | **Write lock** | Covers the whole **subtree**: `…:/a` conflicts with any lock on `/a`, on an ancestor of `/a`, or anywhere under `/a/…`. "This subtree is mine." |

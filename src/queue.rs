@@ -19,7 +19,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{get_ancestors, AcquireArgs, AcquireOutcome, Mode, State};
+use crate::engine::{locks_conflict, AcquireArgs, AcquireOutcome, LockAlgorithm, Mode, State};
 use crate::store_keys::{
     decode_queue_entry_seq, expired, queue_entry_key, queue_entry_lower, queue_entry_upper,
     queue_owner_key, rd_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS, CF_WRITE_LOCKS,
@@ -45,6 +45,14 @@ pub struct QueueEntry {
     pub seq: u64,
     pub owner: String,
     pub args: AcquireArgs,
+    pub algorithm: LockAlgorithm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LegacyQueueEntry {
+    pub seq: u64,
+    pub owner: String,
+    pub args: AcquireArgs,
 }
 
 /// The NEW (state == New) requested paths of an acquire — the paths actually
@@ -56,32 +64,28 @@ fn new_paths(args: &AcquireArgs) -> impl Iterator<Item = (&str, Mode)> {
         .map(|r| (r.path.as_str(), r.mode))
 }
 
-/// Whether `anc` is a strict ancestor of `desc` (same handler, path-prefix at a
-/// `/` boundary, including the handler root).
-fn is_strict_ancestor(anc: &str, desc: &str) -> bool {
-    get_ancestors(desc).iter().any(|a| a == anc)
-}
-
 /// Whether two acquire requests cannot be held simultaneously: a write covers
 /// its whole subtree, reads are point-only.
-pub fn requests_conflict(a_path: &str, a_mode: Mode, b_path: &str, b_mode: Mode) -> bool {
-    if a_path == b_path {
-        return a_mode == Mode::Write || b_mode == Mode::Write;
-    }
-    if is_strict_ancestor(a_path, b_path) {
-        return a_mode == Mode::Write; // a's write covers b
-    }
-    if is_strict_ancestor(b_path, a_path) {
-        return b_mode == Mode::Write; // b's write covers a
-    }
-    false
+pub fn requests_conflict(
+    a_algorithm: LockAlgorithm,
+    a_path: &str,
+    a_mode: Mode,
+    b_algorithm: LockAlgorithm,
+    b_path: &str,
+    b_mode: Mode,
+) -> bool {
+    locks_conflict(a_algorithm, a_path, a_mode, b_algorithm, b_path, b_mode)
 }
 
 /// Whether any NEW path of `args` conflicts with any of `paths`.
-fn args_conflicts_with(args: &AcquireArgs, paths: &[(String, Mode)]) -> Option<String> {
+fn args_conflicts_with(
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+    paths: &[(String, Mode, LockAlgorithm)],
+) -> Option<String> {
     for (ap, am) in new_paths(args) {
-        for (bp, bm) in paths {
-            if requests_conflict(ap, am, bp, *bm) {
+        for (bp, bm, ba) in paths {
+            if requests_conflict(algorithm, ap, am, *ba, bp, *bm) {
                 return Some(ap.to_string());
             }
         }
@@ -123,7 +127,11 @@ fn owner_seq(tx: &mut WriteTxn, owner: &str) -> anyhow::Result<Option<u64>> {
 /// Enqueue `args` (or re-arm an existing entry's TTL). Returns the waiter's
 /// FIFO seq. Idempotent per owner: a re-issued acquire updates in place rather
 /// than duplicating, preserving the original ordering.
-pub fn enqueue(tx: &mut WriteTxn, args: &AcquireArgs) -> anyhow::Result<u64> {
+pub fn enqueue(
+    tx: &mut WriteTxn,
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<u64> {
     let owner = args.owner_id.clone();
     let seq = match owner_seq(tx, &owner)? {
         Some(existing) => existing,
@@ -139,6 +147,7 @@ pub fn enqueue(tx: &mut WriteTxn, args: &AcquireArgs) -> anyhow::Result<u64> {
         seq,
         owner: owner.clone(),
         args: args.clone(),
+        algorithm,
     };
     let encoded = bincode::serde::encode_to_vec(&entry, bincode::config::standard())?;
     tx.set_bytes(CF_QUEUE, &queue_entry_key(seq), encoded, ttl)?;
@@ -168,10 +177,7 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
         }
         if let Ok(StoredRecord::Bytes { v, exp }) = decode_record(value) {
             if !expired(exp, now) {
-                if let Ok((entry, _)) = bincode::serde::decode_from_slice::<QueueEntry, _>(
-                    &v,
-                    bincode::config::standard(),
-                ) {
+                if let Some(entry) = decode_queue_entry(&v) {
                     out.push(entry);
                 }
             }
@@ -179,6 +185,25 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
         Ok(out.len() < QUEUE_SCAN_LIMIT)
     })?;
     Ok(out)
+}
+
+fn decode_queue_entry(bytes: &[u8]) -> Option<QueueEntry> {
+    bincode::serde::decode_from_slice::<QueueEntry, _>(bytes, bincode::config::standard())
+        .ok()
+        .map(|(entry, _)| entry)
+        .or_else(|| {
+            bincode::serde::decode_from_slice::<LegacyQueueEntry, _>(
+                bytes,
+                bincode::config::standard(),
+            )
+            .ok()
+            .map(|(entry, _)| QueueEntry {
+                seq: entry.seq,
+                owner: entry.owner,
+                args: entry.args,
+                algorithm: LockAlgorithm::default(),
+            })
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -197,13 +222,16 @@ fn owner_holds_or_covers(
     owner: &str,
     path: &str,
     mode: Mode,
+    algorithm: LockAlgorithm,
 ) -> anyhow::Result<bool> {
     if tx.get_str(CF_WRITE_LOCKS, &wr_key(path))?.as_deref() == Some(owner) {
         return Ok(true);
     }
-    for anc in get_ancestors(path) {
-        if tx.get_str(CF_WRITE_LOCKS, &wr_key(&anc))?.as_deref() == Some(owner) {
-            return Ok(true);
+    if algorithm.recursive() {
+        for anc in crate::engine::get_ancestors(path) {
+            if tx.get_str(CF_WRITE_LOCKS, &wr_key(&anc))?.as_deref() == Some(owner) {
+                return Ok(true);
+            }
         }
     }
     if mode == Mode::Read && tx.sismember(CF_READ_LOCKS, &rd_prefix(path), owner)? {
@@ -227,6 +255,7 @@ fn owner_holds_or_covers(
 pub fn blocked_by_earlier(
     tx: &mut WriteTxn,
     args: &AcquireArgs,
+    algorithm: LockAlgorithm,
 ) -> anyhow::Result<Option<(String, String, String)>> {
     // Fast path: an empty queue is the overwhelmingly common case (no
     // contention), so scan once up front and skip all per-path holds checks
@@ -237,10 +266,10 @@ pub fn blocked_by_earlier(
         return Ok(None);
     }
     let owner = &args.owner_id;
-    let mut mine: Vec<(String, Mode)> = Vec::new();
+    let mut mine: Vec<(String, Mode, LockAlgorithm)> = Vec::new();
     for (p, m) in new_paths(args) {
-        if !owner_holds_or_covers(tx, owner, p, m)? {
-            mine.push((p.to_string(), m));
+        if !owner_holds_or_covers(tx, owner, p, m, algorithm)? {
+            mine.push((p.to_string(), m, algorithm));
         }
     }
     if mine.is_empty() {
@@ -258,7 +287,7 @@ pub fn blocked_by_earlier(
                 continue;
             }
         }
-        if let Some(path) = args_conflicts_with(&entry.args, &mine) {
+        if let Some(path) = args_conflicts_with(&entry.args, entry.algorithm, &mine) {
             return Ok(Some((entry.owner, path, REASON_QUEUED.to_string())));
         }
     }
@@ -288,17 +317,17 @@ pub fn blocked_by_earlier(
 /// fence past a still-queued waiter's stored token.
 pub fn grant_sweep<F>(tx: &mut WriteTxn, mut try_acquire: F) -> anyhow::Result<Vec<String>>
 where
-    F: FnMut(&mut WriteTxn, &AcquireArgs) -> anyhow::Result<AcquireOutcome>,
+    F: FnMut(&mut WriteTxn, &AcquireArgs, LockAlgorithm) -> anyhow::Result<AcquireOutcome>,
 {
     let entries = scan(tx)?;
     let mut notify = Vec::new();
-    let mut reserved: Vec<(String, Mode)> = Vec::new();
+    let mut reserved: Vec<(String, Mode, LockAlgorithm)> = Vec::new();
     for entry in entries {
-        if args_conflicts_with(&entry.args, &reserved).is_some() {
-            reserve(&mut reserved, &entry.args);
+        if args_conflicts_with(&entry.args, entry.algorithm, &reserved).is_some() {
+            reserve(&mut reserved, &entry.args, entry.algorithm);
             continue;
         }
-        match try_acquire(tx, &entry.args)? {
+        match try_acquire(tx, &entry.args, entry.algorithm)? {
             AcquireOutcome::Ok => {
                 dequeue(tx, &entry.owner)?;
                 notify.push(entry.owner);
@@ -306,20 +335,24 @@ where
             AcquireOutcome::Conflict { reason, .. } if reason == "stale_fencing_token" => {
                 // Wake to refresh-and-retry; stays queued and reserved so later
                 // waiters keep their place behind it.
-                reserve(&mut reserved, &entry.args);
+                reserve(&mut reserved, &entry.args, entry.algorithm);
                 notify.push(entry.owner);
             }
             _ => {
-                reserve(&mut reserved, &entry.args);
+                reserve(&mut reserved, &entry.args, entry.algorithm);
             }
         }
     }
     Ok(notify)
 }
 
-fn reserve(reserved: &mut Vec<(String, Mode)>, args: &AcquireArgs) {
+fn reserve(
+    reserved: &mut Vec<(String, Mode, LockAlgorithm)>,
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+) {
     for (p, m) in new_paths(args) {
-        reserved.push((p.to_string(), m));
+        reserved.push((p.to_string(), m, algorithm));
     }
 }
 
@@ -369,35 +402,120 @@ mod tests {
 
     #[test]
     fn requests_conflict_rules() {
+        let alg = LockAlgorithm::default();
         // same path
-        assert!(requests_conflict("h:/a", Mode::Write, "h:/a", Mode::Read));
-        assert!(requests_conflict("h:/a", Mode::Read, "h:/a", Mode::Write));
-        assert!(!requests_conflict("h:/a", Mode::Read, "h:/a", Mode::Read));
-        // ancestor write covers descendant
-        assert!(requests_conflict("h:/a", Mode::Write, "h:/a/b", Mode::Read));
-        assert!(requests_conflict("h:/a/b", Mode::Read, "h:/a", Mode::Write));
-        // ancestor read does NOT cover descendant (point-only)
-        assert!(!requests_conflict(
+        assert!(requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Write,
+            alg,
+            "h:/a",
+            Mode::Read
+        ));
+        assert!(requests_conflict(
+            alg,
             "h:/a",
             Mode::Read,
+            alg,
+            "h:/a",
+            Mode::Write
+        ));
+        assert!(!requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Read,
+            alg,
+            "h:/a",
+            Mode::Read
+        ));
+        // ancestor write covers descendant
+        assert!(requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Write,
+            alg,
+            "h:/a/b",
+            Mode::Read
+        ));
+        assert!(requests_conflict(
+            alg,
+            "h:/a/b",
+            Mode::Read,
+            alg,
+            "h:/a",
+            Mode::Write
+        ));
+        // ancestor read does NOT cover descendant (point-only)
+        assert!(!requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Read,
+            alg,
             "h:/a/b",
             Mode::Write
         ));
         // unrelated
-        assert!(!requests_conflict("h:/a", Mode::Write, "h:/b", Mode::Write));
+        assert!(!requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Write,
+            alg,
+            "h:/b",
+            Mode::Write
+        ));
         // different handler never conflicts
-        assert!(!requests_conflict("h:/a", Mode::Write, "g:/a", Mode::Write));
+        assert!(!requests_conflict(
+            alg,
+            "h:/a",
+            Mode::Write,
+            alg,
+            "g:/a",
+            Mode::Write
+        ));
+
+        let point = LockAlgorithm::PointRw;
+        assert!(!requests_conflict(
+            point,
+            "h:/a",
+            Mode::Write,
+            point,
+            "h:/a/b",
+            Mode::Read
+        ));
+        assert!(requests_conflict(
+            LockAlgorithm::RecursiveRw,
+            "h:/a",
+            Mode::Write,
+            point,
+            "h:/a/b",
+            Mode::Read
+        ));
     }
 
     #[test]
     fn enqueue_is_fifo_and_idempotent_per_owner() {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
-        let s1 = enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
-        let s2 = enqueue(&mut tx, &args("o2", vec![req("h:/b", Mode::Write)])).unwrap();
+        let s1 = enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        let s2 = enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/b", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         assert!(s2 > s1);
         // re-enqueue same owner keeps its seq (re-arm, no duplicate)
-        let s1b = enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
+        let s1b = enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         assert_eq!(s1, s1b);
         let q = scan(&tx).unwrap();
         assert_eq!(q.len(), 2);
@@ -409,8 +527,18 @@ mod tests {
     fn dequeue_removes_entry_and_owner_index() {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
-        enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
-        enqueue(&mut tx, &args("o2", vec![req("h:/b", Mode::Write)])).unwrap();
+        enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/b", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         dequeue(&mut tx, "o1").unwrap();
         let q = scan(&tx).unwrap();
         assert_eq!(q.len(), 1);
@@ -424,7 +552,12 @@ mod tests {
         let (db, _d) = open_temp_db();
         {
             let mut tx = txn(&db, 1_000);
-            enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
+            enqueue(
+                &mut tx,
+                &args("o1", vec![req("h:/a", Mode::Write)]),
+                LockAlgorithm::default(),
+            )
+            .unwrap();
             tx.commit().unwrap();
         }
         // Far past the entry TTL: the waiter is no longer live.
@@ -437,10 +570,19 @@ mod tests {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
         // o1 queued for an ancestor write
-        enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
+        enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         // newcomer wants a descendant → must yield to o1
-        let blocked =
-            blocked_by_earlier(&mut tx, &args("o2", vec![req("h:/a/b", Mode::Write)])).unwrap();
+        let blocked = blocked_by_earlier(
+            &mut tx,
+            &args("o2", vec![req("h:/a/b", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         // Reports the blocker's contended path (what o2 is queued behind).
         assert_eq!(
             blocked,
@@ -451,11 +593,20 @@ mod tests {
             ))
         );
         // disjoint newcomer is admitted
-        let free =
-            blocked_by_earlier(&mut tx, &args("o3", vec![req("h:/z", Mode::Write)])).unwrap();
+        let free = blocked_by_earlier(
+            &mut tx,
+            &args("o3", vec![req("h:/z", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         assert_eq!(free, None);
         // the waiter itself is not blocked by its own entry
-        let me = blocked_by_earlier(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
+        let me = blocked_by_earlier(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
         assert_eq!(me, None);
     }
 
@@ -463,13 +614,28 @@ mod tests {
     fn grant_sweep_grants_in_fifo_and_reserves_blocked_paths() {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
-        enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
-        enqueue(&mut tx, &args("o2", vec![req("h:/a", Mode::Write)])).unwrap(); // conflicts with o1
-        enqueue(&mut tx, &args("o3", vec![req("h:/b", Mode::Write)])).unwrap(); // disjoint
+        enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap(); // conflicts with o1
+        enqueue(
+            &mut tx,
+            &args("o3", vec![req("h:/b", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap(); // disjoint
 
         // try_acquire: Ok unless the path was already taken this sweep.
         let mut taken: Vec<String> = Vec::new();
-        let granted = grant_sweep(&mut tx, |_tx, a| {
+        let granted = grant_sweep(&mut tx, |_tx, a, _algorithm| {
             let p = a.requests[0].path.clone();
             if taken.iter().any(|t| t == &p) {
                 Ok(AcquireOutcome::Conflict {
@@ -495,11 +661,21 @@ mod tests {
     fn grant_sweep_wakes_a_stale_fencing_head_without_granting() {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
-        enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
-        enqueue(&mut tx, &args("o2", vec![req("h:/a", Mode::Write)])).unwrap();
+        enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
 
         // o1 (head) is stale; o2 conflicts with o1 and stays reserved/quiet.
-        let notify = grant_sweep(&mut tx, |_tx, a| {
+        let notify = grant_sweep(&mut tx, |_tx, a, _algorithm| {
             if a.owner_id == "o1" {
                 Ok(AcquireOutcome::Conflict {
                     path: a.requests[0].path.clone(),
@@ -523,29 +699,57 @@ mod tests {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
         // Three contenders for h:/a, enqueued in order o1, o2, o3.
-        enqueue(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap();
-        enqueue(&mut tx, &args("o2", vec![req("h:/a", Mode::Write)])).unwrap();
-        enqueue(&mut tx, &args("o3", vec![req("h:/a", Mode::Write)])).unwrap();
+        enqueue(
+            &mut tx,
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        enqueue(
+            &mut tx,
+            &args("o3", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
 
         // The head o1 re-acquires (e.g. woken to retry): it must NOT be blocked
         // by the later waiters o2/o3 queued behind it.
         assert_eq!(
-            blocked_by_earlier(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap(),
+            blocked_by_earlier(
+                &mut tx,
+                &args("o1", vec![req("h:/a", Mode::Write)]),
+                LockAlgorithm::default()
+            )
+            .unwrap(),
             None,
             "the FIFO head must never yield to waiters behind it"
         );
         // o2 still yields to the earlier head o1.
         assert_eq!(
-            blocked_by_earlier(&mut tx, &args("o2", vec![req("h:/a", Mode::Write)]))
-                .unwrap()
-                .map(|(o, ..)| o),
+            blocked_by_earlier(
+                &mut tx,
+                &args("o2", vec![req("h:/a", Mode::Write)]),
+                LockAlgorithm::default()
+            )
+            .unwrap()
+            .map(|(o, ..)| o),
             Some("o1".to_string()),
         );
         // A brand-new contender yields to the earliest waiter (o1).
         assert_eq!(
-            blocked_by_earlier(&mut tx, &args("o9", vec![req("h:/a", Mode::Write)]))
-                .unwrap()
-                .map(|(o, ..)| o),
+            blocked_by_earlier(
+                &mut tx,
+                &args("o9", vec![req("h:/a", Mode::Write)]),
+                LockAlgorithm::default()
+            )
+            .unwrap()
+            .map(|(o, ..)| o),
             Some("o1".to_string()),
         );
     }
@@ -555,13 +759,24 @@ mod tests {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
         // o1 actually holds the write lock on h:/a (grant-in-place wrote it)...
-        tx.set_str(CF_WRITE_LOCKS, &wr_key("h:/a"), "o1", 10_000).unwrap();
+        tx.set_str(CF_WRITE_LOCKS, &wr_key("h:/a"), "o1", 10_000)
+            .unwrap();
         // ...while o2 is queued behind for the same path.
-        enqueue(&mut tx, &args("o2", vec![req("h:/a", Mode::Write)])).unwrap();
+        enqueue(
+            &mut tx,
+            &args("o2", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
 
         // o1 re-acquiring its held path is not blocked by the queued o2.
         assert_eq!(
-            blocked_by_earlier(&mut tx, &args("o1", vec![req("h:/a", Mode::Write)])).unwrap(),
+            blocked_by_earlier(
+                &mut tx,
+                &args("o1", vec![req("h:/a", Mode::Write)]),
+                LockAlgorithm::default()
+            )
+            .unwrap(),
             None,
         );
     }

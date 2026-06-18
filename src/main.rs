@@ -229,7 +229,7 @@ async fn main() -> anyhow::Result<()> {
         spawn_expiry_maintenance(db.clone(), groups.clone(), cfg.gc_compact_interval_secs);
     }
 
-    let path_lock = PathLockService::new(router, broadcaster.clone(), cfg.routing_prefix_segments);
+    let path_lock = PathLockService::new(router, broadcaster.clone());
     let addr: SocketAddr = cfg
         .listen
         .parse()

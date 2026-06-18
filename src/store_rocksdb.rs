@@ -1003,6 +1003,107 @@ pub fn dump_owner_holds(
     })
 }
 
+/// List explicit namespace policy/routing roots in one group's namespace
+/// settings CF. The settings are permanent (`exp == 0`) unless explicitly
+/// deleted, but this still uses normal live-record decoding so old expiring
+/// test/corrupt rows do not leak into the resolver.
+pub fn list_namespace_settings(
+    db: &Arc<DB>,
+    group: GroupId,
+    now_ms: u64,
+) -> anyhow::Result<Vec<String>> {
+    let gp = store_keys::group_prefix(group);
+    let start = gp.to_vec();
+    let upper = prefix_upper_bound(&gp);
+    let mut namespaces = Vec::new();
+    scan_with_overlay(
+        db,
+        store_keys::CF_NAMESPACE_SETTINGS,
+        None,
+        Some(&start),
+        upper.as_deref(),
+        |full_key, v| {
+            if decode_record_lenient(v)
+                .and_then(|r| live_str(r, now_ms))
+                .is_none()
+            {
+                return Ok(true);
+            }
+            let key = &full_key[gp.len()..];
+            if let Ok(namespace) = std::str::from_utf8(key) {
+                namespaces.push(namespace.to_string());
+            }
+            Ok(true)
+        },
+    )?;
+    namespaces.sort();
+    namespaces.dedup();
+    Ok(namespaces)
+}
+
+/// Return true if this group has any live lock path contained by `namespace`.
+/// Used by namespace-root reconfiguration guards; expensive but administrative.
+pub fn namespace_has_live_locks(
+    db: &Arc<DB>,
+    group: GroupId,
+    now_ms: u64,
+    namespace: &str,
+) -> anyhow::Result<bool> {
+    let gp = store_keys::group_prefix(group);
+    let start = gp.to_vec();
+    let upper = prefix_upper_bound(&gp);
+    let mut found = false;
+    let mut alive_memo: HashMap<String, bool> = HashMap::new();
+    let mut alive_txn = RocksDbTxn::new(db.clone(), group, now_ms);
+
+    scan_with_overlay(
+        db,
+        store_keys::CF_OWNER_HOLDS,
+        None,
+        Some(&start),
+        upper.as_deref(),
+        |full_key, v| {
+            if found {
+                return Ok(false);
+            }
+            let key = &full_key[gp.len()..];
+            let Some(sep) = key.windows(2).position(|w| w == [0, 0]) else {
+                return Ok(true);
+            };
+            let Ok(owner) = std::str::from_utf8(&key[..sep]) else {
+                return Ok(true);
+            };
+            let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
+                return Ok(true);
+            };
+            let Some(mode_sep) = member.find(':') else {
+                return Ok(true);
+            };
+            let path = &member[mode_sep + 1..];
+            if !crate::cluster::placement::namespace_contains_path(namespace, path) {
+                return Ok(true);
+            }
+            let alive = match alive_memo.get(owner) {
+                Some(alive) => *alive,
+                None => {
+                    let alive = alive_txn
+                        .get_str(store_keys::CF_OWNER_ALIVE, &store_keys::alive_key(owner))?
+                        .is_some();
+                    alive_memo.insert(owner.to_string(), alive);
+                    alive
+                }
+            };
+            if alive {
+                found = true;
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )?;
+
+    Ok(found)
+}
+
 // ---------------------------------------------------------------------------
 // Group lifecycle utilities
 // ---------------------------------------------------------------------------

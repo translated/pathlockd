@@ -1,8 +1,9 @@
 //! Path/owner → group routing over the multi-raft runtime.
 //!
-//! Every path maps to one Raft group via `place_domain(routing_prefix(path))`;
-//! the routing prefix is containment-closed, so a path, its ancestors, and its
-//! whole subtree share a group and every lock operation is single-group.
+//! Every path maps to one Raft group via a routing namespace. The longest
+//! explicitly configured namespace root wins; otherwise routing falls back to
+//! the handler plus a configured number of path segments (one segment by
+//! default, e.g. `google_drive:/docs`).
 //! Cluster-global state — the fencing counter and the deadlock wait-graph —
 //! lives in the system group ([`SYS_GROUP`]).
 //!
@@ -21,7 +22,7 @@
 //!
 //! Owner-scoped operations (renew, release-all, force-release, liveness and
 //! lock listings) fan out across groups and aggregate, because one owner may
-//! hold locks in several routing domains. Fan-out commands are idempotent
+//! hold locks in several routing namespaces. Fan-out commands are idempotent
 //! per group and each group's lease stands alone, so partial application is
 //! safe: a group that wasn't reached simply keeps its previous lease until it
 //! expires.
@@ -34,9 +35,11 @@ use std::time::Duration;
 use tracing::debug;
 
 use crate::cluster::gossip::MemberMap;
-use crate::cluster::placement::{place_domain, routing_prefix, GroupId, SYS_GROUP};
+use crate::cluster::placement::{
+    namespace_contains_path, path_depth, place_domain, routing_prefix, GroupId, SYS_GROUP,
+};
 use crate::engine::{
-    AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockDumpPage,
+    AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockDumpPage,
     OwnedLock, PathInfo, RelReq, RenewOutcome, WaitEdgeMetadata,
 };
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
@@ -56,8 +59,24 @@ pub struct WriteQueueFull;
 pub struct WriterUnavailable;
 
 #[derive(Debug, Clone, thiserror::Error)]
-#[error("all paths in one request must share a routing domain")]
+#[error("all paths in one request must share a routing namespace")]
 pub struct MultiDomainUnsupported;
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("locks above the fallback routing namespace are not supported unless an explicit namespace exists: {path}")]
+pub struct NamespaceDepthUnsupported {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("namespace routing table unavailable")]
+pub struct NamespaceResolverUnavailable;
+
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("namespace {namespace} has live locks; drain it before changing its routing root")]
+pub struct NamespaceNotDrained {
+    pub namespace: String,
+}
 
 /// A command the state machine deterministically refused (none of its writes
 /// committed). A client/request fault, not a server fault.
@@ -75,16 +94,20 @@ const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
 /// Concurrency budget for operations that fan out across many groups
 /// (owner-wide writes, cross-group reads).
 const FANOUT_CONCURRENCY: usize = 16;
-/// Soft cap on the domain→group placement cache. Beyond it, placements are
-/// recomputed per call instead of cached, so unbounded domain cardinality
+/// Soft cap on the namespace→group placement cache. Beyond it, placements are
+/// recomputed per call instead of cached, so unbounded namespace cardinality
 /// (deep `routing_prefix_segments`, hostile clients) cannot grow memory.
 const DOMAIN_CACHE_MAX: usize = 16_384;
+/// Best-effort namespace-root cache refresh cadence. Namespace changes are
+/// administrative and persisted through Raft; keeping this cache off the per
+/// acquire hot path preserves horizontal scaling while still converging quickly.
+const NAMESPACE_CACHE_REFRESH_MS: u64 = 250;
 
 #[derive(Debug, Clone)]
 pub struct RoutingOptions {
     /// Number of lock groups (fixed at cluster birth).
     pub group_count: u32,
-    /// Path segments (beyond the handler) included in the routing domain.
+    /// Path segments (beyond the handler) included in the fallback namespace.
     pub routing_prefix_segments: u32,
     /// In-flight write budget per group; excess fails fast with
     /// [`WriteQueueFull`].
@@ -95,10 +118,16 @@ impl Default for RoutingOptions {
     fn default() -> Self {
         Self {
             group_count: 32,
-            routing_prefix_segments: 0,
+            routing_prefix_segments: 1,
             max_inflight_per_group: 1024,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct NamespaceRoute {
+    namespace: String,
+    explicit: bool,
 }
 
 pub struct Router {
@@ -114,6 +143,10 @@ pub struct Router {
     leader_hints: RwLock<HashMap<GroupId, (u64, NodeMeta)>>,
     /// Memoized HRW placements (`place_domain` is O(group_count) hashes).
     domain_groups: RwLock<HashMap<String, GroupId>>,
+    /// Explicit namespace roots from the sys-group namespace settings table,
+    /// sorted longest-first for longest-prefix routing.
+    namespace_roots: RwLock<Vec<String>>,
+    namespace_cache_loaded_ms: AtomicU64,
     inflight: HashMap<GroupId, Arc<tokio::sync::Semaphore>>,
     inflight_total: Arc<AtomicUsize>,
     /// Request-id source for apply-once forwarding.
@@ -152,6 +185,8 @@ impl Router {
             members,
             leader_hints: RwLock::new(HashMap::new()),
             domain_groups: RwLock::new(HashMap::new()),
+            namespace_roots: RwLock::new(Vec::new()),
+            namespace_cache_loaded_ms: AtomicU64::new(0),
             inflight,
             inflight_total: Arc::new(AtomicUsize::new(0)),
             client_id,
@@ -161,10 +196,174 @@ impl Router {
 
     /// The group a path routes to.
     pub fn group_of(&self, path: &str) -> GroupId {
-        self.group_of_domain(routing_prefix(path, self.routing.routing_prefix_segments))
+        let route = self.resolve_namespace_cached(path);
+        self.group_of_domain(&route.namespace)
     }
 
-    /// The group a routing domain places onto, memoized — domains are
+    fn fallback_namespace(&self, path: &str) -> String {
+        routing_prefix(path, self.routing.routing_prefix_segments).to_string()
+    }
+
+    fn sort_namespace_roots(roots: &mut Vec<String>) {
+        roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        roots.dedup();
+    }
+
+    fn resolve_namespace_cached(&self, path: &str) -> NamespaceRoute {
+        let roots = self
+            .namespace_roots
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(namespace) = roots
+            .iter()
+            .find(|namespace| namespace_contains_path(namespace, path))
+        {
+            return NamespaceRoute {
+                namespace: namespace.clone(),
+                explicit: true,
+            };
+        }
+        NamespaceRoute {
+            namespace: self.fallback_namespace(path),
+            explicit: false,
+        }
+    }
+
+    fn cache_namespace_root(&self, namespace: &str) {
+        let mut roots = self
+            .namespace_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        roots.push(namespace.to_string());
+        Self::sort_namespace_roots(&mut roots);
+    }
+
+    fn uncache_namespace_root(&self, namespace: &str) {
+        let mut roots = self
+            .namespace_roots
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        roots.retain(|root| root != namespace);
+    }
+
+    async fn refresh_namespace_cache_if_stale(&self) -> anyhow::Result<()> {
+        let now_ms = crate::store_keys::now_ms();
+        let loaded = self.namespace_cache_loaded_ms.load(Ordering::Relaxed);
+        if loaded != 0 && now_ms.saturating_sub(loaded) < NAMESPACE_CACHE_REFRESH_MS {
+            return Ok(());
+        }
+        match self.read_on(SYS_GROUP, ReadOp::ListNamespaces).await {
+            Ok(ReadResult::NamespaceList(mut roots)) => {
+                Self::sort_namespace_roots(&mut roots);
+                let mut cache = self
+                    .namespace_roots
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *cache = roots;
+                self.namespace_cache_loaded_ms
+                    .store(now_ms, Ordering::Relaxed);
+                Ok(())
+            }
+            Ok(_) => {
+                debug!("unexpected namespace cache refresh read result");
+                if loaded == 0 {
+                    Err(NamespaceResolverUnavailable.into())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "namespace cache refresh failed; using cached/fallback routing");
+                if loaded == 0 {
+                    Err(NamespaceResolverUnavailable.into())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn ensure_lockable_route(&self, path: &str, route: &NamespaceRoute) -> anyhow::Result<()> {
+        let min_depth = self.routing.routing_prefix_segments;
+        if !route.explicit && min_depth > 0 && path_depth(path) < min_depth {
+            return Err(NamespaceDepthUnsupported {
+                path: path.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    fn namespace_route_would_change(&self, namespace: &str, explicit: bool) -> bool {
+        if explicit {
+            return false;
+        }
+        let probe = if namespace.contains(':') {
+            namespace.to_string()
+        } else if self.routing.routing_prefix_segments == 0 {
+            namespace.to_string()
+        } else {
+            format!("{namespace}:/")
+        };
+        self.resolve_namespace_cached(&probe).namespace != namespace
+    }
+
+    async fn namespace_has_locks_anywhere(&self, namespace: &str) -> anyhow::Result<bool> {
+        use futures::StreamExt;
+        let mut stream = futures::stream::iter(self.lock_groups().map(|group| {
+            self.read_on(
+                group,
+                ReadOp::NamespaceHasLocks {
+                    namespace: namespace.to_string(),
+                },
+            )
+        }))
+        .buffer_unordered(FANOUT_CONCURRENCY);
+        while let Some(result) = stream.next().await {
+            match result? {
+                ReadResult::Bool(true) => return Ok(true),
+                ReadResult::Bool(false) => {}
+                _ => anyhow::bail!("unexpected read result"),
+            }
+        }
+        Ok(false)
+    }
+
+    async fn ensure_namespace_drained_if_route_changes(
+        &self,
+        namespace: &str,
+        explicit: bool,
+    ) -> anyhow::Result<()> {
+        if !self.namespace_route_would_change(namespace, explicit) {
+            return Ok(());
+        }
+        if self.namespace_has_locks_anywhere(namespace).await? {
+            return Err(NamespaceNotDrained {
+                namespace: namespace.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn ensure_namespace_drained_before_delete(
+        &self,
+        namespace: &str,
+        explicit: bool,
+    ) -> anyhow::Result<()> {
+        if !explicit {
+            return Ok(());
+        }
+        if self.namespace_has_locks_anywhere(namespace).await? {
+            return Err(NamespaceNotDrained {
+                namespace: namespace.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// The group a routing namespace places onto, memoized — namespaces are
     /// low-cardinality in practice while requests may carry many paths.
     fn group_of_domain(&self, domain: &str) -> GroupId {
         if let Some(group) = self
@@ -643,17 +842,18 @@ impl Router {
         args: AcquireArgs,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
-        let segments = self.routing.routing_prefix_segments;
-        let domains: std::collections::HashSet<&str> = args
-            .requests
-            .iter()
-            .map(|r| routing_prefix(&r.path, segments))
-            .chain(
-                args.release_requests
-                    .iter()
-                    .map(|r| routing_prefix(&r.path, segments)),
-            )
-            .collect();
+        self.refresh_namespace_cache_if_stale().await?;
+        let mut domains: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for req in &args.requests {
+            let route = self.resolve_namespace_cached(&req.path);
+            if req.state == crate::engine::State::New {
+                self.ensure_lockable_route(&req.path, &route)?;
+            }
+            domains.insert(route.namespace);
+        }
+        for req in &args.release_requests {
+            domains.insert(self.resolve_namespace_cached(&req.path).namespace);
+        }
 
         if domains.len() > 1 {
             return Err(MultiDomainUnsupported.into());
@@ -661,12 +861,18 @@ impl Router {
         let Some(domain) = domains.into_iter().next() else {
             return Ok((AcquireOutcome::Ok, Vec::new()));
         };
-        let group = self.group_of_domain(domain);
+        let group = self.group_of_domain(&domain);
 
         match self
             .apply_to(
                 group,
-                self.command_with_idempotency(Op::Acquire(args), idempotency_key),
+                self.command_with_idempotency(
+                    Op::AcquireInNamespace {
+                        namespace: domain,
+                        args,
+                    },
+                    idempotency_key,
+                ),
             )
             .await?
         {
@@ -676,8 +882,8 @@ impl Router {
         }
     }
 
-    /// Release explicit paths, grouped by routing domain (a release may span
-    /// domains; each group's release is independent).
+    /// Release explicit paths, grouped by routing namespace (a release may
+    /// span namespaces; each group's release is independent).
     pub async fn release(
         &self,
         owner: &str,
@@ -709,6 +915,7 @@ impl Router {
         if reqs.is_empty() {
             return Ok(Vec::new());
         }
+        self.refresh_namespace_cache_if_stale().await?;
         let mut by_group: HashMap<GroupId, Vec<RelReq>> = HashMap::new();
         for req in reqs {
             by_group
@@ -778,7 +985,7 @@ impl Router {
     /// Renew the owner's per-group leases.
     ///
     /// `domains` (client-declared, from `RenewRequest.domains`) targets the
-    /// fan-out: with it, only those routing domains' groups are touched — the
+    /// fan-out: with it, only those routing namespaces' groups are touched — the
     /// recommended mode, keeping renew cost proportional to what the owner
     /// actually holds. Without it, every lock group is probed (correct but
     /// amplified; discouraged for heartbeat-frequency renews).
@@ -972,6 +1179,133 @@ impl Router {
         Ok(())
     }
 
+    pub async fn set_namespace_policy(
+        &self,
+        namespace: &str,
+        algorithm: LockAlgorithm,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+        self.refresh_namespace_cache_if_stale().await?;
+        let (_, explicit) = self.namespace_policy(namespace).await?;
+        let route_changes = self.namespace_route_would_change(namespace, explicit);
+        if route_changes {
+            self.ensure_namespace_drained_if_route_changes(namespace, explicit)
+                .await?;
+        }
+
+        let lock_cmds: Vec<(GroupId, Command)> = self
+            .lock_groups()
+            .map(|group| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::SetNamespacePolicy {
+                            namespace: namespace.to_string(),
+                            algorithm,
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+        for resp in self.fanout_apply(lock_cmds).await? {
+            match resp {
+                ApplyResponse::Unit => {}
+                _ => anyhow::bail!("unexpected response type"),
+            }
+        }
+        match self
+            .apply_to(
+                SYS_GROUP,
+                self.command_with_idempotency(
+                    Op::SetNamespacePolicy {
+                        namespace: namespace.to_string(),
+                        algorithm,
+                    },
+                    idempotency_key,
+                ),
+            )
+            .await?
+        {
+            ApplyResponse::Unit => {}
+            _ => anyhow::bail!("unexpected response type"),
+        }
+        self.cache_namespace_root(namespace);
+        if route_changes {
+            tokio::time::sleep(Duration::from_millis(NAMESPACE_CACHE_REFRESH_MS)).await;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_namespace_policy(
+        &self,
+        namespace: &str,
+        idempotency_key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+        self.refresh_namespace_cache_if_stale().await?;
+        let (_, explicit) = self.namespace_policy(namespace).await?;
+        if explicit {
+            self.ensure_namespace_drained_before_delete(namespace, explicit)
+                .await?;
+        }
+
+        let lock_cmds: Vec<(GroupId, Command)> = self
+            .lock_groups()
+            .map(|group| {
+                (
+                    group,
+                    self.command_with_idempotency(
+                        Op::DeleteNamespacePolicy {
+                            namespace: namespace.to_string(),
+                        },
+                        idempotency_key,
+                    ),
+                )
+            })
+            .collect();
+        for resp in self.fanout_apply(lock_cmds).await? {
+            match resp {
+                ApplyResponse::Unit => {}
+                _ => anyhow::bail!("unexpected response type"),
+            }
+        }
+        match self
+            .apply_to(
+                SYS_GROUP,
+                self.command_with_idempotency(
+                    Op::DeleteNamespacePolicy {
+                        namespace: namespace.to_string(),
+                    },
+                    idempotency_key,
+                ),
+            )
+            .await?
+        {
+            ApplyResponse::Unit => {}
+            _ => anyhow::bail!("unexpected response type"),
+        }
+        self.uncache_namespace_root(namespace);
+        if explicit {
+            tokio::time::sleep(Duration::from_millis(NAMESPACE_CACHE_REFRESH_MS)).await;
+        }
+        Ok(())
+    }
+
+    pub async fn namespace_policy(&self, namespace: &str) -> anyhow::Result<(LockAlgorithm, bool)> {
+        let op = ReadOp::GetNamespacePolicy {
+            namespace: namespace.to_string(),
+        };
+        match self.read_linearizable(SYS_GROUP, op).await? {
+            ReadResult::NamespacePolicy {
+                algorithm,
+                explicit,
+            } => Ok((algorithm, explicit)),
+            _ => anyhow::bail!("unexpected read result"),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Read-only operations
     // -----------------------------------------------------------------------
@@ -984,6 +1318,7 @@ impl Router {
         token: i64,
         paths: &[String],
     ) -> anyhow::Result<AssertOutcome> {
+        self.refresh_namespace_cache_if_stale().await?;
         let mut by_group: HashMap<GroupId, Vec<String>> = HashMap::new();
         for path in paths {
             by_group
@@ -1092,6 +1427,7 @@ impl Router {
     /// Check whether `owner` still blocks at `path` — the lock state lives in
     /// the path's group.
     pub async fn is_blocking(&self, path: &str, owner: &str, reason: &str) -> anyhow::Result<bool> {
+        self.refresh_namespace_cache_if_stale().await?;
         let group = self.group_of(path);
         let op = ReadOp::IsBlocking {
             path: path.to_string(),
@@ -1127,6 +1463,7 @@ impl Router {
     }
 
     pub async fn inspect_path(&self, path: &str) -> anyhow::Result<PathInfo> {
+        self.refresh_namespace_cache_if_stale().await?;
         let group = self.group_of(path);
         let op = ReadOp::InspectPath {
             path: path.to_string(),
@@ -1277,13 +1614,26 @@ mod tests {
         for group in (0..routing.group_count).chain([SYS_GROUP]) {
             groups.bootstrap_group(group, voters.clone()).await.unwrap();
         }
-        (Arc::new(Router::new(groups, routing, None)), dir)
+        let router = Arc::new(Router::new(groups, routing, None));
+        router
+            .probe_writer(Duration::from_secs(10))
+            .await
+            .expect("test router sys group must elect a leader");
+        (router, dir)
     }
 
     fn wr_req(path: &str) -> LockReq {
         LockReq {
             path: path.into(),
             mode: Mode::Write,
+            state: State::New,
+        }
+    }
+
+    fn rd_req(path: &str) -> LockReq {
+        LockReq {
+            path: path.into(),
+            mode: Mode::Read,
             state: State::New,
         }
     }
@@ -1424,6 +1774,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fallback_namespace_is_first_segment_and_root_requires_explicit_namespace() {
+        let (router, _dir) = test_router_with_segments(1).await;
+
+        let err = router
+            .acquire(AcquireArgs {
+                owner_id: "root-owner".into(),
+                ttl_ms: 30_000,
+                requests: vec![wr_req("h:/")],
+                fencing_token: 1,
+                release_requests: vec![],
+                queue_ttl_ms: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<NamespaceDepthUnsupported>().is_some());
+
+        router
+            .set_namespace_policy("h:/", LockAlgorithm::RecursiveRw, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "root-owner".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req("h:/")],
+                    fencing_token: 1,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Ok
+        );
+        assert!(matches!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "child-owner".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req("h:/a")],
+                    fencing_token: 2,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Queued { reason, .. } if reason == "ancestor_locked"
+        ));
+    }
+
+    #[tokio::test]
+    async fn explicit_nested_namespace_controls_routing_policy_and_delete_falls_back() {
+        let (router, _dir) = test_router_with_segments(1).await;
+
+        router
+            .set_namespace_policy("h:/a/b", LockAlgorithm::PointWrite, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            router.namespace_policy("h:/a/b").await.unwrap(),
+            (LockAlgorithm::PointWrite, true)
+        );
+
+        assert!(matches!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "reader".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![rd_req("h:/a/b/file")],
+                    fencing_token: 0,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Conflict { reason, .. } if reason == "read_locks_disabled"
+        ));
+
+        let err = router
+            .acquire(AcquireArgs {
+                owner_id: "multi".into(),
+                ttl_ms: 30_000,
+                requests: vec![wr_req("h:/a/c"), wr_req("h:/a/b/file")],
+                fencing_token: 3,
+                release_requests: vec![],
+                queue_ttl_ms: 0,
+            })
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<MultiDomainUnsupported>().is_some());
+
+        router
+            .delete_namespace_policy("h:/a/b", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            router.namespace_policy("h:/a/b").await.unwrap(),
+            (LockAlgorithm::RecursiveRw, false)
+        );
+        assert_eq!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "reader".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![rd_req("h:/a/b/file")],
+                    fencing_token: 0,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Ok
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_route_changes_require_drained_subtree() {
+        let (router, _dir) = test_router_with_segments(1).await;
+
+        assert_eq!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "holder".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req("h:/guard/deep/file")],
+                    fencing_token: 1,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Ok
+        );
+
+        let err = router
+            .set_namespace_policy("h:/guard/deep", LockAlgorithm::PointWrite, None)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<NamespaceNotDrained>().is_some());
+
+        router
+            .set_namespace_policy("h:/guard", LockAlgorithm::PointWrite, None)
+            .await
+            .unwrap();
+
+        router
+            .set_namespace_policy("h:/delete-me", LockAlgorithm::RecursiveRw, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            router
+                .acquire(AcquireArgs {
+                    owner_id: "delete-holder".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req("h:/delete-me/file")],
+                    fencing_token: 2,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap()
+                .0,
+            AcquireOutcome::Ok
+        );
+        let err = router
+            .delete_namespace_policy("h:/delete-me", None)
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<NamespaceNotDrained>().is_some());
+
+        router
+            .release("delete-holder", &[wr_rel("h:/delete-me/file")], false)
+            .await
+            .unwrap();
+        router
+            .delete_namespace_policy("h:/delete-me", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn concurrent_writes_serialize_correctly() {
         let (router, _dir) = test_router().await;
 
@@ -1459,7 +1995,7 @@ mod tests {
     async fn owner_wide_ops_fan_out_across_domains() {
         let (router, _dir) = test_router().await;
 
-        // Same owner locks paths in two different routing domains.
+        // Same owner locks paths in two different routing namespaces.
         for path in ["alpha:/a", "beta:/b"] {
             let (outcome, _granted) = router
                 .acquire(AcquireArgs {
@@ -1557,12 +2093,10 @@ mod tests {
         }
     }
 
-    // The wait queue is per-group, so it is correct under sharding only if a
-    // path and its whole *comparable* (ancestor/descendant) lockable subtree
-    // always route to one group. With routing_prefix_segments=K, containment
-    // closure (locks below depth K are rejected; the prefix is the first K
-    // segments) guarantees exactly that. This pins it down: an ancestor write
-    // and a descendant write share a shard, the descendant queues behind the
+    // The wait queue is per-group. With the static fallback prefix and no
+    // nested explicit namespace, comparable paths under that fallback root
+    // route to one group. This pins it down: an ancestor write and a
+    // descendant write share a shard, the descendant queues behind the
     // ancestor, and is granted in place when the ancestor releases.
     #[tokio::test]
     async fn queue_shards_with_locks_under_routing_prefix_segments() {
@@ -1581,7 +2115,11 @@ mod tests {
         let acq = |owner: &str, fence: i64, path: &str, state: State| AcquireArgs {
             owner_id: owner.into(),
             ttl_ms: 30_000,
-            requests: vec![LockReq { path: path.into(), mode: Mode::Write, state }],
+            requests: vec![LockReq {
+                path: path.into(),
+                mode: Mode::Write,
+                state,
+            }],
             fencing_token: fence,
             release_requests: vec![],
             queue_ttl_ms: 0,
@@ -1589,22 +2127,44 @@ mod tests {
 
         // Owner A holds the ancestor write (covers the subtree).
         assert_eq!(
-            router.acquire(acq("a", 1, anc, State::New)).await.unwrap().0,
+            router
+                .acquire(acq("a", 1, anc, State::New))
+                .await
+                .unwrap()
+                .0,
             AcquireOutcome::Ok
         );
         // A descendant write by B is enqueued in the same group (covered by A).
         assert!(
             matches!(
-                router.acquire(acq("b", 2, desc, State::New)).await.unwrap().0,
+                router
+                    .acquire(acq("b", 2, desc, State::New))
+                    .await
+                    .unwrap()
+                    .0,
                 AcquireOutcome::Queued { .. }
             ),
             "descendant write must queue behind the covering ancestor"
         );
 
         // A releases → B is granted in place (same-group grant sweep).
-        router.release("a", &[RelReq { path: anc.into(), mode: Mode::Write }], false).await.unwrap();
+        router
+            .release(
+                "a",
+                &[RelReq {
+                    path: anc.into(),
+                    mode: Mode::Write,
+                }],
+                false,
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            router.acquire(acq("b", 2, desc, State::Held)).await.unwrap().0,
+            router
+                .acquire(acq("b", 2, desc, State::Held))
+                .await
+                .unwrap()
+                .0,
             AcquireOutcome::Ok,
             "B must hold the descendant after the ancestor releases"
         );

@@ -79,6 +79,17 @@ pub enum ReadOp {
     ReadWaitEdge {
         owner: String,
     },
+    /// Sys-group only: read a namespace's lock algorithm policy.
+    GetNamespacePolicy {
+        namespace: String,
+    },
+    /// Sys-group only: list explicit namespace policy/routing roots.
+    ListNamespaces,
+    /// Lock-group read: true if the group has live locks contained by a
+    /// namespace root.
+    NamespaceHasLocks {
+        namespace: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +103,11 @@ pub enum ReadResult {
     },
     DumpPage(crate::engine::LockDumpPage),
     WaitEdge(Option<crate::engine::WaitEdge>),
+    NamespacePolicy {
+        algorithm: crate::engine::LockAlgorithm,
+        explicit: bool,
+    },
+    NamespaceList(Vec<String>),
 }
 
 /// Error half of a forwarded command/read response.

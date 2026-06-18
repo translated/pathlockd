@@ -412,5 +412,19 @@ pub fn execute_read_blocking(
         ReadOp::ReadWaitEdge { owner } => {
             crate::engine::read_wait_edge(&mut txn, &owner).map(ReadResult::WaitEdge)
         }
+        ReadOp::GetNamespacePolicy { namespace } => {
+            let (algorithm, explicit) =
+                crate::engine::get_namespace_policy_inner(&mut txn, &namespace)?;
+            Ok(ReadResult::NamespacePolicy {
+                algorithm,
+                explicit,
+            })
+        }
+        ReadOp::ListNamespaces => crate::store_rocksdb::list_namespace_settings(db, group, now_ms)
+            .map(ReadResult::NamespaceList),
+        ReadOp::NamespaceHasLocks { namespace } => {
+            crate::store_rocksdb::namespace_has_live_locks(db, group, now_ms, &namespace)
+                .map(ReadResult::Bool)
+        }
     }
 }

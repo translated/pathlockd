@@ -8,11 +8,12 @@
 use std::sync::Arc;
 
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, AssertOutcome, LockReq, Mode, RelReq, RenewOutcome, State,
-    WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, AssertOutcome, LockAlgorithm, LockReq, Mode, RelReq, RenewOutcome,
+    State, WaitEdgeMetadata,
 };
 use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
+use pathlockd::raft::types::{ReadOp, ReadResult};
 use pathlockd::store_keys;
 
 /// All single-process tests pin their state to one Raft group keyspace.
@@ -84,6 +85,23 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
         release_requests: vec![],
         queue_ttl_ms: 0,
     }
+}
+
+fn set_policy(db: &Arc<rocksdb::DB>, now_ms: u64, namespace: &str, algorithm: LockAlgorithm) {
+    assert!(matches!(
+        apply(
+            db,
+            Command {
+                request_id: None,
+                now_ms,
+                op: Op::SetNamespacePolicy {
+                    namespace: namespace.into(),
+                    algorithm,
+                },
+            },
+        ),
+        ApplyResponse::Unit
+    ));
 }
 
 #[test]
@@ -2383,5 +2401,319 @@ fn expired_queue_entries_are_gc_swept() {
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { owner, .. }) => assert_eq!(owner, "alice"),
         other => panic!("expected Carol queued behind Alice, got {:?}", other),
+    }
+}
+
+#[test]
+fn point_rw_policy_is_nonrecursive_but_same_path_rw() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::PointRw);
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+
+    // Nonrecursive: a point write at h:/a does not cover h:/a/b.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+
+    // Still an RWLock on the exact path.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 3,
+                op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![rd("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == "write_locked"
+    ));
+}
+
+#[test]
+fn write_only_policies_reject_new_reads() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    for (i, algorithm) in [LockAlgorithm::RecursiveWrite, LockAlgorithm::PointWrite]
+        .into_iter()
+        .enumerate()
+    {
+        set_policy(&db, now + (i as u64 * 2), "h", algorithm);
+        match apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + (i as u64 * 2) + 1,
+                op: Op::Acquire(acquire_args(
+                    &format!("reader-{i}"),
+                    60_000,
+                    0,
+                    vec![rd(&format!("h:/read-{i}"))],
+                )),
+            },
+        ) {
+            ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+                assert_eq!(reason, "read_locks_disabled");
+            }
+            other => panic!("expected read_locks_disabled conflict, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn recursive_write_and_point_write_scope_differ() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::RecursiveWrite);
+
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/recursive")])),
+        },
+    );
+    set_policy(&db, now + 2, "h", LockAlgorithm::PointWrite);
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 3,
+            op: Op::Acquire(acquire_args(
+                "bob",
+                60_000,
+                2,
+                vec![wr("h:/recursive/child")],
+            )),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
+            assert_eq!(reason, "ancestor_locked");
+        }
+        other => panic!("expected recursive ancestor conflict, got {other:?}"),
+    }
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 4,
+                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/point")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 5,
+                op: Op::Acquire(acquire_args("dave", 60_000, 4, vec![wr("h:/point/child")],)),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+}
+
+#[test]
+fn new_recursive_policy_sees_existing_point_descendants() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::PointWrite);
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+    set_policy(&db, now + 2, "h", LockAlgorithm::RecursiveWrite);
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 3,
+            op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, path, .. }) => {
+            assert_eq!(reason, "descendant_write_locked");
+            assert_eq!(path, "h:/a/b");
+        }
+        other => panic!("expected descendant point lock to block recursive write, got {other:?}"),
+    }
+}
+
+#[test]
+fn namespace_policy_defaults_and_persists_in_sys_group() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    match pathlockd::raft::server::execute_read_blocking(
+        &db,
+        pathlockd::cluster::placement::SYS_GROUP,
+        ReadOp::GetNamespacePolicy {
+            namespace: "h".into(),
+        },
+    )
+    .unwrap()
+    {
+        ReadResult::NamespacePolicy {
+            algorithm,
+            explicit,
+        } => {
+            assert_eq!(algorithm, LockAlgorithm::RecursiveRw);
+            assert!(!explicit);
+        }
+        other => panic!("expected namespace policy result, got {other:?}"),
+    }
+
+    assert!(matches!(
+        state_machine::apply(
+            &db,
+            pathlockd::cluster::placement::SYS_GROUP,
+            &Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::SetNamespacePolicy {
+                    namespace: "h".into(),
+                    algorithm: LockAlgorithm::PointWrite,
+                },
+            },
+        )
+        .unwrap(),
+        ApplyResponse::Unit
+    ));
+
+    match pathlockd::raft::server::execute_read_blocking(
+        &db,
+        pathlockd::cluster::placement::SYS_GROUP,
+        ReadOp::GetNamespacePolicy {
+            namespace: "h".into(),
+        },
+    )
+    .unwrap()
+    {
+        ReadResult::NamespacePolicy {
+            algorithm,
+            explicit,
+        } => {
+            assert_eq!(algorithm, LockAlgorithm::PointWrite);
+            assert!(explicit);
+        }
+        other => panic!("expected namespace policy result, got {other:?}"),
+    }
+
+    assert!(matches!(
+        state_machine::apply(
+            &db,
+            pathlockd::cluster::placement::SYS_GROUP,
+            &Command {
+                request_id: None,
+                now_ms: now + 1_000_000,
+                op: Op::GcSweep {
+                    now_ms: now + 1_000_000,
+                    batch: 1024,
+                },
+            },
+        )
+        .unwrap(),
+        ApplyResponse::Gc { .. }
+    ));
+
+    match pathlockd::raft::server::execute_read_blocking(
+        &db,
+        pathlockd::cluster::placement::SYS_GROUP,
+        ReadOp::GetNamespacePolicy {
+            namespace: "h".into(),
+        },
+    )
+    .unwrap()
+    {
+        ReadResult::NamespacePolicy {
+            algorithm,
+            explicit,
+        } => {
+            assert_eq!(algorithm, LockAlgorithm::PointWrite);
+            assert!(explicit);
+        }
+        other => panic!("expected namespace policy result after GC, got {other:?}"),
+    }
+
+    match pathlockd::raft::server::execute_read_blocking(
+        &db,
+        pathlockd::cluster::placement::SYS_GROUP,
+        ReadOp::ListNamespaces,
+    )
+    .unwrap()
+    {
+        ReadResult::NamespaceList(namespaces) => assert_eq!(namespaces, vec!["h".to_string()]),
+        other => panic!("expected namespace list result, got {other:?}"),
+    }
+
+    assert!(matches!(
+        state_machine::apply(
+            &db,
+            pathlockd::cluster::placement::SYS_GROUP,
+            &Command {
+                request_id: None,
+                now_ms: now + 1_000_001,
+                op: Op::DeleteNamespacePolicy {
+                    namespace: "h".into(),
+                },
+            },
+        )
+        .unwrap(),
+        ApplyResponse::Unit
+    ));
+
+    match pathlockd::raft::server::execute_read_blocking(
+        &db,
+        pathlockd::cluster::placement::SYS_GROUP,
+        ReadOp::GetNamespacePolicy {
+            namespace: "h".into(),
+        },
+    )
+    .unwrap()
+    {
+        ReadResult::NamespacePolicy {
+            algorithm,
+            explicit,
+        } => {
+            assert_eq!(algorithm, LockAlgorithm::RecursiveRw);
+            assert!(!explicit);
+        }
+        other => panic!("expected namespace policy result after delete, got {other:?}"),
     }
 }

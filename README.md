@@ -25,11 +25,11 @@ external dependencies.
 > 1 node works (no fault tolerance), 3+ nodes give HA; replicas join and leave
 > at runtime and groups re-place themselves automatically.
 
-It is *opinionated*: the locking model is exactly the one a virtual-filesystem
-needs — write locks that cover a whole subtree, point reads that don't, fencing
-tokens to make stale writers detectable, leases that expire if a holder dies,
-and built-in deadlock detection — rather than a general-purpose lock manager you
-have to assemble yourself.
+It ships with an opinionated default locking model for virtual filesystems:
+write locks cover a whole subtree, point reads don't, fencing tokens make stale
+writers detectable, leases expire if a holder dies, and built-in deadlock
+detection handles wait-for cycles. Namespaces can opt into simpler policies
+over gRPC when they need flat point locks or write-only locks.
 
 ## Why path locking
 
@@ -65,6 +65,7 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 | --- | --- |
 | **Owner** | A caller-supplied id that owns a lock and all the paths it holds. |
 | **Read / write modes** | Shared readers, exclusive writer — but hierarchical, not flat: a write covers its whole subtree, a read covers only its node. A tree-shaped RWLock, not the symmetric textbook one. Full rules: [docs/locking-semantics.md](docs/locking-semantics.md). |
+| **Namespace policy** | Each routing namespace defaults to recursive RW locking and may be changed with `SetNamespacePolicy`; `GetNamespacePolicy` reports whether the namespace has an explicit persisted setting. |
 | **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
 | **TTL lease + renewal** | Every lock is a lease. The holder renews it; if the holder dies, the lease expires and the subtree frees itself — no orphaned locks. |
 | **Liveness & pruning** | Read sets self-heal: members whose owner lease has lapsed are pruned on the next touch. |
@@ -90,14 +91,14 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 - **Self-contained binary.** All durable state lives in an embedded RocksDB
   engine inside each node. No external coordination service is needed — start
   a single binary and it is ready.
-- **RocksDB for persistence.** Lock metadata is stored in 14 column families
+- **RocksDB for persistence.** Lock metadata is stored in 15 column families
   with TTL-based expiry and background GC sweeps. WAL fsync guarantees
   durability across process crashes.
 - **Multi-Raft consensus.** The path namespace shards into `group_count` Raft
-  groups by **routing domain** (the handler prefix, optionally deeper): a
-  path, its ancestors, and its whole subtree always share one group, so every
-  lock operation is single-group — no cross-shard transactions, ever. Each
-  group is an independent openraft core; writes commit on the group's leader
+  groups by **routing namespace** (first path segment by default, or an
+  explicit namespace root). Every acquire is constrained to one namespace and
+  one Raft group — no cross-shard transactions, ever. Each group is an
+  independent openraft core; writes commit on the group's leader
   and apply identically on every replica. A dedicated **system group** holds
   the cluster-global state: the monotonic fencing counter, the deadlock
   wait-graph, and the membership directory (replicated to every node).
@@ -122,14 +123,16 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 
 ### Scope & limits
 
-- **Write throughput scales per handler, not without bound.** All mutations that
-  touch a given handler serialize through the handler's Raft group leader.
-  Spread load across handlers — or split a hot handler — to scale; a single hot
-  handler is the throughput ceiling.
+- **Write throughput scales per routing namespace, not without bound.** All
+  mutations that touch a given routing namespace serialize through that
+  namespace's Raft group leader. Spread load across first-segment namespaces or
+  explicit namespace roots to scale; a single hot namespace is the throughput
+  ceiling.
 - **Descendant index size.** A write lock is indexed under every ancestor up to
-  the handler root, so the root index aggregates every write lock in the handler
-  in one value. This bounds the practical number of concurrent locks per handler;
-  very wide/deep trees in one handler are not yet sharded (future work).
+  the namespace root, so a broad root index aggregates every write lock in that
+  namespace. This bounds the practical number of concurrent locks per namespace;
+  split very wide/deep trees with explicit namespace roots when parent recursive
+  locks do not need to cover the split subtree.
 - **Input limits (enforced server-side).** `ttl_ms` must be `> 0` (a `0` TTL
   would never expire) and `≤ 7 days`; paths must be normalized
   (`<handler>:/rooted/path`, no `//`, `.`/`..`, or trailing slash);
@@ -285,13 +288,15 @@ correctness backstop, so a dropped event costs wakeup latency, never safety.
 ### Scaling and write throughput
 
 Reads scale with nodes (any replica serves stale-tolerable reads locally).
-Writes scale with **routing domains**: every domain (handler prefix by
-default) serializes through one Raft group leader, and leaders spread across
-nodes. Many handlers → near-linear write scaling. Few handlers → set
-`routing_prefix_segments = K` to shard by the first K path segments instead,
-accepting that locks *above* depth K are rejected (containment must stay
-single-group). Renews should declare their domains (`RenewRequest.domains`)
-so each heartbeat touches only the groups that actually hold state.
+Writes scale with **routing namespaces**: every namespace serializes through
+one Raft group leader, and leaders spread across nodes. By default a path
+routes by handler plus its first path segment (`google_drive:/team`). Operators
+can create explicit namespace roots with `SetNamespacePolicy`, including
+deeper roots such as `google_drive:/team/archive`; the longest explicit root
+wins. Namespace roots are conflict-domain boundaries, so define or delete them
+while the affected subtree is drained if parent recursive locks must cover it.
+Renews should declare their domains (`RenewRequest.domains`) so each heartbeat
+touches only the groups that actually hold state.
 
 To **decommission** a node gracefully, mark it draining (internal
 `RaftTransport/SetDraining` RPC, or just stop it and let the eviction window
@@ -321,7 +326,7 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip addresses of existing members (required unless bootstrapping) |
 | `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a brand-new cluster (exactly one node; guarded against re-init on empty disks) |
 | `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups (fixed at cluster birth) |
-| `routing_prefix_segments` | `PATHLOCKD_ROUTING_PREFIX_SEGMENTS` | `0` | Path depth of the routing domain (0 = handler only) |
+| `routing_prefix_segments` | `PATHLOCKD_ROUTING_PREFIX_SEGMENTS` | `1` | Fallback path depth when no explicit namespace root exists (`1` = handler plus first segment; `0` = legacy handler only) |
 | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (odd; auto-degrades/upgrades with node count) |
 | `stability_window_secs` | `PATHLOCKD_STABILITY_WINDOW_SECS` | `30` | Node uptime required before group placement |
 | `eviction_window_secs` | `PATHLOCKD_EVICTION_WINDOW_SECS` | `60` | How long a voter must be gone before replacement |
@@ -374,7 +379,8 @@ export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 ## gRPC API
 
 The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
-`PathLock` service: `Acquire`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
+`PathLock` service: `Acquire`, `SetNamespacePolicy`, `GetNamespacePolicy`,
+`DeleteNamespacePolicy`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
 `AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
 `ClearWaitEdge`, `IsOwnerAlive`, `RequestRevoke`, `Subscribe` (server stream),
 `Health`.

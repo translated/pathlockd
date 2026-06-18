@@ -33,7 +33,7 @@ owner + stale token), lock-loss on held/renew, dead-owner pruning, deadlock
 cycle detection, is-blocking, inline shadowing release, release-all, and GC
 pruning.
 
-Each test creates a fresh RocksDB in a temp directory with all 14 column
+Each test creates a fresh RocksDB in a temp directory with all 15 column
 families, builds `Command`s, runs `state_machine::apply()`, and asserts
 outcomes. No containers, no network, no external services.
 

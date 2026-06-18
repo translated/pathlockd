@@ -18,6 +18,7 @@ All lock metadata lives across these RocksDB column families:
 | `CF_OWNER_ALIVE` | Liveness marker: owner → "1" |
 | `CF_OWNER_HOLDS` | Owner's held locks set: owner\0mode\0path → member |
 | `CF_WAIT_EDGES` | Deadlock-graph edges: owner → encoded WaitEdge |
+| `CF_NAMESPACE_SETTINGS` | Namespace settings: namespace → lock algorithm policy / explicit route root |
 | `CF_QUEUE` | Wait queue: entry keys (`'e'`+be_u64(seq) → owner+AcquireArgs) iterate FIFO; owner keys (`'o'`+owner → seq) for O(1) dequeue |
 | `CF_EXPIRY` | TTL index: expires_at\0cf\0primary_key (shadow records) |
 | `CF_META` | Global metadata: fence_counter (monotonic), per-group queue sequence |

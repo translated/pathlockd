@@ -17,7 +17,7 @@ deterministic state machine.
 |---|---|
 | `proto/pathlockd.proto` | The gRPC contract (the only public API). |
 | `src/store_rocksdb.rs` | RocksDB-backed `StoreTxn` trait, value model, TTL emulation. |
-| `src/store_keys.rs` | Key layout for all 14 column families. |
+| `src/store_keys.rs` | Key layout for all 15 column families. |
 | `src/engine.rs` | The lock primitives (acquire/release/renew/…), conflict logic. |
 | `src/service.rs` | gRPC service: proto ⇄ engine mapping, event publishing. |
 | `src/events.rs` | Per-owner event broadcaster + peer fan-out. |

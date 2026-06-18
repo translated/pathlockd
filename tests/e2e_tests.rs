@@ -9,9 +9,10 @@ use std::time::Duration;
 use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::{
     AcquireRequest, AcquireStatus, AssertFencingRequest, AssertStatus, CycleKind,
-    DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest, IsOwnerAliveRequest,
-    ListOwnerLocksRequest, LockRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest,
-    RenewStatus, SetWaitEdgeRequest,
+    DeleteNamespacePolicyRequest, DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest,
+    GetNamespacePolicyRequest, IsOwnerAliveRequest, ListOwnerLocksRequest,
+    LockAlgorithm as ProtoLockAlgorithm, LockRequest, LockState, Mode, ReleaseLocksRequest,
+    RenewRequest, RenewStatus, SetNamespacePolicyRequest, SetWaitEdgeRequest,
 };
 use tonic::transport::Channel;
 
@@ -154,6 +155,182 @@ async fn e2e_acquire_and_release() {
         .unwrap()
         .into_inner();
     assert_eq!(resp.status(), AcquireStatus::Ok);
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn e2e_namespace_policy_set_get_and_apply() {
+    let mut daemon = start_daemon().await;
+
+    let policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "policy".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.algorithm(), ProtoLockAlgorithm::RecursiveRw);
+    assert!(!policy.explicit);
+
+    daemon
+        .client
+        .set_namespace_policy(SetNamespacePolicyRequest {
+            namespace: "policy".into(),
+            algorithm: ProtoLockAlgorithm::PointWrite as i32,
+            idempotency_key: "policy-point-write".into(),
+        })
+        .await
+        .unwrap();
+
+    let policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "policy".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.algorithm(), ProtoLockAlgorithm::PointWrite);
+    assert!(policy.explicit);
+
+    let write_req = |owner: &str, fence: i64, path: &str| AcquireRequest {
+        owner_id: owner.into(),
+        ttl_ms: 10000,
+        fencing_token: fence,
+        requests: vec![LockRequest {
+            path: path.into(),
+            mode: Mode::Write as i32,
+            state: LockState::New as i32,
+        }],
+        release_requests: vec![],
+        queue_ttl_ms: 0,
+        idempotency_key: String::new(),
+    };
+
+    assert_eq!(
+        daemon
+            .client
+            .acquire(write_req("alice", 1, "policy:/a"))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok
+    );
+    assert_eq!(
+        daemon
+            .client
+            .acquire(write_req("bob", 2, "policy:/a/b"))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok,
+        "point_write must not recurse into descendants"
+    );
+
+    let read_resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "policy:/read".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read_resp.status(), AcquireStatus::Conflict);
+    assert_eq!(read_resp.reason, "read_locks_disabled");
+
+    daemon
+        .client
+        .set_namespace_policy(SetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+            algorithm: ProtoLockAlgorithm::PointWrite as i32,
+            idempotency_key: "drive-deep-point-write".into(),
+        })
+        .await
+        .unwrap();
+    let path_policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_policy.algorithm(), ProtoLockAlgorithm::PointWrite);
+    assert!(path_policy.explicit);
+
+    let path_read = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "path-reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "drive:/tenant/deep/file".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_read.status(), AcquireStatus::Conflict);
+    assert_eq!(path_read.reason, "read_locks_disabled");
+
+    daemon
+        .client
+        .delete_namespace_policy(DeleteNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+            idempotency_key: "drive-deep-delete".into(),
+        })
+        .await
+        .unwrap();
+    let path_policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_policy.algorithm(), ProtoLockAlgorithm::RecursiveRw);
+    assert!(!path_policy.explicit);
+
+    let fallback_read = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "path-reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "drive:/tenant/deep/file".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback_read.status(), AcquireStatus::Ok);
 
     daemon.child.kill().ok();
 }
@@ -404,12 +581,12 @@ async fn e2e_list_owner_locks() {
             fencing_token: 1,
             requests: vec![
                 pathlockd::proto::LockRequest {
-                    path: "h:/a".into(),
+                    path: "h:/root/a".into(),
                     mode: Mode::Write as i32,
                     state: LockState::New as i32,
                 },
                 pathlockd::proto::LockRequest {
-                    path: "h:/b".into(),
+                    path: "h:/root/b".into(),
                     mode: Mode::Read as i32,
                     state: LockState::New as i32,
                 },
@@ -876,13 +1053,25 @@ async fn e2e_convoy_grants_in_fifo_across_releases() {
     };
 
     assert_eq!(
-        daemon.client.acquire(acq("a", 1, LockState::New)).await.unwrap().into_inner().status(),
+        daemon
+            .client
+            .acquire(acq("a", 1, LockState::New))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
         AcquireStatus::Ok
     );
     // Two waiters queue behind A, in order b then c.
     for (owner, fence) in [("b", 2), ("c", 3)] {
         assert_eq!(
-            daemon.client.acquire(acq(owner, fence, LockState::New)).await.unwrap().into_inner().status(),
+            daemon
+                .client
+                .acquire(acq(owner, fence, LockState::New))
+                .await
+                .unwrap()
+                .into_inner()
+                .status(),
             AcquireStatus::Queued,
             "{owner} should be queued behind the holder"
         );
@@ -891,21 +1080,39 @@ async fn e2e_convoy_grants_in_fifo_across_releases() {
     // A releases → B (FIFO head) is granted in place; C stays queued behind B.
     daemon.client.release(rel("a")).await.unwrap();
     assert_eq!(
-        daemon.client.acquire(acq("b", 2, LockState::Held)).await.unwrap().into_inner().status(),
+        daemon
+            .client
+            .acquire(acq("b", 2, LockState::Held))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
         AcquireStatus::Ok,
         "B (first waiter) must hold h:/c after A releases"
     );
     // C is still waiting (B holds it now) — re-issuing C's acquire re-queues it,
     // and critically does NOT block B's ownership.
     assert_eq!(
-        daemon.client.acquire(acq("c", 3, LockState::New)).await.unwrap().into_inner().status(),
+        daemon
+            .client
+            .acquire(acq("c", 3, LockState::New))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
         AcquireStatus::Queued
     );
 
     // B releases → C is granted next.
     daemon.client.release(rel("b")).await.unwrap();
     assert_eq!(
-        daemon.client.acquire(acq("c", 3, LockState::Held)).await.unwrap().into_inner().status(),
+        daemon
+            .client
+            .acquire(acq("c", 3, LockState::Held))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
         AcquireStatus::Ok,
         "C (second waiter) must hold h:/c after B releases"
     );

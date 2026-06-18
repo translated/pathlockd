@@ -11,17 +11,21 @@
 //! All engine functions are synchronous because the underlying RocksDB
 //! operations are inherently sync. The Raft state machine's apply is also sync.
 
+use std::str::FromStr;
+
 use tracing::warn;
 
 use crate::store_keys::{
-    alive_key, fence_key, own_prefix, rd_prefix, rddesc_prefix, wait_key, wr_key, wrdesc_key,
-    FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
+    alive_key, fence_key, hold_algorithm_key, namespace_policy_key, own_prefix, rd_prefix,
+    rddesc_prefix, wait_key, wr_key, wrdesc_key, FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
 
 use crate::store_keys::CF_DESC_READ as RDDESC_CF;
 use crate::store_keys::CF_DESC_WRITE as WRDESC_CF;
 use crate::store_keys::CF_FENCES as FENCE_CF;
+use crate::store_keys::CF_META as META_CF;
+use crate::store_keys::CF_NAMESPACE_SETTINGS as NS_SETTINGS_CF;
 use crate::store_keys::CF_OWNER_ALIVE as ALIVE_CF;
 use crate::store_keys::CF_OWNER_HOLDS as OWN_CF;
 use crate::store_keys::CF_READ_LOCKS as RD_CF;
@@ -56,6 +60,94 @@ impl Mode {
         match self {
             Mode::Write => "write",
             Mode::Read => "read",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LockAlgorithm {
+    /// Default: multiple point reads on a path; writes exclude the path and
+    /// descendants.
+    RecursiveRw,
+    /// Multiple point reads on a path; writes exclude only the exact path.
+    PointRw,
+    /// Write locks only; writes exclude the path and descendants.
+    RecursiveWrite,
+    /// Write locks only; writes exclude only the exact path.
+    PointWrite,
+}
+
+impl Default for LockAlgorithm {
+    fn default() -> Self {
+        Self::RecursiveRw
+    }
+}
+
+impl LockAlgorithm {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RecursiveRw => "recursive_rw",
+            Self::PointRw => "point_rw",
+            Self::RecursiveWrite => "recursive_write",
+            Self::PointWrite => "point_write",
+        }
+    }
+
+    pub fn allows_read(self) -> bool {
+        matches!(self, Self::RecursiveRw | Self::PointRw)
+    }
+
+    pub fn recursive(self) -> bool {
+        matches!(self, Self::RecursiveRw | Self::RecursiveWrite)
+    }
+
+    pub fn allows_mode(self, mode: Mode) -> bool {
+        mode == Mode::Write || self.allows_read()
+    }
+
+    pub fn variants() -> &'static [&'static str] {
+        &["recursive_rw", "point_rw", "recursive_write", "point_write"]
+    }
+}
+
+impl std::fmt::Display for LockAlgorithm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for LockAlgorithm {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let normalized = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+        match normalized.as_str() {
+            "recursive_rw" | "recursive_rwlock" | "rw_recursive" | "rwlock"
+            | "rwlock_recursive" => Ok(Self::RecursiveRw),
+            "point_rw"
+            | "point_rwlock"
+            | "flat_rw"
+            | "flat_rwlock"
+            | "rw_point"
+            | "rwlock_point"
+            | "rwlock_flat"
+            | "rwlock_nonrecursive"
+            | "rwlock_no_recursion"
+            | "rwlock_no_recursive"
+            | "nonrecursive_rw"
+            | "non_recursive_rw" => Ok(Self::PointRw),
+            "recursive_write"
+            | "write_recursive"
+            | "write_only_recursive"
+            | "recursive_write_only"
+            | "recursive_mutex"
+            | "mutex_recursive" => Ok(Self::RecursiveWrite),
+            "point_write" | "write_point" | "flat_write" | "write_only_point"
+            | "point_write_only" | "point_mutex" | "mutex" | "flat_mutex" => Ok(Self::PointWrite),
+            _ => anyhow::bail!(
+                "unknown lock algorithm {raw:?}; expected one of: {}",
+                Self::variants().join(", ")
+            ),
         }
     }
 }
@@ -184,12 +276,116 @@ pub fn get_ancestors(full_path: &str) -> Vec<String> {
     ancestors
 }
 
+/// Whether `anc` is a strict ancestor of `desc` in the same namespace.
+pub fn is_strict_ancestor(anc: &str, desc: &str) -> bool {
+    get_ancestors(desc).iter().any(|a| a == anc)
+}
+
+/// Whether two requested locks cannot coexist when each uses its own policy.
+pub fn locks_conflict(
+    a_algorithm: LockAlgorithm,
+    a_path: &str,
+    a_mode: Mode,
+    b_algorithm: LockAlgorithm,
+    b_path: &str,
+    b_mode: Mode,
+) -> bool {
+    if !a_algorithm.allows_mode(a_mode) || !b_algorithm.allows_mode(b_mode) {
+        return false;
+    }
+    if a_path == b_path {
+        return a_mode == Mode::Write || b_mode == Mode::Write;
+    }
+    if is_strict_ancestor(a_path, b_path) {
+        return a_mode == Mode::Write && a_algorithm.recursive();
+    }
+    if is_strict_ancestor(b_path, a_path) {
+        return b_mode == Mode::Write && b_algorithm.recursive();
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers (all sync)
 // ---------------------------------------------------------------------------
 
 fn owner_alive<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<bool> {
     tx.get_str(ALIVE_CF, &alive_key(owner)).map(|v| v.is_some())
+}
+
+pub fn set_namespace_policy_inner<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<()> {
+    tx.set_str(
+        NS_SETTINGS_CF,
+        &namespace_policy_key(namespace),
+        algorithm.as_str(),
+        0,
+    )
+}
+
+pub fn delete_namespace_policy_inner<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+) -> anyhow::Result<()> {
+    tx.del(NS_SETTINGS_CF, &namespace_policy_key(namespace))
+}
+
+pub fn get_namespace_policy_inner<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+) -> anyhow::Result<(LockAlgorithm, bool)> {
+    match tx.get_str(NS_SETTINGS_CF, &namespace_policy_key(namespace))? {
+        None => Ok((LockAlgorithm::default(), false)),
+        Some(raw) => match raw.parse::<LockAlgorithm>() {
+            Ok(algorithm) => Ok((algorithm, true)),
+            Err(e) => {
+                warn!(namespace, value = %raw, error = %e, "invalid namespace lock policy; using default");
+                Ok((LockAlgorithm::default(), true))
+            }
+        },
+    }
+}
+
+fn hold_algorithm<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    mode: Mode,
+    path: &str,
+) -> anyhow::Result<LockAlgorithm> {
+    match tx.get_str(META_CF, &hold_algorithm_key(owner, mode.as_str(), path))? {
+        None => Ok(LockAlgorithm::default()),
+        Some(raw) => raw
+            .parse::<LockAlgorithm>()
+            .or(Ok(LockAlgorithm::default())),
+    }
+}
+
+fn set_hold_algorithm<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    mode: Mode,
+    path: &str,
+    algorithm: LockAlgorithm,
+    ttl_ms: u64,
+) -> anyhow::Result<()> {
+    tx.set_str(
+        META_CF,
+        &hold_algorithm_key(owner, mode.as_str(), path),
+        algorithm.as_str(),
+        ttl_ms,
+    )
+}
+
+fn del_hold_algorithm<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    mode: Mode,
+    path: &str,
+) -> anyhow::Result<()> {
+    tx.del(META_CF, &hold_algorithm_key(owner, mode.as_str(), path))
 }
 
 fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Vec<String>> {
@@ -201,6 +397,7 @@ fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
             alive.push(o);
         } else {
             tx.srem(RD_CF, &rd_pfx, &o)?;
+            del_hold_algorithm(tx, &o, Mode::Read, path)?;
         }
     }
     Ok(alive)
@@ -214,6 +411,7 @@ fn get_live_write_owner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<O
         return Ok(Some(owner));
     }
     tx.del(WR_CF, &wr_key(path))?;
+    del_hold_algorithm(tx, &owner, Mode::Write, path)?;
     remove_descendant_indexes(tx, Mode::Write, path)?;
     Ok(None)
 }
@@ -315,6 +513,14 @@ pub fn acquire_inner<T: StoreTxn>(
     tx: &mut T,
     args: &AcquireArgs,
 ) -> anyhow::Result<AcquireOutcome> {
+    acquire_inner_with_policy(tx, args, LockAlgorithm::default())
+}
+
+pub fn acquire_inner_with_policy<T: StoreTxn>(
+    tx: &mut T,
+    args: &AcquireArgs,
+    request_algorithm: LockAlgorithm,
+) -> anyhow::Result<AcquireOutcome> {
     let owner = &args.owner_id;
     let ttl = args.ttl_ms;
     let fence_ttl = ttl.max(FENCE_MIN_TTL_MS);
@@ -358,9 +564,14 @@ pub fn acquire_inner<T: StoreTxn>(
                 }
             }
             State::New => {
+                if !request_algorithm.allows_mode(req.mode) {
+                    return Ok(conflict(path, "", "read_locks_disabled"));
+                }
                 for anc in get_ancestors(path) {
                     if let Some(anc_owner) = get_live_write_owner(tx, &anc)? {
-                        if anc_owner != *owner {
+                        if anc_owner != *owner
+                            && hold_algorithm(tx, &anc_owner, Mode::Write, &anc)?.recursive()
+                        {
                             return Ok(conflict(&anc, &anc_owner, "ancestor_locked"));
                         }
                     }
@@ -380,19 +591,21 @@ pub fn acquire_inner<T: StoreTxn>(
                             return Ok(conflict(path, o, "read_locked"));
                         }
                     }
-                    if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path)? {
-                        return Ok(AcquireOutcome::Conflict {
-                            path: p,
-                            owner: o,
-                            reason: r,
-                        });
-                    }
-                    if let Some((p, o, r)) = find_descendant_read_conflict(tx, owner, path)? {
-                        return Ok(AcquireOutcome::Conflict {
-                            path: p,
-                            owner: o,
-                            reason: r,
-                        });
+                    if request_algorithm.recursive() {
+                        if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path)? {
+                            return Ok(AcquireOutcome::Conflict {
+                                path: p,
+                                owner: o,
+                                reason: r,
+                            });
+                        }
+                        if let Some((p, o, r)) = find_descendant_read_conflict(tx, owner, path)? {
+                            return Ok(AcquireOutcome::Conflict {
+                                path: p,
+                                owner: o,
+                                reason: r,
+                            });
+                        }
                     }
                     if let Some(cur) = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?) {
                         if cur > token {
@@ -415,6 +628,12 @@ pub fn acquire_inner<T: StoreTxn>(
         let path = &req.path;
         let member = format!("{}:{}", req.mode.as_str(), path);
         tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
+        let held_algorithm = if req.state == State::Held {
+            hold_algorithm(tx, owner, req.mode, path)?
+        } else {
+            request_algorithm
+        };
+        set_hold_algorithm(tx, owner, req.mode, path, held_algorithm, ttl)?;
 
         if req.mode == Mode::Write {
             let wr_k = wr_key(path);
@@ -469,6 +688,7 @@ pub fn acquire_inner<T: StoreTxn>(
                 return Ok(lost(&path, "missing_write"));
             }
             tx.pexpire_str(WR_CF, &wr_k, ttl)?;
+            let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
             match parse_fence(tx.get_str(FENCE_CF, &fence_key(&path))?) {
                 None => return Ok(lost(&path, "missing_fence")),
                 Some(cur) if token > 0 && cur > token => {
@@ -484,6 +704,7 @@ pub fn acquire_inner<T: StoreTxn>(
                     )?;
                 }
             }
+            set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl)?;
             add_descendant_indexes(tx, Mode::Write, &path, ttl)?;
             tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
         } else if mode == "read" {
@@ -491,7 +712,9 @@ pub fn acquire_inner<T: StoreTxn>(
             if !tx.sismember(RD_CF, &rd_pfx, owner)? {
                 return Ok(lost(&path, "missing_read"));
             }
+            let lock_algorithm = hold_algorithm(tx, owner, Mode::Read, &path)?;
             tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
+            set_hold_algorithm(tx, owner, Mode::Read, &path, lock_algorithm, ttl)?;
             add_descendant_indexes(tx, Mode::Read, &path, ttl)?;
             tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
         }
@@ -508,11 +731,13 @@ pub fn acquire_inner<T: StoreTxn>(
                 let wr_k = wr_key(path);
                 if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner.as_str()) {
                     tx.del(WR_CF, &wr_k)?;
+                    del_hold_algorithm(tx, owner, Mode::Write, path)?;
                     remove_descendant_indexes(tx, Mode::Write, path)?;
                 }
             } else {
                 let rd_pfx = rd_prefix(path);
                 tx.srem(RD_CF, &rd_pfx, owner)?;
+                del_hold_algorithm(tx, owner, Mode::Read, path)?;
                 if !tx.has_live_member(RD_CF, &rd_pfx)? {
                     remove_descendant_indexes(tx, Mode::Read, path)?;
                 }
@@ -551,11 +776,13 @@ pub fn release_inner<T: StoreTxn>(
             let wr_k = wr_key(path);
             if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
                 tx.del(WR_CF, &wr_k)?;
+                del_hold_algorithm(tx, owner, Mode::Write, path)?;
                 remove_descendant_indexes(tx, Mode::Write, path)?;
             }
         } else {
             let rd_pfx = rd_prefix(path);
             tx.srem(RD_CF, &rd_pfx, owner)?;
+            del_hold_algorithm(tx, owner, Mode::Read, path)?;
             if !tx.has_live_member(RD_CF, &rd_pfx)? {
                 remove_descendant_indexes(tx, Mode::Read, path)?;
             }
@@ -593,11 +820,13 @@ fn release_held_member<T: StoreTxn>(tx: &mut T, owner: &str, item: &str) -> anyh
         let wr_k = wr_key(path);
         if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
             tx.del(WR_CF, &wr_k)?;
+            del_hold_algorithm(tx, owner, Mode::Write, path)?;
             remove_descendant_indexes(tx, Mode::Write, path)?;
         }
     } else if mode == "read" {
         let rd_pfx = rd_prefix(path);
         tx.srem(RD_CF, &rd_pfx, owner)?;
+        del_hold_algorithm(tx, owner, Mode::Read, path)?;
         if !tx.has_live_member(RD_CF, &rd_pfx)? {
             remove_descendant_indexes(tx, Mode::Read, path)?;
         }
@@ -696,12 +925,14 @@ pub fn renew_inner<T: StoreTxn>(
                     if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner) {
                         return Ok(renew_lost(&path, "missing_write"));
                     }
+                    let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
                     tx.pexpire_str(WR_CF, &wr_k, ttl_ms)?;
                     let fence_k = fence_key(&path);
                     if tx.get_str(FENCE_CF, &fence_k)?.is_none() {
                         return Ok(renew_lost(&path, "missing_fence"));
                     }
                     tx.pexpire_str(FENCE_CF, &fence_k, fence_ttl)?;
+                    set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl_ms)?;
                     add_descendant_indexes(tx, Mode::Write, &path, ttl_ms)?;
                     tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
                     renewed += 1;
@@ -712,7 +943,9 @@ pub fn renew_inner<T: StoreTxn>(
                         remove_descendant_indexes(tx, Mode::Read, &path)?;
                     }
                     if owners.iter().any(|o| o == owner) {
+                        let lock_algorithm = hold_algorithm(tx, owner, Mode::Read, &path)?;
                         tx.sadd(RD_CF, &rd_pfx, owner, ttl_ms)?;
+                        set_hold_algorithm(tx, owner, Mode::Read, &path, lock_algorithm, ttl_ms)?;
                         add_descendant_indexes(tx, Mode::Read, &path, ttl_ms)?;
                         tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
                         renewed += 1;
@@ -871,6 +1104,7 @@ pub fn is_blocking_inner<T: StoreTxn>(
             return Ok(true);
         }
         tx.srem(RD_CF, &rd_pfx, conflict_owner)?;
+        del_hold_algorithm(tx, conflict_owner, Mode::Read, conflict_path)?;
         if !tx.has_live_member(RD_CF, &rd_pfx)? {
             remove_descendant_indexes(tx, Mode::Read, conflict_path)?;
         }

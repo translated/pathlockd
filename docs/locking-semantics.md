@@ -14,14 +14,46 @@ the [traceability map](#rule--test-traceability) at the end).
 | Term | Definition |
 |---|---|
 | **Path** | `"<handler>:<normalizedPath>"`, e.g. `google_drive:/team/q3.xlsx`. The segment before the first `:` is the **handler**; the rest is rooted (`/…`), with no trailing slash, `//`, `.` or `..`. |
-| **Handler** | A backend/namespace. Locks in *different* handlers never conflict and serialize independently. |
+| **Handler** | A backend namespace prefix before `:`. |
+| **Routing namespace** | The Raft sharding and conflict domain for a path. By default this is the handler plus the first path segment, e.g. `google_drive:/team`; explicit namespace roots can be configured deeper or at the handler/root level. |
 | **Owner** | A caller-supplied id identifying one lock session. Every path held under that id shares a single lease. Conflict checks are always *between different owners* — an owner never conflicts with itself. |
 | **Mode** | `write` or `read`. |
 | **Ancestor / descendant** | `/a` is an ancestor of `/a/b`; `/a/b` is a descendant of `/a`. A path is neither its own ancestor nor descendant. Ancestry is computed per handler. |
+| **Namespace policy** | The lock algorithm configured for a routing namespace. Missing settings use the default `recursive_rw` policy. |
+
+## Namespace policies
+
+Policies are configured with `SetNamespacePolicy` and read with
+`GetNamespacePolicy`. The namespace key may be a handler (`google_drive`) or a
+normalized path root (`google_drive:/team` or `google_drive:/team/archive`).
+Path-root settings also define explicit routing namespaces; the longest
+explicit root containing a path wins, otherwise the fallback resolver uses
+handler plus the first path segment. Settings are Raft-replicated into each
+lock group and the system group, stored permanently in the `namespace_settings`
+RocksDB column family until `DeleteNamespacePolicy` removes them. The default
+is the first policy:
+
+| Policy | Reads | Write scope |
+|---|---|---|
+| `recursive_rw` | Shared point reads | Path plus descendants |
+| `point_rw` | Shared point reads | Exact path only |
+| `recursive_write` | Reads disabled | Path plus descendants |
+| `point_write` | Reads disabled | Exact path only |
+
+An existing lock keeps the policy it was acquired with until it is released or
+expires. A namespace policy change therefore affects future acquisitions without
+retroactively shrinking or expanding live leases.
+
+Recursive lock guarantees are scoped to the selected routing namespace. A
+nested explicit namespace such as `google_drive:/team/archive` intentionally
+lets that subtree route to a different Raft group; parent locks in
+`google_drive:/team` do not coordinate with that child namespace. Define or
+delete namespace roots while the affected subtree is drained if callers rely on
+parent recursive locks covering the whole subtree.
 
 ## The core invariant
 
-This is a **reader-writer lock generalized to a tree** — and the generalization
+The default `recursive_rw` policy is a **reader-writer lock generalized to a tree** — and the generalization
 is *asymmetric*, which is what sets it apart from a classic RWLock. A textbook
 RWLock is flat and symmetric: one resource, readers share, a writer excludes
 everyone. pathlockd keeps "shared readers, exclusive writer" but gives the two
@@ -46,7 +78,7 @@ directly:
 - An **ancestor read** is point-only: it does **not** cover its descendants, so
   it neither blocks nor is blocked by a lock deeper in the tree.
 
-## Conflict matrix
+## Default Conflict Matrix
 
 Because the relation is symmetric (the same pair of locks conflicts regardless of
 which is acquired first), it is enough to read it as "a **new request** on `P`
@@ -87,9 +119,10 @@ that holds it, and the reason. A **waitable** conflict (any held-lock reason
 above) does not refuse the request — it **enqueues** it in the per-group FIFO
 wait queue and returns `QUEUED`; the daemon grants it in place and sends a
 `GRANT` event when the path frees (FIFO admission also means a newcomer yields to
-earlier waiters, so no one is starved). `CONFLICT` is reserved for the
-non-waitable `stale_fencing_token`, where `owner` carries the *persisted fence
-value* rather than an owner id and the caller should refresh its token and retry.
+earlier waiters, so no one is starved). `CONFLICT` is reserved for non-waitable
+request faults: `read_locks_disabled` in write-only namespaces, and
+`stale_fencing_token`, where `owner` carries the *persisted fence value* rather
+than an owner id and the caller should refresh its token and retry.
 
 ## Same-owner re-entrancy
 

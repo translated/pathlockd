@@ -32,6 +32,18 @@ enum LockState {
   LOCK_STATE_HELD = 1;
 }
 
+enum LockAlgorithm {
+  // Default: shared point reads; writes are exclusive on the path and its
+  // descendants.
+  LOCK_ALGORITHM_RECURSIVE_RW = 0;
+  // Shared point reads; writes are exclusive only on the exact path.
+  LOCK_ALGORITHM_POINT_RW = 1;
+  // Write locks only; writes are exclusive on the path and descendants.
+  LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
+  // Write locks only; writes are exclusive only on the exact path.
+  LOCK_ALGORITHM_POINT_WRITE = 3;
+}
+
 message LockRequest {
   // Path form: "<handlerType>:<normalizedPath>", e.g. "google_drive:/a/b".
   string path = 1;
@@ -43,6 +55,44 @@ message ReleaseRequest {
   string path = 1;
   Mode mode = 2;
 }
+
+// ---------------------------------------------------------------------------
+// Namespace policy
+// ---------------------------------------------------------------------------
+
+message SetNamespacePolicyRequest {
+  // Namespace is either a handler ("google_drive") or a normalized path root
+  // ("google_drive:/docs" or "google_drive:/docs/team"). A path namespace
+  // also becomes an explicit routing root; longest explicit root wins.
+  string namespace = 1;
+  LockAlgorithm algorithm = 2;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 3;
+}
+
+message SetNamespacePolicyResponse {}
+
+message GetNamespacePolicyRequest {
+  // Exact namespace key to read. Missing rows use LOCK_ALGORITHM_RECURSIVE_RW.
+  string namespace = 1;
+}
+
+message GetNamespacePolicyResponse {
+  LockAlgorithm algorithm = 1;
+  // false means no explicit row exists and the daemon is using the default
+  // LOCK_ALGORITHM_RECURSIVE_RW policy.
+  bool explicit = 2;
+}
+
+message DeleteNamespacePolicyRequest {
+  // Removes the explicit policy/routing root. Future requests fall back to the
+  // default resolver unless another explicit parent namespace matches.
+  string namespace = 1;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 2;
+}
+
+message DeleteNamespacePolicyResponse {}
 
 // ---------------------------------------------------------------------------
 // Acquire
@@ -86,8 +136,8 @@ message AcquireResponse {
   string owner = 3;
   // CONFLICT/LOST: machine-readable reason
   // (ancestor_locked | write_locked | read_locked | descendant_write_locked |
-  //  descendant_read_locked | stale_fencing_token | missing_write | missing_read |
-  //  missing_fence | missing_alive).
+  //  descendant_read_locked | read_locks_disabled | stale_fencing_token |
+  //  missing_write | missing_read | missing_fence | missing_alive).
   string reason = 4;
 }
 
@@ -120,11 +170,11 @@ message ReleaseResponse {}
 message RenewRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
-  // The routing domains in which this owner holds locks (the handler prefix
-  // of each held path, e.g. "google_drive"; with deeper routing prefixes,
-  // the prefix at the configured depth). Targets the renew fan-out at exactly
-  // those Raft groups. When empty, every group is probed — correct, but
-  // amplified; strongly discouraged for heartbeat-frequency renews.
+  // The routing namespaces in which this owner holds locks, e.g.
+  // "google_drive:/team" by default or an explicit root such as
+  // "google_drive:/team/archive". Targets the renew fan-out at exactly those
+  // Raft groups. When empty, every group is probed — correct, but amplified;
+  // strongly discouraged for heartbeat-frequency renews.
   repeated string domains = 3;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 4;
@@ -413,6 +463,9 @@ message HealthResponse {
 
 service PathLock {
   rpc Acquire(AcquireRequest) returns (AcquireResponse);
+  rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
+  rpc GetNamespacePolicy(GetNamespacePolicyRequest) returns (GetNamespacePolicyResponse);
+  rpc DeleteNamespacePolicy(DeleteNamespacePolicyRequest) returns (DeleteNamespacePolicyResponse);
   // Client-streamed form of Acquire for large path sets. The daemon buffers all
   // chunks, validates them as one logical request, then applies a single
   // Acquire transaction; it never acquires chunk-by-chunk.

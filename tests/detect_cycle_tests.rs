@@ -55,7 +55,12 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
     for group in (0..routing.group_count).chain([SYS_GROUP]) {
         groups.bootstrap_group(group, voters.clone()).await.unwrap();
     }
-    (Arc::new(Router::new(groups, routing, None)), dir)
+    let router = Arc::new(Router::new(groups, routing, None));
+    router
+        .probe_writer(Duration::from_secs(10))
+        .await
+        .expect("test router sys group must elect a leader");
+    (router, dir)
 }
 
 async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str) {

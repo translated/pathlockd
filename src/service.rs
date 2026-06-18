@@ -10,21 +10,23 @@ use tonic::{Request, Response, Status};
 
 use crate::cluster::router::Router;
 use crate::engine::{
-    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockReq, RelReq, RenewOutcome,
-    WaitEdgeMetadata,
+    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockReq, RelReq,
+    RenewOutcome, WaitEdgeMetadata,
 };
 use crate::events::Broadcaster;
 use crate::proto::{
     self, path_lock_server::PathLock, AcquireRequest, AcquireResponse, AcquireStatus,
     AssertFencingRequest, AssertFencingResponse, AssertStatus, ClearWaitEdgeRequest,
-    ClearWaitEdgeResponse, CycleKind, DetectCycleRequest, DetectCycleResponse, DumpLocksRequest,
-    DumpLocksResponse, Event, ForceReleaseRequest, ForceReleaseResponse, HealthRequest,
-    HealthResponse, IncrFencingTokenRequest, IncrFencingTokenResponse, InspectPathRequest,
-    InspectPathResponse, IsBlockingRequest, IsBlockingResponse, IsOwnerAliveRequest,
-    IsOwnerAliveResponse, ListOwnerLocksRequest, ListOwnerLocksResponse, LockEntry, OwnedLock,
-    PublishEventRequest, PublishEventResponse, ReleaseAllRequest, ReleaseLocksRequest,
-    ReleaseResponse, RenewRequest, RenewResponse, RenewStatus, RequestRevokeRequest,
-    RequestRevokeResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
+    ClearWaitEdgeResponse, CycleKind, DeleteNamespacePolicyRequest, DeleteNamespacePolicyResponse,
+    DetectCycleRequest, DetectCycleResponse, DumpLocksRequest, DumpLocksResponse, Event,
+    ForceReleaseRequest, ForceReleaseResponse, GetNamespacePolicyRequest,
+    GetNamespacePolicyResponse, HealthRequest, HealthResponse, IncrFencingTokenRequest,
+    IncrFencingTokenResponse, InspectPathRequest, InspectPathResponse, IsBlockingRequest,
+    IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse, ListOwnerLocksRequest,
+    ListOwnerLocksResponse, LockEntry, OwnedLock, PublishEventRequest, PublishEventResponse,
+    ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest, RenewResponse,
+    RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetNamespacePolicyRequest,
+    SetNamespacePolicyResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
 };
 
 fn engine_err(e: anyhow::Error) -> Status {
@@ -45,6 +47,15 @@ fn engine_err(e: anyhow::Error) -> Status {
         }
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
         Status::invalid_argument(err.to_string())
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::NamespaceDepthUnsupported>()
+    {
+        Status::invalid_argument(err.to_string())
+    } else if let Some(err) =
+        e.downcast_ref::<crate::cluster::router::NamespaceResolverUnavailable>()
+    {
+        Status::unavailable(err.to_string())
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::NamespaceNotDrained>() {
+        Status::failed_precondition(err.to_string())
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriteQueueFull>() {
         // Honest backpressure: the writer is saturated; the client should
         // back off and retry rather than queue behind a 30s deadline.
@@ -152,6 +163,32 @@ fn check_path(path: &str) -> Result<(), Status> {
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
+fn check_namespace(namespace: &str) -> Result<(), Status> {
+    if namespace.is_empty() {
+        return Err(Status::invalid_argument("namespace must be non-empty"));
+    }
+    if namespace.contains(':') {
+        if namespace.len() > MAX_PATH_LEN {
+            return Err(Status::invalid_argument(format!(
+                "path namespace too long (max {MAX_PATH_LEN} bytes)"
+            )));
+        }
+        return check_path(namespace);
+    }
+    if namespace.len() > MAX_ID_LEN {
+        return Err(Status::invalid_argument(format!(
+            "handler namespace too long (max {MAX_ID_LEN} bytes)"
+        )));
+    }
+    if namespace.contains('/') {
+        return Err(Status::invalid_argument(format!(
+            "handler namespace must not contain '/': {namespace}"
+        )));
+    }
+    Ok(())
+}
+
 const BLOCKING_REASONS: [&str; 5] = [
     "ancestor_locked",
     "write_locked",
@@ -213,6 +250,28 @@ fn mode_to_proto(mode: engine::Mode) -> i32 {
 }
 
 #[allow(clippy::result_large_err)]
+fn to_algorithm(i: i32) -> Result<LockAlgorithm, Status> {
+    match proto::LockAlgorithm::try_from(i) {
+        Ok(proto::LockAlgorithm::RecursiveRw) => Ok(LockAlgorithm::RecursiveRw),
+        Ok(proto::LockAlgorithm::PointRw) => Ok(LockAlgorithm::PointRw),
+        Ok(proto::LockAlgorithm::RecursiveWrite) => Ok(LockAlgorithm::RecursiveWrite),
+        Ok(proto::LockAlgorithm::PointWrite) => Ok(LockAlgorithm::PointWrite),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid lock algorithm value {i}"
+        ))),
+    }
+}
+
+fn algorithm_to_proto(algorithm: LockAlgorithm) -> i32 {
+    match algorithm {
+        LockAlgorithm::RecursiveRw => proto::LockAlgorithm::RecursiveRw as i32,
+        LockAlgorithm::PointRw => proto::LockAlgorithm::PointRw as i32,
+        LockAlgorithm::RecursiveWrite => proto::LockAlgorithm::RecursiveWrite as i32,
+        LockAlgorithm::PointWrite => proto::LockAlgorithm::PointWrite as i32,
+    }
+}
+
+#[allow(clippy::result_large_err)]
 fn to_state(i: i32) -> Result<engine::State, Status> {
     match proto::LockState::try_from(i) {
         Ok(proto::LockState::Held) => Ok(engine::State::Held),
@@ -230,31 +289,14 @@ fn to_state(i: i32) -> Result<engine::State, Status> {
 pub struct PathLockService {
     pub router: Arc<Router>,
     pub broadcaster: Broadcaster,
-    /// With deep routing prefixes (`routing_prefix_segments` = K > 0), locks
-    /// at depth < K would span Raft groups and are rejected up front.
-    min_lock_depth: u32,
 }
 
 impl PathLockService {
-    pub fn new(router: Arc<Router>, broadcaster: Broadcaster, min_lock_depth: u32) -> Self {
+    pub fn new(router: Arc<Router>, broadcaster: Broadcaster) -> Self {
         Self {
             router,
             broadcaster,
-            min_lock_depth,
         }
-    }
-
-    #[allow(clippy::result_large_err)]
-    fn check_lockable_depth(&self, path: &str) -> Result<(), Status> {
-        if self.min_lock_depth > 0
-            && crate::cluster::placement::path_depth(path) < self.min_lock_depth
-        {
-            return Err(Status::invalid_argument(format!(
-                "locks above routing depth {} are not supported with routing_prefix_segments > 0: {path}",
-                self.min_lock_depth
-            )));
-        }
-        Ok(())
     }
 
     #[allow(clippy::result_large_err)]
@@ -318,11 +360,9 @@ impl PathLockService {
         }
         for r in &req.requests {
             check_path(&r.path)?;
-            self.check_lockable_depth(&r.path)?;
         }
         for r in &req.release_requests {
             check_path(&r.path)?;
-            self.check_lockable_depth(&r.path)?;
         }
         if req
             .requests
@@ -464,6 +504,76 @@ impl PathLock for PathLockService {
             let resp = self.handle_acquire_request(req, MAX_PATHS_PER_STREAMED_ACQUIRE).await?;
             Ok(Response::new(resp))
         }).await
+    }
+
+    async fn set_namespace_policy(
+        &self,
+        request: Request<SetNamespacePolicyRequest>,
+    ) -> Result<Response<SetNamespacePolicyResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "SetNamespacePolicy",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_namespace(&req.namespace)?;
+                let algorithm = to_algorithm(req.algorithm)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                self.router
+                    .set_namespace_policy(&req.namespace, algorithm, idempotency_key.as_deref())
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(SetNamespacePolicyResponse {}))
+            },
+        )
+        .await
+    }
+
+    async fn get_namespace_policy(
+        &self,
+        request: Request<GetNamespacePolicyRequest>,
+    ) -> Result<Response<GetNamespacePolicyResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "GetNamespacePolicy",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_namespace(&req.namespace)?;
+                let (algorithm, explicit) = self
+                    .router
+                    .namespace_policy(&req.namespace)
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(GetNamespacePolicyResponse {
+                    algorithm: algorithm_to_proto(algorithm),
+                    explicit,
+                }))
+            },
+        )
+        .await
+    }
+
+    async fn delete_namespace_policy(
+        &self,
+        request: Request<DeleteNamespacePolicyRequest>,
+    ) -> Result<Response<DeleteNamespacePolicyResponse>, Status> {
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "DeleteNamespacePolicy",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_namespace(&req.namespace)?;
+                let idempotency_key = idempotency_key(&req.idempotency_key)?;
+                self.router
+                    .delete_namespace_policy(&req.namespace, idempotency_key.as_deref())
+                    .await
+                    .map_err(engine_err)?;
+                Ok(Response::new(DeleteNamespacePolicyResponse {}))
+            },
+        )
+        .await
     }
 
     async fn release(
@@ -804,7 +914,6 @@ impl PathLock for PathLockService {
         .await
     }
 
-
     async fn is_owner_alive(
         &self,
         request: Request<IsOwnerAliveRequest>,
@@ -831,12 +940,18 @@ impl PathLock for PathLockService {
         &self,
         request: Request<RequestRevokeRequest>,
     ) -> Result<Response<RequestRevokeResponse>, Status> {
-        crate::otel::observe_rpc(PATH_LOCK_SERVICE, "RequestRevoke", request, |request| async move {
-            let req = request.into_inner();
-            check_id("owner_id", &req.owner_id)?;
-            self.broadcaster.revoke(&req.owner_id);
-            Ok(Response::new(RequestRevokeResponse {}))
-        }).await
+        crate::otel::observe_rpc(
+            PATH_LOCK_SERVICE,
+            "RequestRevoke",
+            request,
+            |request| async move {
+                let req = request.into_inner();
+                check_id("owner_id", &req.owner_id)?;
+                self.broadcaster.revoke(&req.owner_id);
+                Ok(Response::new(RequestRevokeResponse {}))
+            },
+        )
+        .await
     }
 
     async fn inspect_path(
@@ -1041,6 +1156,16 @@ mod tests {
         assert!(check_path("h:/a//b").is_err());
         assert!(check_path("h:/a/../b").is_err());
         assert!(check_path("h:/a/./b").is_err());
+    }
+
+    #[test]
+    fn check_namespace_accepts_handlers_and_path_roots() {
+        assert!(check_namespace("google_drive").is_ok());
+        assert!(check_namespace("google_drive:/folder").is_ok());
+        assert!(check_namespace("google_drive:/folder/deeper").is_ok());
+        assert!(check_namespace("google_drive:/").is_ok());
+        assert!(check_namespace("google_drive:/folder/").is_err());
+        assert!(check_namespace("google_drive/folder").is_err());
     }
 
     #[test]

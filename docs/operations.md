@@ -28,7 +28,7 @@ Configuration is loaded from lowest to highest precedence:
 | Field | Default | Description |
 |---|---|---|
 | `group_count` | `32` | Number of Raft groups (shards; fixed at cluster birth) |
-| `routing_prefix_segments` | `0` | Path depth of the routing domain (0 = handler only) |
+| `routing_prefix_segments` | `1` | Fallback path depth when no explicit namespace root exists (`1` = handler plus first segment; `0` = legacy handler only) |
 | `replication_factor` | `3` | Voters per Raft group (odd; auto-degrades to the node count and upgrades as nodes join) |
 | `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
 | `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
@@ -208,6 +208,7 @@ families:
 | `owner_alive` | `owner -> AliveRecord` |
 | `owner_holds` | `owner:NUL:mode:NUL:path -> OwnedLockRecord` |
 | `wait_edges` | `owner -> WaitEdgeRecord` |
+| `namespace_settings` | `namespace -> lock algorithm policy / explicit route root` |
 | `lock_queue` | `'e':be64(seq) -> QueueEntry` (FIFO waiters); `'o':owner -> seq` |
 | `expiry` | `be64(expires_at):NUL:kind:NUL:primary_key -> ExpiryRecord` |
 | `request_dedupe` | `request_id -> cached ApplyResponse` (apply-once forwarding) |
@@ -233,12 +234,14 @@ Set `group_gc_interval_secs = 0` to disable active GC (lazy expiry still applies
 
 ### Lock domain cardinality and write scaling
 
-- Each routing domain maps to exactly one Raft group (HRW); all writes for a
-  domain serialize through that group's leader. Write throughput scales with
-  the number of *domains*, spread across nodes by leader balancing.
-- Few handlers? Set `routing_prefix_segments = K` to shard by the first K
-  path segments — locks above depth K are then rejected (containment must
-  stay single-group).
+- Each routing namespace maps to exactly one Raft group (HRW); all writes for a
+  namespace serialize through that group's leader. Write throughput scales with
+  the number of namespaces, spread across nodes by leader balancing.
+- The fallback namespace for `handler:/a/b` is `handler:/a`. Use
+  `SetNamespacePolicy` to create explicit namespace roots such as
+  `handler:/a/b` when a subtree needs its own shard. The longest explicit root
+  wins; define/delete nested roots while the affected subtree is drained if
+  parent recursive locks must cover it.
 - Multi-domain acquires are rejected; owner-wide operations (renew,
   release-all, force-release) fan out per group. Clients should declare
   `RenewRequest.domains` so heartbeats touch only the groups holding state.

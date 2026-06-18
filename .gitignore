@@ -6,3 +6,4 @@ pathlockd.toml
 .claude/
 /dist/
 .vscode/
+node_modules/
