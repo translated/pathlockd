@@ -422,12 +422,52 @@ cargo test --test e2e_tests       # full e2e tests (starts a 1-node cluster, dri
 cargo test --test cluster_tests   # 3-node cluster: formation, leader-kill failover under
                                   # contention (exactly-one-holder invariant), wiped-disk
                                   # bootstrap guard, node rejoin
-cargo test --test load            # throughput benchmarks
+cargo test --test load            # state-machine throughput benchmarks (in-process)
+cargo test --test load_cluster -- --nocapture  # gRPC load/soak: single-node + 3-node, concurrent
+                                  # user activity (acquire/renew/release, hot-path contention with
+                                  # an exactly-one-holder invariant, shared reads, queued waiters
+                                  # woken by GRANT events, fencing traffic, live policy/settings churn)
 ./scripts/test-e2e-stress.sh     # starts peered replicas, checks cross-replica events, runs GC stress
 ```
 
+The `load_cluster` suite spins up real daemons and pours concurrent traffic at
+the gRPC surface in both deployment shapes (`single_node_load`,
+`three_node_load`). It is bounded and tunable so it runs quickly by default and
+can be cranked into a real soak:
+
+| Env var | Default | Meaning |
+| --- | --- | --- |
+| `PLK_LOAD_SECS` | `6` | Duration of the load phase, seconds |
+| `PLK_LOAD_WORKERS` | `24` | Base concurrency (throughput-worker count; the other roles scale from it) |
+
+Run with `-- --nocapture` to print the per-run throughput/latency summary.
+
 Engine tests and e2e tests run directly against the embedded RocksDB — no
 external cluster is needed. See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
+
+### Benchmarking (`cargo benchmark`)
+
+The peak-throughput benchmark is **out of `cargo test`** — it is a
+`harness = false` bench target driven via a cargo alias, so it never runs during
+the test suite or release builds. It spins up real daemons and *ramps
+concurrency* to find the peak sustained rate/s for several real-world scenarios,
+in single-node and 3-node topologies:
+
+```bash
+cargo benchmark                                  # both topologies, all scenarios
+cargo benchmark single unique-writes             # one topology, one scenario
+cargo benchmark cluster all measure=5 max-workers=256
+cargo benchmark mixed groups=32                  # realistic blend, more shards
+```
+
+Scenarios: `unique-writes` (best-case parallel writes), `read-heavy` (~90%
+shared reads), `hot-contention` (one path, contention ceiling), `fencing`
+(system-group counter ceiling), `mixed` (production blend). Each prints a
+concurrency-vs-throughput table, the detected peak, and a final summary across
+all (topology, scenario) pairs. Tuning: `measure=` / `warmup=` (seconds per
+level), `min-workers=` / `max-workers=` (ramp bounds), `groups=` (Raft
+`group_count`). Build the daemon first (`cargo build --release`) so the
+benchmark can launch it.
 
 ## Releasing
 

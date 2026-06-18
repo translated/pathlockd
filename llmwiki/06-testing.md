@@ -74,6 +74,59 @@ in-process RocksDB engine.
 cargo test --test load --release -- --nocapture   # run directly
 ```
 
+## gRPC load / soak (`tests/load_cluster.rs`)
+
+End-to-end load against real daemons (not the in-process engine): spins up a
+single bootstrap node (`single_node_load`) and a 3-node HA cluster
+(`three_node_load`) and drives concurrent, realistic client activity at the gRPC
+surface — unique-path acquire/renew/release throughput, hot-path contention with
+a live exactly-one-holder invariant, shared point reads, queued waiters woken by
+GRANT events over `Subscribe` (waiters subscribe on a different node than they
+acquire from, exercising peer event fan-out), fencing-token traffic, and live
+namespace-policy (settings) churn including the force-clear/KILL path. Each run
+asserts mutual exclusion held, the cluster made progress, and the rpc-error rate
+stayed under a topology-appropriate ceiling, then prints a throughput/latency
+summary.
+
+```bash
+cargo test --test load_cluster -- --nocapture          # both shapes, serialized
+cargo test --test load_cluster single_node_load -- --nocapture
+PLK_LOAD_SECS=30 PLK_LOAD_WORKERS=64 \
+  cargo test --release --test load_cluster three_node_load -- --nocapture  # soak
+```
+
+Tunables: `PLK_LOAD_SECS` (load-phase seconds, default `6`) and
+`PLK_LOAD_WORKERS` (base concurrency, default `24`; the other worker roles scale
+from it). The two entry points are serialized against each other so they never
+contend for the host at the same time.
+
+## Peak-throughput benchmark (`benches/benchmark.rs`, `cargo benchmark`)
+
+A `harness = false` bench target wired to the `cargo benchmark` alias
+(`.cargo/config.toml`). It is **deliberately outside `cargo test`**: benches are
+not built by `cargo test`, `cargo build`, or release builds — only by
+`cargo bench`. Where `load_cluster` *asserts* correctness at fixed concurrency,
+this *measures* performance: it spins up real daemons and ramps concurrency
+(doubling `min-workers`→`max-workers`, stopping once throughput falls below the
+running peak for two levels) to find the peak sustained rate/s.
+
+```bash
+cargo benchmark                                  # both topologies, all scenarios
+cargo benchmark single unique-writes             # one topology, one scenario
+cargo benchmark cluster all measure=5 max-workers=256
+cargo benchmark mixed groups=32
+```
+
+Topologies: `single` | `cluster` | `both`. Scenarios: `unique-writes` (parallel
+writes across `groups` namespaces), `read-heavy` (~90% shared reads / ~10%
+writes), `hot-contention` (one path — the contention ceiling), `fencing`
+(`IncrFencingToken` — the system-group counter ceiling), `mixed` (65% write /
+20% read / 10% hot / 5% fence), or `all`. Tuning args: `measure=`, `warmup=`
+(seconds per level), `min-workers=`, `max-workers=`, `groups=`. It prints a
+concurrency-vs-throughput table with p50/p99 latency per scenario, the detected
+peak, and a final cross-scenario summary. The bench profile inherits release, so
+the daemon it launches is optimized.
+
 ## Manual smoke
 
 ```bash

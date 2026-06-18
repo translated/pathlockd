@@ -16,6 +16,15 @@ path = "src/lib.rs"
 name = "pathlockd"
 path = "src/main.rs"
 
+# Peak-throughput benchmark harness. Invoke via `cargo benchmark` (alias in
+# .cargo/config.toml). It is a plain `fn main()` (harness = false), is never run
+# by `cargo test`, and is not built by `cargo build` / release builds — only by
+# `cargo bench`.
+[[bench]]
+name = "benchmark"
+path = "benches/benchmark.rs"
+harness = false
+
 [dependencies]
 tonic = "=0.14.6"
 tonic-prost = "=0.14.6"
