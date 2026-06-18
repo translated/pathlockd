@@ -259,6 +259,11 @@ fn is_queueable_conflict(reason: &str) -> bool {
             | "ancestor_locked"
             | "descendant_write_locked"
             | "descendant_read_locked"
+            // A full semaphore frees a permit when a holder releases/expires, so
+            // the waiter is granted in place by the post-release sweep. (An
+            // `invalid_permits` request is a client error, not contention, and
+            // is deliberately *not* queueable.)
+            | "semaphore_full"
     )
 }
 

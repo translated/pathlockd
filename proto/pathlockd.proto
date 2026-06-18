@@ -42,6 +42,11 @@ enum LockAlgorithm {
   LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
   // Write locks only; writes are exclusive only on the exact path.
   LOCK_ALGORITHM_POINT_WRITE = 3;
+  // Counting semaphore: point-scoped, write-only. A path admits up to the
+  // acquirer's requested permit count (LockRequest.permits) concurrent holders;
+  // no read mode, no descendant exclusion, no fencing. Each acquire is admitted
+  // iff the path currently has fewer than its own `permits` live holders.
+  LOCK_ALGORITHM_SEMAPHORE = 4;
 }
 
 message LockRequest {
@@ -49,6 +54,10 @@ message LockRequest {
   string path = 1;
   Mode mode = 2;
   LockState state = 3;
+  // Concurrent-holder cap for a LOCK_ALGORITHM_SEMAPHORE namespace: the acquire
+  // succeeds iff the path currently has fewer than `permits` live holders.
+  // Required >= 1 in a semaphore namespace; ignored by all other algorithms.
+  uint32 permits = 4;
 }
 
 message ReleaseRequest {
@@ -409,6 +418,10 @@ message InspectPathResponse {
   // Retained for wire compatibility; always empty (path claims were removed in
   // favour of the wait queue).
   string claim_owner = 5;
+  // Live semaphore holders of this exact path (LOCK_ALGORITHM_SEMAPHORE
+  // namespaces). Empty for non-semaphore paths. The path is at capacity for a
+  // given acquire when this list's length reaches that acquire's `permits`.
+  repeated string semaphore_owners = 6;
 }
 
 message ListOwnerLocksRequest {

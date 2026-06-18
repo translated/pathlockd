@@ -100,6 +100,10 @@ pub const CF_META: &str = "meta";
 pub const CF_RAFT_LOG: &str = "raft_log";
 pub const CF_WRITE_LOCKS: &str = "write_locks";
 pub const CF_READ_LOCKS: &str = "read_locks";
+/// Per-path set of semaphore holders. Keyed by path (see [`sem_prefix`]), members
+/// are owner ids. Unlike `CF_WRITE_LOCKS` (single owner per path), a semaphore
+/// path admits up to the acquirer's requested permit count concurrent holders.
+pub const CF_SEMAPHORE: &str = "semaphore_holders";
 pub const CF_FENCES: &str = "fences";
 pub const CF_DESC_WRITE: &str = "desc_write";
 pub const CF_DESC_READ: &str = "desc_read";
@@ -124,6 +128,7 @@ pub const CF_QUEUE: &str = "lock_queue";
 pub const STATE_CFS: &[&str] = &[
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
+    CF_SEMAPHORE,
     CF_FENCES,
     CF_DESC_WRITE,
     CF_DESC_READ,
@@ -143,6 +148,7 @@ pub const ALL_CFS: &[&str] = &[
     CF_RAFT_LOG,
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
+    CF_SEMAPHORE,
     CF_FENCES,
     CF_DESC_WRITE,
     CF_DESC_READ,
@@ -164,6 +170,14 @@ pub fn wr_key(path: &str) -> Vec<u8> {
 
 /// Set key under which a path's read-lock owners are stored.
 pub fn rd_prefix(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(path.len() + 1);
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(0);
+    buf
+}
+
+/// Set key under which a path's semaphore holders are stored.
+pub fn sem_prefix(path: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(path.len() + 1);
     buf.extend_from_slice(path.as_bytes());
     buf.push(0);

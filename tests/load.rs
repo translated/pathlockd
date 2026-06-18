@@ -36,6 +36,7 @@ fn wr(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Write,
         state: State::New,
+        permits: 0,
     }
 }
 
@@ -44,6 +45,7 @@ fn rd(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Read,
         state: State::New,
+        permits: 0,
     }
 }
 

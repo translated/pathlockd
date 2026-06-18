@@ -32,6 +32,7 @@ fn wr(path: &str) -> pathlockd::proto::LockRequest {
         path: path.into(),
         mode: Mode::Write as i32,
         state: LockState::New as i32,
+        permits: 0,
     }
 }
 

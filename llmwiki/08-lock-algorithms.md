@@ -7,25 +7,31 @@
 > the held lock**, and **carried into the wait queue**.
 
 The default pathlockd conflict model is a tree-shaped reader-writer lock. v0.10
-adds three alternative policies that namespaces can opt into when the default
-is the wrong shape. This page is the reference for what changes when you pick
-one.
+adds alternative policies that namespaces can opt into when the default is the
+wrong shape — three exclusive variants plus a counting **semaphore**. This page
+is the reference for what changes when you pick one.
 
 ## At a glance
 
-| Policy | Reads | Write scope | Reads allowed? | Status |
-|---|---|---|---|---|
-| `recursive_rw` | shared point reads | path **+ descendants** | yes | default |
-| `point_rw` | shared point reads | exact path only | yes | opt-in |
-| `recursive_write` | — | path **+ descendants** | **no** | opt-in |
-| `point_write` | — | exact path only | **no** | opt-in |
+| Policy | Reads | Write scope | Reads allowed? | Concurrency | Status |
+|---|---|---|---|---|---|
+| `recursive_rw` | shared point reads | path **+ descendants** | yes | 1 writer | default |
+| `point_rw` | shared point reads | exact path only | yes | 1 writer | opt-in |
+| `recursive_write` | — | path **+ descendants** | **no** | 1 writer | opt-in |
+| `point_write` | — | exact path only | **no** | 1 writer | opt-in |
+| `semaphore` | — | exact path only | **no** | **up to N** (per acquire) | opt-in |
 
 Every policy is **re-entrant per owner** (an owner can hold overlapping locks
-without conflicting with itself), every policy **scopes recursive guarantees
-to the selected routing namespace** (a nested explicit namespace routes to a
-different Raft group, so parent locks in the outer namespace do not
-coordinate with it), and every policy **fences writes** (a stale token is
-rejected as `stale_fencing_token`).
+without conflicting with itself), and every policy **scopes recursive
+guarantees to the selected routing namespace** (a nested explicit namespace
+routes to a different Raft group, so parent locks in the outer namespace do not
+coordinate with it).
+
+The exclusive policies (everything except `semaphore`) **fence writes** (a
+stale token is rejected as `stale_fencing_token`) and admit **exactly one**
+writer per path. `semaphore` is different on both axes: it admits **up to N**
+holders per path (N is chosen per acquire, not per namespace) and **does not
+fence** (there is no single owner to fence). See its section below.
 
 ## How an algorithm is selected
 
@@ -168,6 +174,60 @@ Allowed: any ancestor / descendant / unrelated lock. Use this for
 single-object ownership (a specific file in object storage, a queue item
 in a flat namespace).
 
+### `semaphore`
+
+A **counting semaphore**: point-scoped, write-only, but unlike `point_write`
+it admits **up to N concurrent holders** on the exact path. N is not a property
+of the namespace — each acquire carries its own permit count in
+`LockRequest.permits` (engine `LockReq.permits`). The admission rule:
+
+> `write P` is admitted iff `P` currently has **fewer live holders than the
+> requesting acquire's own `permits`**.
+
+| New request | Conflicts with an existing lock when it is… | Reason |
+|---|---|---|
+| `read P` | — | `read_locks_disabled` |
+| `write P` with `permits == 0` | (always) | `invalid_permits` (not waitable) |
+| `write P` | already at `permits` live holders on `P` | `semaphore_full` (waitable) |
+| `write P` | a write on an **ancestor** of `P` (recursive holder, other namespace) | `ancestor_locked` |
+
+Key properties and deliberate consequences:
+
+- **Gate on the requester's own N.** Because each acquire brings its own
+  `permits`, the effective capacity of a path is dynamic — it is the *minimum*
+  N among current contenders. Two owners can ask for the same path with
+  different N: an owner with `permits=2` is refused while `2` are held, while a
+  concurrent owner with `permits=3` is admitted. This is the only
+  well-defined per-request rule and is intentional.
+- **`semaphore_full` is waitable; `invalid_permits` is not.** A full semaphore
+  frees a permit when a holder releases or its lease expires, so the waiter is
+  enqueued and granted in place by the post-release sweep (FIFO, like every
+  other contention conflict). `permits == 0` is a client error, returned as
+  `CONFLICT` and never enqueued.
+- **FIFO still applies per path.** Once a waiter is queued on a path, a later
+  arrival on that same path yields to it (`blocked_by_earlier`) regardless of
+  its own N — a larger-N newcomer cannot barge past an earlier waiter. The
+  per-request N gate governs admission against *holders*; FIFO governs ordering
+  against *earlier waiters*.
+- **No fencing.** A semaphore acquire ignores `fencing_token`; no fence row is
+  written or checked, and `stale_fencing_token` never appears. With up to N
+  holders there is no single owner for a per-path monotonic token to protect.
+- **Point only.** A semaphore hold neither claims descendants nor is blocked by
+  a *point* lock on an ancestor — but a *recursive* write holder on an ancestor
+  (in another namespace) still blocks it via the `ancestor_locked` check, the
+  same "recursive is louder than point" asymmetry as `point_write`.
+
+Storage: holders are a per-path set in `CF_SEMAPHORE` (`sem_prefix(path) →
+{owner}`), the same shape as the read set but counted against the acquirer's
+`permits`. `inspect_path` reports the live holders in
+`InspectPathResponse.semaphore_owners`; the path is at capacity for an acquire
+of permit count `k` when that list's length reaches `k`. There is no `wr:` key
+and no fence for a semaphore path, so `write_owner`/`has_fence` are empty even
+when the semaphore is fully held.
+
+Use this for bounded-concurrency resources: at most N workers in a critical
+section, a connection-pool cap, a rate of N concurrent jobs per key.
+
 ## The conflict precedence is identical across policies
 
 The engine checks ancestors top-down, then self, then the subtree, then
@@ -265,8 +325,11 @@ This couples the algorithm to the shard. Practical consequences:
 
 - **Proto**: `enum LockAlgorithm { LOCK_ALGORITHM_RECURSIVE_RW = 0;
   LOCK_ALGORITHM_POINT_RW = 1; LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
-  LOCK_ALGORITHM_POINT_WRITE = 3; }`. Default value is `RECURSIVE_RW` so
-  a missing `algorithm` field on the wire is the safest option.
+  LOCK_ALGORITHM_POINT_WRITE = 3; LOCK_ALGORITHM_SEMAPHORE = 4; }`. Default
+  value is `RECURSIVE_RW` so a missing `algorithm` field on the wire is the
+  safest option. `LockRequest.permits` (uint32) carries the per-acquire permit
+  count; it is required `>= 1` in a semaphore namespace and ignored by every
+  other algorithm.
 - **Raft commands** (`src/raft/command.rs`):
   - `SetNamespacePolicy { namespace, algorithm }` — written to the
     `namespace_settings` CF on every lock group and the system group, so
@@ -358,13 +421,18 @@ hits one group per namespace, no amplification.
 | Distributed mutex over a subtree, no read sharing | `recursive_write` | cheaper than `recursive_rw`; refuses reads cleanly |
 | Exclusive ownership of a single key, no read sharing | `point_write` | cheapest validation; O(1) per request |
 | Migration from a flat mutex service | `point_write` | smallest behavioural delta from a flat lock |
+| Bounded concurrency on a key (≤ N workers, pool cap) | `semaphore` | admits up to N holders; per-acquire `permits` |
 
 ## Invariants preserved across all algorithms
 
 - An owner never conflicts with itself; re-entrancy is unconditional.
 - Fencing tokens are monotonic per path and outlive the lease (TTL
-  `max(ttl, 1 day)`).
-- A `STALE_FENCING_TOKEN` always wins over a held-lock reason.
+  `max(ttl, 1 day)`) — **except `semaphore`, which does not fence**.
+- A `STALE_FENCING_TOKEN` always wins over a held-lock reason (it never arises
+  under `semaphore`).
+- `semaphore` is the only algorithm that admits more than one holder per path;
+  all others are single-writer. Its capacity is per-acquire (`permits`), not a
+  fixed namespace property.
 - A `read_locks_disabled` is never enqueued (the namespace forbids the
   mode); it is a non-waitable client fault.
 - A namespace policy change does not mutate a live lock's algorithm; it

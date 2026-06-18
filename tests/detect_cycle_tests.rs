@@ -73,6 +73,7 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
                 path: path.into(),
                 mode: Mode::Write,
                 state: State::New,
+                permits: 0,
             }],
             fencing_token: fence,
             release_requests: vec![],

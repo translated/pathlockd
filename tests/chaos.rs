@@ -26,6 +26,7 @@ fn wr(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Write,
         state: State::New,
+        permits: 0,
     }
 }
 
@@ -137,6 +138,7 @@ fn crash_after_commit_sequence_preserves_all_mutations() {
                         path: "h:/c".into(),
                         mode: Mode::Read,
                         state: State::New,
+                        permits: 0,
                     }],
                     release_requests: vec![],
                     queue_ttl_ms: 0,
@@ -359,6 +361,7 @@ fn checkpoint_preserves_full_state() {
                         path: "h:/z".into(),
                         mode: Mode::Read,
                         state: State::New,
+                        permits: 0,
                     }],
                     release_requests: vec![],
                     queue_ttl_ms: 0,

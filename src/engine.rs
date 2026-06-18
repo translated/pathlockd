@@ -17,7 +17,8 @@ use tracing::warn;
 
 use crate::store_keys::{
     alive_key, fence_key, hold_algorithm_key, namespace_policy_key, own_prefix, rd_prefix,
-    rddesc_prefix, wait_key, wr_key, wrdesc_key, FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
+    rddesc_prefix, sem_prefix, wait_key, wr_key, wrdesc_key, FENCE_MIN_TTL_MS,
+    MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
 
@@ -29,6 +30,7 @@ use crate::store_keys::CF_NAMESPACE_SETTINGS as NS_SETTINGS_CF;
 use crate::store_keys::CF_OWNER_ALIVE as ALIVE_CF;
 use crate::store_keys::CF_OWNER_HOLDS as OWN_CF;
 use crate::store_keys::CF_READ_LOCKS as RD_CF;
+use crate::store_keys::CF_SEMAPHORE as SEM_CF;
 use crate::store_keys::CF_WAIT_EDGES as WAIT_CF;
 use crate::store_keys::CF_WRITE_LOCKS as WR_CF;
 
@@ -75,6 +77,10 @@ pub enum LockAlgorithm {
     RecursiveWrite,
     /// Write locks only; writes exclude only the exact path.
     PointWrite,
+    /// Counting semaphore: point-scoped, write-only. A path admits up to the
+    /// acquirer's requested permit count (`LockReq::permits`) concurrent
+    /// holders; no read mode, no descendant exclusion, no fencing.
+    Semaphore,
 }
 
 impl Default for LockAlgorithm {
@@ -90,6 +96,7 @@ impl LockAlgorithm {
             Self::PointRw => "point_rw",
             Self::RecursiveWrite => "recursive_write",
             Self::PointWrite => "point_write",
+            Self::Semaphore => "semaphore",
         }
     }
 
@@ -101,12 +108,24 @@ impl LockAlgorithm {
         matches!(self, Self::RecursiveRw | Self::RecursiveWrite)
     }
 
+    /// A counting semaphore rather than an exclusive lock: a path admits up to
+    /// the acquirer's requested permit count concurrent holders.
+    pub fn is_semaphore(self) -> bool {
+        matches!(self, Self::Semaphore)
+    }
+
     pub fn allows_mode(self, mode: Mode) -> bool {
         mode == Mode::Write || self.allows_read()
     }
 
     pub fn variants() -> &'static [&'static str] {
-        &["recursive_rw", "point_rw", "recursive_write", "point_write"]
+        &[
+            "recursive_rw",
+            "point_rw",
+            "recursive_write",
+            "point_write",
+            "semaphore",
+        ]
     }
 }
 
@@ -122,28 +141,11 @@ impl FromStr for LockAlgorithm {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let normalized = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
         match normalized.as_str() {
-            "recursive_rw" | "recursive_rwlock" | "rw_recursive" | "rwlock"
-            | "rwlock_recursive" => Ok(Self::RecursiveRw),
-            "point_rw"
-            | "point_rwlock"
-            | "flat_rw"
-            | "flat_rwlock"
-            | "rw_point"
-            | "rwlock_point"
-            | "rwlock_flat"
-            | "rwlock_nonrecursive"
-            | "rwlock_no_recursion"
-            | "rwlock_no_recursive"
-            | "nonrecursive_rw"
-            | "non_recursive_rw" => Ok(Self::PointRw),
-            "recursive_write"
-            | "write_recursive"
-            | "write_only_recursive"
-            | "recursive_write_only"
-            | "recursive_mutex"
-            | "mutex_recursive" => Ok(Self::RecursiveWrite),
-            "point_write" | "write_point" | "flat_write" | "write_only_point"
-            | "point_write_only" | "point_mutex" | "mutex" | "flat_mutex" => Ok(Self::PointWrite),
+            "recursive_rw" => Ok(Self::RecursiveRw),
+            "point_rw" => Ok(Self::PointRw),
+            "recursive_write" => Ok(Self::RecursiveWrite),
+            "point_write" => Ok(Self::PointWrite),
+            "semaphore" => Ok(Self::Semaphore),
             _ => anyhow::bail!(
                 "unknown lock algorithm {raw:?}; expected one of: {}",
                 Self::variants().join(", ")
@@ -163,6 +165,11 @@ pub struct LockReq {
     pub path: String,
     pub mode: Mode,
     pub state: State,
+    /// Concurrent-holder cap for a [`LockAlgorithm::Semaphore`] namespace: the
+    /// acquire is admitted iff the path currently has fewer than `permits` live
+    /// holders. Required `>= 1` in a semaphore namespace; ignored otherwise.
+    #[serde(default)]
+    pub permits: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -408,6 +415,27 @@ fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
     Ok(alive)
 }
 
+/// Live semaphore holders at `path`, dropping any whose owner is dead (and the
+/// dead owner's per-hold algorithm marker). Semaphore holds are stored under
+/// the engine's `Mode::Write` string, mirroring their wire mode.
+fn prune_dead_semaphore_owners<T: StoreTxn>(
+    tx: &mut T,
+    path: &str,
+) -> anyhow::Result<Vec<String>> {
+    let pfx = sem_prefix(path);
+    let owners = tx.smembers_limited(SEM_CF, &pfx, MAX_SET_ENUM_MEMBERS)?;
+    let mut alive = Vec::new();
+    for o in owners {
+        if owner_alive(tx, &o)? {
+            alive.push(o);
+        } else {
+            tx.srem(SEM_CF, &pfx, &o)?;
+            del_hold_algorithm(tx, &o, Mode::Write, path)?;
+        }
+    }
+    Ok(alive)
+}
+
 fn get_live_write_owner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<String>> {
     let Some(owner) = tx.get_str(WR_CF, &wr_key(path))? else {
         return Ok(None);
@@ -550,7 +578,13 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
         let path = &req.path;
         match req.state {
             State::Held => {
-                if req.mode == Mode::Write {
+                if request_algorithm.is_semaphore() {
+                    // A held semaphore lock lives in the holder set, not WR_CF,
+                    // and carries no fence.
+                    if !tx.sismember(SEM_CF, &sem_prefix(path), owner)? {
+                        return Ok(lost(path, "missing_semaphore"));
+                    }
+                } else if req.mode == Mode::Write {
                     if tx.get_str(WR_CF, &wr_key(path))?.as_deref() != Some(owner.as_str()) {
                         return Ok(lost(path, "missing_write"));
                     }
@@ -580,6 +614,24 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
                             return Ok(conflict(&anc, &anc_owner, "ancestor_locked"));
                         }
                     }
+                }
+                if request_algorithm.is_semaphore() {
+                    // Point, write-only counting semaphore: admit iff the path
+                    // has fewer live holders than this request's own permit
+                    // count. An owner already holding refreshes in place (no
+                    // double-count). Ancestor exclusion above still applies; no
+                    // descendant scan, read check, or fence.
+                    if req.permits == 0 {
+                        return Ok(conflict(path, "", "invalid_permits"));
+                    }
+                    if !tx.sismember(SEM_CF, &sem_prefix(path), owner)? {
+                        let holders = prune_dead_semaphore_owners(tx, path)?;
+                        if holders.len() as u32 >= req.permits {
+                            let blocker = holders.into_iter().next().unwrap_or_default();
+                            return Ok(conflict(path, &blocker, "semaphore_full"));
+                        }
+                    }
+                    continue;
                 }
                 if let Some(wr_owner) = get_live_write_owner(tx, path)? {
                     if wr_owner != *owner {
@@ -640,7 +692,10 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
         };
         set_hold_algorithm(tx, owner, req.mode, path, held_algorithm, ttl)?;
 
-        if req.mode == Mode::Write {
+        if held_algorithm.is_semaphore() {
+            // Validated above; just (re)join the holder set under the lease TTL.
+            tx.sadd(SEM_CF, &sem_prefix(path), owner, ttl)?;
+        } else if req.mode == Mode::Write {
             let wr_k = wr_key(path);
             let fence_k = fence_key(path);
             match req.state {
@@ -688,12 +743,23 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
         };
         let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
         if mode == "write" {
+            let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
+            if lock_algorithm.is_semaphore() {
+                // Semaphore hold: refresh membership + per-hold algorithm under
+                // the new lease TTL; no WR_CF, fence, or descendant index.
+                if !tx.sismember(SEM_CF, &sem_prefix(&path), owner)? {
+                    return Ok(lost(&path, "missing_semaphore"));
+                }
+                tx.sadd(SEM_CF, &sem_prefix(&path), owner, ttl)?;
+                set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl)?;
+                tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
+                continue;
+            }
             let wr_k = wr_key(&path);
             if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner.as_str()) {
                 return Ok(lost(&path, "missing_write"));
             }
             tx.pexpire_str(WR_CF, &wr_k, ttl)?;
-            let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
             match parse_fence(tx.get_str(FENCE_CF, &fence_key(&path))?) {
                 None => return Ok(lost(&path, "missing_fence")),
                 Some(cur) if token > 0 && cur > token => {
@@ -732,7 +798,13 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
             let member = format!("{}:{}", req.mode.as_str(), path);
             tx.srem(OWN_CF, &own_pfx, &member)?;
 
-            if req.mode == Mode::Write {
+            if req.mode == Mode::Write && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore()
+            {
+                // Semaphore hold (no WR_CF / fence / descendant index): just
+                // leave the holder set, freeing a permit for the next waiter.
+                tx.srem(SEM_CF, &sem_prefix(path), owner)?;
+                del_hold_algorithm(tx, owner, Mode::Write, path)?;
+            } else if req.mode == Mode::Write {
                 let wr_k = wr_key(path);
                 if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner.as_str()) {
                     tx.del(WR_CF, &wr_k)?;
@@ -777,7 +849,10 @@ pub fn release_inner<T: StoreTxn>(
         let member = format!("{}:{}", req.mode.as_str(), path);
         tx.srem(OWN_CF, &own_pfx, &member)?;
 
-        if req.mode == Mode::Write {
+        if req.mode == Mode::Write && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore() {
+            tx.srem(SEM_CF, &sem_prefix(path), owner)?;
+            del_hold_algorithm(tx, owner, Mode::Write, path)?;
+        } else if req.mode == Mode::Write {
             let wr_k = wr_key(path);
             if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
                 tx.del(WR_CF, &wr_k)?;
@@ -821,7 +896,10 @@ fn release_held_member<T: StoreTxn>(tx: &mut T, owner: &str, item: &str) -> anyh
     };
     let mode = &item[..sep];
     let path = &item[sep + 1..];
-    if mode == "write" {
+    if mode == "write" && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore() {
+        tx.srem(SEM_CF, &sem_prefix(path), owner)?;
+        del_hold_algorithm(tx, owner, Mode::Write, path)?;
+    } else if mode == "write" {
         let wr_k = wr_key(path);
         if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
             tx.del(WR_CF, &wr_k)?;
@@ -926,11 +1004,21 @@ pub fn renew_inner<T: StoreTxn>(
                 let mode = &item[..sep];
                 let path = item[sep + 1..].to_string();
                 if mode == "write" {
+                    let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
+                    if lock_algorithm.is_semaphore() {
+                        if !tx.sismember(SEM_CF, &sem_prefix(&path), owner)? {
+                            return Ok(renew_lost(&path, "missing_semaphore"));
+                        }
+                        tx.sadd(SEM_CF, &sem_prefix(&path), owner, ttl_ms)?;
+                        set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl_ms)?;
+                        tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
+                        renewed += 1;
+                        continue;
+                    }
                     let wr_k = wr_key(&path);
                     if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner) {
                         return Ok(renew_lost(&path, "missing_write"));
                     }
-                    let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
                     tx.pexpire_str(WR_CF, &wr_k, ttl_ms)?;
                     let fence_k = fence_key(&path);
                     if tx.get_str(FENCE_CF, &fence_k)?.is_none() {
@@ -1152,6 +1240,8 @@ pub struct PathInfo {
     pub read_owners: Vec<String>,
     pub fence: Option<i64>,
     pub claim_owner: Option<String>,
+    /// Live semaphore holders of this exact path (empty for non-semaphore paths).
+    pub semaphore_owners: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1190,6 +1280,13 @@ pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
 
     let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?);
 
+    let mut semaphore_owners = Vec::new();
+    for owner in tx.smembers_limited(SEM_CF, &sem_prefix(path), MAX_SET_ENUM_MEMBERS)? {
+        if owner_alive(tx, &owner)? {
+            semaphore_owners.push(owner);
+        }
+    }
+
     Ok(PathInfo {
         write_owner,
         read_owners,
@@ -1197,6 +1294,7 @@ pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
         // Path claims were removed in favour of the wait queue; retained on the
         // inspection struct (always None) for wire/API stability.
         claim_owner: None,
+        semaphore_owners,
     })
 }
 
@@ -1289,6 +1387,44 @@ mod tests {
         for anc in get_ancestors("google_drive:/x/y/z") {
             assert!(anc.starts_with("google_drive:"));
         }
+    }
+
+    #[test]
+    fn lock_algorithm_parses_canonical_names_round_trip() {
+        for name in LockAlgorithm::variants() {
+            let parsed: LockAlgorithm = name.parse().unwrap();
+            assert_eq!(parsed.as_str(), *name);
+        }
+        // Case / separator normalization still applies.
+        assert_eq!(
+            "Recursive-RW".parse::<LockAlgorithm>().unwrap(),
+            LockAlgorithm::RecursiveRw
+        );
+        assert_eq!(
+            " semaphore ".parse::<LockAlgorithm>().unwrap(),
+            LockAlgorithm::Semaphore
+        );
+    }
+
+    #[test]
+    fn lock_algorithm_rejects_removed_aliases() {
+        // The legacy synonym set was trimmed to one canonical name per variant.
+        for alias in ["rwlock", "rwlock_no_recursion", "mutex", "flat_write", "bogus"] {
+            assert!(
+                alias.parse::<LockAlgorithm>().is_err(),
+                "{alias:?} should no longer parse"
+            );
+        }
+    }
+
+    #[test]
+    fn semaphore_algorithm_flags() {
+        let s = LockAlgorithm::Semaphore;
+        assert!(s.is_semaphore());
+        assert!(!s.allows_read());
+        assert!(!s.recursive());
+        assert!(s.allows_mode(Mode::Write));
+        assert!(!s.allows_mode(Mode::Read));
     }
 
     #[test]

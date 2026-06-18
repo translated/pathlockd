@@ -42,6 +42,7 @@ fn wr(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Write,
         state: State::New,
+        permits: 0,
     }
 }
 
@@ -50,6 +51,7 @@ fn wr_held(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Write,
         state: State::Held,
+        permits: 0,
     }
 }
 
@@ -58,6 +60,7 @@ fn rd(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Read,
         state: State::New,
+        permits: 0,
     }
 }
 
@@ -66,6 +69,7 @@ fn rd_held(path: &str) -> LockReq {
         path: path.to_string(),
         mode: Mode::Read,
         state: State::Held,
+        permits: 0,
     }
 }
 
@@ -2900,4 +2904,305 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         }
         other => panic!("expected namespace policy result after delete, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Semaphore algorithm (point, write-only, per-acquire permit count)
+// ---------------------------------------------------------------------------
+
+/// A new semaphore acquire on `path` requesting `permits` concurrent holders.
+fn sem(path: &str, permits: u32) -> LockReq {
+    LockReq {
+        path: path.to_string(),
+        mode: Mode::Write,
+        state: State::New,
+        permits,
+    }
+}
+
+/// A held-state re-validation of a semaphore lock.
+fn sem_held(path: &str, permits: u32) -> LockReq {
+    LockReq {
+        path: path.to_string(),
+        mode: Mode::Write,
+        state: State::Held,
+        permits,
+    }
+}
+
+fn inspect(db: &Arc<rocksdb::DB>, path: &str) -> pathlockd::engine::PathInfo {
+    match pathlockd::raft::server::execute_read_blocking(
+        db,
+        G,
+        ReadOp::InspectPath { path: path.into() },
+        LockAlgorithm::default(),
+    )
+    .unwrap()
+    {
+        ReadResult::InspectPath(info) => info,
+        other => panic!("expected InspectPath result, got {other:?}"),
+    }
+}
+
+#[test]
+fn semaphore_admits_up_to_permits_then_queues() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    // Two holders fit under permits=2.
+    for (i, owner) in ["alice", "bob"].into_iter().enumerate() {
+        assert!(
+            matches!(
+                apply(
+                    &db,
+                    Command {
+                        request_id: None,
+                        now_ms: now + 1 + i as u64,
+                        op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
+                    }
+                ),
+                ApplyResponse::Acquire(AcquireOutcome::Ok)
+            ),
+            "{owner} should be admitted"
+        );
+    }
+
+    // The third request exceeds its own permit count and is queued (not refused):
+    // semaphore_full is a contention conflict, granted in place once a permit frees.
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 4,
+            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
+            assert_eq!(reason, "semaphore_full");
+        }
+        other => panic!("expected Queued(semaphore_full), got {other:?}"),
+    }
+
+    let info = inspect(&db, "sem:/a");
+    assert!(info.write_owner.is_none(), "semaphore has no exclusive owner");
+    assert_eq!(info.semaphore_owners.len(), 2);
+}
+
+#[test]
+fn semaphore_release_frees_a_permit_and_grants_waiter() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    for (i, owner) in ["alice", "bob"].into_iter().enumerate() {
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1 + i as u64,
+                op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
+            },
+        );
+    }
+    // carol queues behind the full semaphore.
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 4,
+            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+        },
+    );
+
+    // alice releases → the post-release sweep grants carol in place.
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 5,
+            op: Op::Release {
+                owner: "alice".into(),
+                reqs: vec![rel("sem:/a", Mode::Write)],
+                del_wait: false,
+            },
+        },
+    );
+
+    let info = inspect(&db, "sem:/a");
+    assert_eq!(info.semaphore_owners.len(), 2);
+    assert!(info.semaphore_owners.contains(&"carol".to_string()));
+    assert!(!info.semaphore_owners.contains(&"alice".to_string()));
+
+    // carol can now re-validate its held grant.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 6,
+                op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem_held("sem:/a", 2)])),
+            }
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+}
+
+#[test]
+fn semaphore_reacquire_by_holder_does_not_consume_a_second_permit() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    // alice acquires twice; she must still occupy exactly one of two permits.
+    for i in 0..2 {
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1 + i,
+                op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
+            },
+        );
+    }
+    assert_eq!(inspect(&db, "sem:/a").semaphore_owners.len(), 1);
+
+    // bob still fits in the remaining permit.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 3,
+                op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![sem("sem:/a", 2)])),
+            }
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+    assert_eq!(inspect(&db, "sem:/a").semaphore_owners.len(), 2);
+}
+
+#[test]
+fn semaphore_gates_on_the_requesters_own_permit_count() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    // Two independent paths, each pre-loaded with exactly two holders and an
+    // empty wait queue. Holding the count fixed at 2 across both paths isolates
+    // the per-request gate from FIFO ordering (a queued waiter on a path would
+    // otherwise make later arrivals on that same path yield to it).
+    for (i, owner) in ["alice", "bob"].into_iter().enumerate() {
+        for path in ["sem:/a", "sem:/b"] {
+            apply(
+                &db,
+                Command {
+                    request_id: None,
+                    now_ms: now + 1 + i as u64,
+                    op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem(path, 3)])),
+                },
+            );
+        }
+    }
+
+    // permits=2 sees 2 >= 2 → refused (queued).
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 3,
+            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
+            assert_eq!(reason, "semaphore_full");
+        }
+        other => panic!("expected Queued(semaphore_full) for permits=2, got {other:?}"),
+    }
+
+    // permits=3 sees 2 < 3 → admitted (distinct path, so unaffected by carol).
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 4,
+                op: Op::Acquire(acquire_args("dave", 60_000, 0, vec![sem("sem:/b", 3)])),
+            }
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+}
+
+#[test]
+fn semaphore_zero_permits_is_invalid_and_not_queued() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 0)])),
+        },
+    ) {
+        // A client error, not contention: refused outright rather than queued.
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "invalid_permits");
+        }
+        other => panic!("expected Conflict(invalid_permits), got {other:?}"),
+    }
+}
+
+#[test]
+fn semaphore_namespace_rejects_reads() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("sem:/a")])),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, "read_locks_disabled");
+        }
+        other => panic!("expected Conflict(read_locks_disabled), got {other:?}"),
+    }
+}
+
+#[test]
+fn semaphore_release_all_clears_a_holder() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
+        },
+    );
+    assert_eq!(inspect(&db, "sem:/a").semaphore_owners.len(), 1);
+
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 2,
+            op: Op::ReleaseAll {
+                owner: "alice".into(),
+                del_wait: false,
+            },
+        },
+    );
+    assert!(inspect(&db, "sem:/a").semaphore_owners.is_empty());
 }

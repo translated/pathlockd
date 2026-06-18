@@ -256,6 +256,7 @@ fn to_algorithm(i: i32) -> Result<LockAlgorithm, Status> {
         Ok(proto::LockAlgorithm::PointRw) => Ok(LockAlgorithm::PointRw),
         Ok(proto::LockAlgorithm::RecursiveWrite) => Ok(LockAlgorithm::RecursiveWrite),
         Ok(proto::LockAlgorithm::PointWrite) => Ok(LockAlgorithm::PointWrite),
+        Ok(proto::LockAlgorithm::Semaphore) => Ok(LockAlgorithm::Semaphore),
         Err(_) => Err(Status::invalid_argument(format!(
             "invalid lock algorithm value {i}"
         ))),
@@ -268,6 +269,7 @@ fn algorithm_to_proto(algorithm: LockAlgorithm) -> i32 {
         LockAlgorithm::PointRw => proto::LockAlgorithm::PointRw as i32,
         LockAlgorithm::RecursiveWrite => proto::LockAlgorithm::RecursiveWrite as i32,
         LockAlgorithm::PointWrite => proto::LockAlgorithm::PointWrite as i32,
+        LockAlgorithm::Semaphore => proto::LockAlgorithm::Semaphore as i32,
     }
 }
 
@@ -379,6 +381,7 @@ impl PathLockService {
                     path: r.path.clone(),
                     mode: to_mode(r.mode)?,
                     state: to_state(r.state)?,
+                    permits: r.permits,
                 })
             })
             .collect::<Result<_, Status>>()?;
@@ -988,6 +991,7 @@ impl PathLock for PathLockService {
                     has_fence: info.fence.is_some(),
                     fence: info.fence.unwrap_or(0),
                     claim_owner: String::new(),
+                    semaphore_owners: info.semaphore_owners,
                 }))
             },
         )

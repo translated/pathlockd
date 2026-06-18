@@ -406,6 +406,7 @@ fn wr(path: &str) -> LockRequest {
         path: path.into(),
         mode: Mode::Write as i32,
         state: LockState::New as i32,
+        permits: 0,
     }
 }
 
@@ -414,6 +415,7 @@ fn rd(path: &str) -> LockRequest {
         path: path.into(),
         mode: Mode::Read as i32,
         state: LockState::New as i32,
+        permits: 0,
     }
 }
 

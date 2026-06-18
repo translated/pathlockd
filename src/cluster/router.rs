@@ -1645,6 +1645,7 @@ mod tests {
             path: path.into(),
             mode: Mode::Write,
             state: State::New,
+            permits: 0,
         }
     }
 
@@ -1653,6 +1654,7 @@ mod tests {
             path: path.into(),
             mode: Mode::Read,
             state: State::New,
+            permits: 0,
         }
     }
 
@@ -2137,6 +2139,7 @@ mod tests {
                 path: path.into(),
                 mode: Mode::Write,
                 state,
+                permits: 0,
             }],
             fencing_token: fence,
             release_requests: vec![],

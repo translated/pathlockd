@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{locks_conflict, AcquireArgs, AcquireOutcome, LockAlgorithm, Mode, State};
 use crate::store_keys::{
     decode_queue_entry_seq, expired, queue_entry_key, queue_entry_lower, queue_entry_upper,
-    queue_owner_key, rd_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS, CF_WRITE_LOCKS,
-    META_QUEUE_SEQ_KEY,
+    queue_owner_key, rd_prefix, sem_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS,
+    CF_SEMAPHORE, CF_WRITE_LOCKS, META_QUEUE_SEQ_KEY,
 };
 use crate::store_rocksdb::{decode_record, encode_record, StoreTxn, StoredRecord, WriteTxn};
 
@@ -247,6 +247,11 @@ fn owner_holds_or_covers(
     if tx.get_str(CF_WRITE_LOCKS, &wr_key(path))?.as_deref() == Some(owner) {
         return Ok(true);
     }
+    // A semaphore holder re-acquiring already occupies a permit; it must not be
+    // told to yield to an earlier waiter for the same path.
+    if algorithm.is_semaphore() && tx.sismember(CF_SEMAPHORE, &sem_prefix(path), owner)? {
+        return Ok(true);
+    }
     if algorithm.recursive() {
         for anc in crate::engine::get_ancestors(path) {
             if tx.get_str(CF_WRITE_LOCKS, &wr_key(&anc))?.as_deref() == Some(owner) {
@@ -406,6 +411,7 @@ mod tests {
             path: path.to_string(),
             mode,
             state: State::New,
+            permits: 0,
         }
     }
 
