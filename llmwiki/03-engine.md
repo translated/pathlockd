@@ -14,7 +14,13 @@ are inherently sync.
 ## `acquire`
 
 Args: owner, ttl, `requests: [{path, mode, state}]`, fencing token, optional
-inline `release_requests`.
+inline `release_requests`. The router resolves the path's routing namespace
+and looks up its `LockAlgorithm`; the apply layer invokes
+`acquire_inner_with_policy(args, algorithm)`. The default policy is
+`recursive_rw`; opt-in policies (`point_rw`, `recursive_write`, `point_write`)
+narrow the conflict scan and may reject `MODE_READ` outright as
+`read_locks_disabled`. See [08-lock-algorithms.md](08-lock-algorithms.md) for
+the per-algorithm matrices and the rationale.
 
 1. **Liveness gate.** If any request is `Held` and the owner's `alive` key is
    gone → `LOST(missing_alive)`.
@@ -23,30 +29,39 @@ inline `release_requests`.
      `fence:<path>` must exist (else `LOST(missing_fence)`) and be ≤ the token
      (else `CONFLICT(stale_fencing_token)`, with the persisted fence in `owner`).
    - *Held read*: owner must be in `rd:<path>` (else `LOST(missing_read)`).
-   - *New*: check ancestors for a live foreign `wr` (`ancestor_locked`); check
-     self `wr` (`write_locked`), pruning dead write owners while doing so; for a
-     *write* additionally: foreign reader on self (`read_locked`, after pruning
-     dead readers), a foreign write in the subtree (`descendant_write_locked`),
-     a foreign read in the subtree (`descendant_read_locked`), and a higher
-     persisted fence (`stale_fencing_token`). Reads are point-only — they do
-     **not** scan descendants.
-3. **Execution.** Refresh `alive`; for each request add to `own:<owner>` and
-   write `wr`/`rd` + fence + descendant indexes via the `StoreTxn`. Re-acquiring
-   an owned path refreshes its TTL and advances the fence to the (validated ≥)
-   token. Since the call advances `alive` and the whole `own` set to `now+ttl`,
-   it then refreshes every *other* still-held path to the same horizon too, so
-   the single owner lease never outlives the keys backing it. If one of those
-   unlisted held paths has vanished, acquire reports `LOST` instead of masking
-   the loss. A read-only acquire can refresh an unlisted write by preserving its
-   existing fence value; a positive token advances it and still fails if stale.
-   A call with no requests and no releases is a no-op.
+   - *New*: if the policy is `recursive_write` or `point_write` and the
+     request is a read → `CONFLICT(read_locks_disabled)` (non-waitable, never
+     enqueued). Otherwise: check ancestors for a live foreign `wr`
+     (`ancestor_locked`); check self `wr` (`write_locked`), pruning dead write
+     owners while doing so; for a *write* additionally: foreign reader on self
+     (`read_locked`, after pruning dead readers), and — **only if the policy is
+     recursive** — a foreign write in the subtree
+     (`descendant_write_locked`), a foreign read in the subtree
+     (`descendant_read_locked`). The `point_*` policies do not consult the
+     descendant index and never produce those reasons. Every policy then
+     checks the persisted fence (`stale_fencing_token`).
+3. **Execution.** Refresh `alive`; for each request add to `own:<owner>`,
+   stamp the resolved `LockAlgorithm` in `META_CF` under
+   `hold_algorithm_key(owner, mode, path)` (so the held lock keeps its
+   algorithm even if the namespace policy later changes), and write
+   `wr`/`rd` + fence + descendant indexes via the `StoreTxn`. Re-acquiring an
+   owned path refreshes its TTL and advances the fence to the (validated ≥)
+   token. Since the call advances `alive` and the whole `own` set to
+   `now+ttl`, it then refreshes every *other* still-held path to the same
+   horizon too, so the single owner lease never outlives the keys backing it.
+   If one of those unlisted held paths has vanished, acquire reports `LOST`
+   instead of masking the loss. A read-only acquire can refresh an unlisted
+   write by preserving its existing fence value; a positive token advances it
+   and still fails if stale. A call with no requests and no releases is a
+   no-op.
 4. **Inline release.** Any `release_requests` are applied in the same
    `WriteBatch` (used for shadowing transitions: acquire the covering ancestor
    and drop now-redundant child keys atomically).
 
 **Conflict precedence** (fixed): `ancestor_locked` → `write_locked` →
 `read_locked` → `descendant_write_locked` → `descendant_read_locked` →
-`stale_fencing_token`.
+`read_locks_disabled` → `stale_fencing_token`. The effective order collapses
+for `point_*` policies (no ancestor / descendant reasons fire).
 
 ## `release` / `release_all`
 
@@ -98,14 +113,22 @@ The engine primitives above stay pure; the **wait queue** lives one layer up, in
 the Raft apply (`src/queue.rs` + `state_machine.rs`), so it can use the
 deterministic transaction and the persisted clock:
 
-- On a conflict that is *waitable* (held-lock conflict, not `stale_fencing_token`),
-  the apply **enqueues** the request (`CF_QUEUE`) and returns `Queued` instead of
-  discarding the conflict. FIFO admission makes a newcomer yield to strictly
-  earlier waiters whose scope covers its path (anti-starvation).
+- On a conflict that is *waitable* (held-lock conflict, not `stale_fencing_token`
+  or `read_locks_disabled`), the apply **enqueues** the request (`CF_QUEUE`)
+  and returns `Queued` instead of discarding the conflict. FIFO admission makes
+  a newcomer yield to strictly earlier waiters whose scope covers its path
+  (anti-starvation). The queue entry carries the request's `LockAlgorithm`, so
+  the wake-time re-acquire uses the algorithm the request was made with — even
+  if the namespace policy has since changed.
+- Conflict detection at admission goes through `queue::requests_conflict`, an
+  alias of `engine::locks_conflict` with the **per-pair algorithms** plugged
+  in. A point-policy waiter can be blocked by a recursive-policy holder on an
+  ancestor (the recursive writer's descendant index covers the point), but
+  never by a point-policy holder outside its exact path.
 - After any release/force-release/GC frees keys, the **grant sweep** walks the
   queue in FIFO order and re-runs `acquire_inner` for each head waiter; an `Ok`
-  writes its lock keys in place and dequeues it; a stale-fencing head is woken to
-  refresh-and-retry. Granted/woken owners get a `GRANT` event.
+  writes its lock keys in place and dequeues it; a stale-fencing head is woken
+  to refresh-and-retry. Granted/woken owners get a `GRANT` event.
 - Entries are TTL'd (the caller's `queue_ttl_ms`) and GC-reaped, and are
   snapshotted with the group, so the queue is durable and survives failover /
   rebalancing / full restart.

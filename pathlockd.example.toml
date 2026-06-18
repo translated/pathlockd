@@ -46,6 +46,14 @@ group_count = 32
 # within one handler, at the cost of rejecting locks at depth < K.
 routing_prefix_segments = 0
 
+# Lock algorithm applied to namespaces with no explicit SetNamespacePolicy row.
+# One of: recursive_rw (default) | point_rw | recursive_write | point_write.
+# Cluster-wide invariant: every node MUST set the same value — it feeds the
+# deterministic Raft state machine, so a divergent value corrupts replicated
+# state (same rule as group_count / routing_prefix_segments). Changing a
+# namespace's effective algorithm later force-clears that namespace's locks.
+default_lock_algorithm = "recursive_rw"
+
 # Voters per Raft group (odd). The effective factor degrades to the largest
 # odd number <= the stable node count and upgrades automatically as nodes
 # join (1 node -> 1, 3+ nodes -> 3, ...).

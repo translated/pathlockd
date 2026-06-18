@@ -22,6 +22,20 @@ clients ──gRPC──▶ pathlockd (N replicas)
 - **SWIM gossip** (via `foca`) discovers cluster nodes from a static `seed_nodes`
   list and propagates membership changes.
 
+## Lock algorithm is a property of the routing namespace
+
+Each routing namespace has a `LockAlgorithm` (`recursive_rw` by default;
+`point_rw`, `recursive_write`, `point_write` opt-ins) that selects the
+conflict rules used inside the group: the scope of a write
+(subtree vs exact path), whether reads are allowed at all, and whether
+the descendant index is consulted. The algorithm is **stamped on the
+held lock** (in `META_CF`) so it survives the namespace policy that
+produced it; `Set` / `Delete` of a namespace policy is forward-only and
+never shrinks a live lease. See
+[08-lock-algorithms.md](08-lock-algorithms.md) for the four conflict
+matrices, the rationale, and the interaction with routing and the
+wait queue.
+
 ## Request lifecycle (e.g. acquire)
 
 1. A client calls `Acquire` with an owner id, a TTL, the requested paths, and a

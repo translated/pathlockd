@@ -14,6 +14,7 @@ use rocksdb::DB;
 use tracing::info;
 
 use crate::cluster::placement::GroupId;
+use crate::engine::LockAlgorithm;
 use crate::raft::log_store::{FsyncBatcher, GroupLogStore};
 use crate::raft::network::{PeerPool, RaftClientFactory};
 use crate::raft::state_machine::GroupStateMachine;
@@ -27,6 +28,10 @@ pub struct RaftGroups {
     snapshot_max_bytes: u64,
     batcher: FsyncBatcher,
     pool: PeerPool,
+    /// Configured fallback lock algorithm (`Config::default_lock_algorithm`),
+    /// handed to every group's state machine and read handler so the default
+    /// namespace policy is resolved identically (and configurably) everywhere.
+    default_algorithm: LockAlgorithm,
     groups: RwLock<HashMap<GroupId, Raft>>,
 }
 
@@ -39,6 +44,7 @@ impl RaftGroups {
         snapshot_max_bytes: u64,
         batcher: FsyncBatcher,
         pool: PeerPool,
+        default_algorithm: LockAlgorithm,
     ) -> anyhow::Result<Arc<Self>> {
         let raft_config = Arc::new(
             raft_config
@@ -53,8 +59,15 @@ impl RaftGroups {
             snapshot_max_bytes,
             batcher,
             pool,
+            default_algorithm,
             groups: RwLock::new(HashMap::new()),
         }))
+    }
+
+    /// The configured fallback lock algorithm for namespaces with no explicit
+    /// policy row.
+    pub fn default_algorithm(&self) -> LockAlgorithm {
+        self.default_algorithm
     }
 
     pub fn node_id(&self) -> u64 {
@@ -124,7 +137,12 @@ impl RaftGroups {
             return Ok(existing);
         }
         let log_store = GroupLogStore::new(self.db.clone(), group, self.batcher.clone());
-        let state_machine = GroupStateMachine::new(self.db.clone(), group, self.batcher.clone());
+        let state_machine = GroupStateMachine::new(
+            self.db.clone(),
+            group,
+            self.batcher.clone(),
+            self.default_algorithm,
+        );
         let network = RaftClientFactory::new(group, self.pool.clone(), self.snapshot_max_bytes);
         let raft = Raft::new(
             self.node_id,

@@ -153,4 +153,12 @@ pub enum ApplyResponse {
         outcome: crate::engine::AcquireOutcome,
         granted: Vec<String>,
     },
+    /// Owners whose held and/or queued locks were force-cleared because a
+    /// namespace's effective lock algorithm changed (`SetNamespacePolicy` to a
+    /// different algorithm, or `DeleteNamespacePolicy` reverting an explicit
+    /// non-default policy). Those locks were acquired under the old algorithm's
+    /// conflict semantics, so they are dropped and the owners told to
+    /// re-establish; the service layer emits a KILLED event for each. Appended
+    /// last to keep existing variant encodings stable.
+    NamespaceCleared(Vec<String>),
 }

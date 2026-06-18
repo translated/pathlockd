@@ -51,6 +51,11 @@ lets that subtree route to a different Raft group; parent locks in
 delete namespace roots while the affected subtree is drained if callers rely on
 parent recursive locks covering the whole subtree.
 
+> The per-algorithm conflict matrices, the rationale for each policy, and the
+> interplay with routing and the wait queue are documented in depth in
+> [`llmwiki/08-lock-algorithms.md`](../llmwiki/08-lock-algorithms.md). The rest
+> of this file describes the **default** `recursive_rw` model in full.
+
 ## The core invariant
 
 The default `recursive_rw` policy is a **reader-writer lock generalized to a tree** — and the generalization

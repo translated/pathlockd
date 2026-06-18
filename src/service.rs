@@ -519,10 +519,16 @@ impl PathLock for PathLockService {
                 check_namespace(&req.namespace)?;
                 let algorithm = to_algorithm(req.algorithm)?;
                 let idempotency_key = idempotency_key(&req.idempotency_key)?;
-                self.router
+                let killed = self
+                    .router
                     .set_namespace_policy(&req.namespace, algorithm, idempotency_key.as_deref())
                     .await
                     .map_err(engine_err)?;
+                // The algorithm change dropped these owners' locks (held and/or
+                // queued); tell them to re-establish under the new policy.
+                for owner in &killed {
+                    self.broadcaster.killed(owner);
+                }
                 Ok(Response::new(SetNamespacePolicyResponse {}))
             },
         )
@@ -566,10 +572,16 @@ impl PathLock for PathLockService {
                 let req = request.into_inner();
                 check_namespace(&req.namespace)?;
                 let idempotency_key = idempotency_key(&req.idempotency_key)?;
-                self.router
+                let killed = self
+                    .router
                     .delete_namespace_policy(&req.namespace, idempotency_key.as_deref())
                     .await
                     .map_err(engine_err)?;
+                // Reverting to the default algorithm dropped these owners'
+                // locks; tell them to re-establish under the new policy.
+                for owner in &killed {
+                    self.broadcaster.killed(owner);
+                }
                 Ok(Response::new(DeleteNamespacePolicyResponse {}))
             },
         )

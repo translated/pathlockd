@@ -88,6 +88,9 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
 }
 
 fn set_policy(db: &Arc<rocksdb::DB>, now_ms: u64, namespace: &str, algorithm: LockAlgorithm) {
+    // A policy change force-clears locks under the namespace when the effective
+    // algorithm changes, so the response is either `Unit` (no change, or an
+    // empty namespace) or `NamespaceCleared` (locks were dropped).
     assert!(matches!(
         apply(
             db,
@@ -100,7 +103,7 @@ fn set_policy(db: &Arc<rocksdb::DB>, now_ms: u64, namespace: &str, algorithm: Lo
                 },
             },
         ),
-        ApplyResponse::Unit
+        ApplyResponse::Unit | ApplyResponse::NamespaceCleared(_)
     ));
 }
 
@@ -2484,28 +2487,31 @@ fn write_only_policies_reject_new_reads() {
 fn recursive_write_and_point_write_scope_differ() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
-    set_policy(&db, now, "h", LockAlgorithm::RecursiveWrite);
+    // Two namespaces, each with its policy set before any locks: changing a
+    // policy now clears the namespace's locks, so the scope difference is shown
+    // with distinct pre-configured handlers rather than a mid-lock switch.
+    set_policy(&db, now, "rec", LockAlgorithm::RecursiveWrite);
+    set_policy(&db, now, "pt", LockAlgorithm::PointWrite);
 
+    // Recursive: an ancestor write covers its descendants.
     apply(
         &db,
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/recursive")])),
+            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("rec:/recursive")])),
         },
     );
-    set_policy(&db, now + 2, "h", LockAlgorithm::PointWrite);
-
     match apply(
         &db,
         Command {
             request_id: None,
-            now_ms: now + 3,
+            now_ms: now + 2,
             op: Op::Acquire(acquire_args(
                 "bob",
                 60_000,
                 2,
-                vec![wr("h:/recursive/child")],
+                vec![wr("rec:/recursive/child")],
             )),
         },
     ) {
@@ -2515,13 +2521,14 @@ fn recursive_write_and_point_write_scope_differ() {
         other => panic!("expected recursive ancestor conflict, got {other:?}"),
     }
 
+    // Point: an exact-path write does not cover descendants.
     assert!(matches!(
         apply(
             &db,
             Command {
                 request_id: None,
-                now_ms: now + 4,
-                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/point")])),
+                now_ms: now + 3,
+                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("pt:/point")])),
             },
         ),
         ApplyResponse::Acquire(AcquireOutcome::Ok)
@@ -2532,8 +2539,8 @@ fn recursive_write_and_point_write_scope_differ() {
             &db,
             Command {
                 request_id: None,
-                now_ms: now + 5,
-                op: Op::Acquire(acquire_args("dave", 60_000, 4, vec![wr("h:/point/child")],)),
+                now_ms: now + 4,
+                op: Op::Acquire(acquire_args("dave", 60_000, 4, vec![wr("pt:/point/child")],)),
             },
         ),
         ApplyResponse::Acquire(AcquireOutcome::Ok)
@@ -2541,11 +2548,12 @@ fn recursive_write_and_point_write_scope_differ() {
 }
 
 #[test]
-fn new_recursive_policy_sees_existing_point_descendants() {
+fn algorithm_change_clears_held_locks_under_namespace() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
     set_policy(&db, now, "h", LockAlgorithm::PointWrite);
 
+    // Two point writes that coexist under the old (point) semantics.
     assert!(matches!(
         apply(
             &db,
@@ -2557,21 +2565,192 @@ fn new_recursive_policy_sees_existing_point_descendants() {
         ),
         ApplyResponse::Acquire(AcquireOutcome::Ok)
     ));
-    set_policy(&db, now + 2, "h", LockAlgorithm::RecursiveWrite);
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
 
+    // Switching the algorithm force-clears every held lock under "h".
     match apply(
         &db,
         Command {
             request_id: None,
             now_ms: now + 3,
-            op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+            op: Op::SetNamespacePolicy {
+                namespace: "h".into(),
+                algorithm: LockAlgorithm::RecursiveWrite,
+            },
         },
     ) {
-        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, path, .. }) => {
-            assert_eq!(reason, "descendant_write_locked");
-            assert_eq!(path, "h:/a/b");
+        ApplyResponse::NamespaceCleared(owners) => {
+            assert_eq!(owners, vec!["alice".to_string(), "bob".to_string()]);
         }
-        other => panic!("expected descendant point lock to block recursive write, got {other:?}"),
+        other => panic!("expected NamespaceCleared, got {other:?}"),
+    }
+
+    // The cleared paths are free again: a fresh acquire succeeds.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 4,
+                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+}
+
+#[test]
+fn algorithm_change_clears_queued_waiters_under_namespace() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::RecursiveWrite);
+
+    // alice holds the recursive ancestor; bob queues behind it.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+    ));
+
+    // The change clears alice's held lock AND bob's queued waiter.
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 3,
+            op: Op::SetNamespacePolicy {
+                namespace: "h".into(),
+                algorithm: LockAlgorithm::PointWrite,
+            },
+        },
+    ) {
+        ApplyResponse::NamespaceCleared(owners) => {
+            assert_eq!(owners, vec!["alice".to_string(), "bob".to_string()]);
+        }
+        other => panic!("expected NamespaceCleared, got {other:?}"),
+    }
+
+    // bob is no longer queued: re-acquiring now succeeds outright.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 4,
+                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+}
+
+#[test]
+fn policy_reset_to_same_algorithm_keeps_locks() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::PointWrite);
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/x")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+
+    // Re-setting the same algorithm is not a change: nothing is cleared.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::SetNamespacePolicy {
+                    namespace: "h".into(),
+                    algorithm: LockAlgorithm::PointWrite,
+                },
+            },
+        ),
+        ApplyResponse::Unit
+    ));
+
+    // alice still holds h:/x, so a conflicting acquire is refused.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 3,
+                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/x")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == "write_locked"
+    ));
+}
+
+#[test]
+fn delete_policy_reverts_to_default_and_clears() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h", LockAlgorithm::PointWrite);
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/p/q")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok)
+    ));
+
+    // Deleting the explicit (non-default) policy reverts "h" to the default
+    // algorithm — an effective change — so alice's lock is cleared.
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 2,
+            op: Op::DeleteNamespacePolicy {
+                namespace: "h".into(),
+            },
+        },
+    ) {
+        ApplyResponse::NamespaceCleared(owners) => {
+            assert_eq!(owners, vec!["alice".to_string()]);
+        }
+        other => panic!("expected NamespaceCleared, got {other:?}"),
     }
 }
 
@@ -2586,6 +2765,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadOp::GetNamespacePolicy {
             namespace: "h".into(),
         },
+        LockAlgorithm::default(),
     )
     .unwrap()
     {
@@ -2622,6 +2802,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadOp::GetNamespacePolicy {
             namespace: "h".into(),
         },
+        LockAlgorithm::default(),
     )
     .unwrap()
     {
@@ -2658,6 +2839,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadOp::GetNamespacePolicy {
             namespace: "h".into(),
         },
+        LockAlgorithm::default(),
     )
     .unwrap()
     {
@@ -2675,6 +2857,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         &db,
         pathlockd::cluster::placement::SYS_GROUP,
         ReadOp::ListNamespaces,
+        LockAlgorithm::default(),
     )
     .unwrap()
     {
@@ -2704,6 +2887,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadOp::GetNamespacePolicy {
             namespace: "h".into(),
         },
+        LockAlgorithm::default(),
     )
     .unwrap()
     {

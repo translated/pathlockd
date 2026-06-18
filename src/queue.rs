@@ -187,6 +187,26 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
     Ok(out)
 }
 
+/// Dequeue every live waiter whose acquire targets `namespace`, returning the
+/// dequeued owners (deterministic, ascending-seq order). Used when a namespace's
+/// lock algorithm changes: a waiter queued under the old semantics must not be
+/// granted in place under the new ones, so it is dropped (the caller signals it
+/// via a KILLED event).
+pub fn clear_namespace(tx: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
+    let entries = scan(tx)?;
+    let mut cleared = Vec::new();
+    for entry in entries {
+        let targets = entry.args.requests.iter().any(|r| {
+            crate::cluster::placement::namespace_contains_path(namespace, &r.path)
+        });
+        if targets {
+            dequeue(tx, &entry.owner)?;
+            cleared.push(entry.owner);
+        }
+    }
+    Ok(cleared)
+}
+
 fn decode_queue_entry(bytes: &[u8]) -> Option<QueueEntry> {
     bincode::serde::decode_from_slice::<QueueEntry, _>(bytes, bincode::config::standard())
         .ok()

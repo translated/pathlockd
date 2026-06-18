@@ -44,6 +44,7 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
         cfg.raft_snapshot_max_bytes,
         batcher,
         PeerPool::new(),
+        cfg.default_lock_algorithm,
     )
     .unwrap();
     let routing = RoutingOptions {

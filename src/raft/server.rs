@@ -361,8 +361,10 @@ impl RaftTransportService {
             })?;
 
         let db = self.groups.db_handle();
+        let default_algorithm = self.groups.default_algorithm();
         tokio::task::spawn_blocking(move || {
-            execute_read_blocking(&db, group, op).map_err(|e| ForwardError::Other(e.to_string()))
+            execute_read_blocking(&db, group, op, default_algorithm)
+                .map_err(|e| ForwardError::Other(e.to_string()))
         })
         .await
         .map_err(|e| ForwardError::Other(format!("read task failed: {e}")))?
@@ -376,6 +378,7 @@ pub fn execute_read_blocking(
     db: &Arc<rocksdb::DB>,
     group: u32,
     op: ReadOp,
+    default_algorithm: crate::engine::LockAlgorithm,
 ) -> anyhow::Result<ReadResult> {
     // Clamp the read clock to the group's persisted monotone apply clock so
     // a node with a lagging wall clock cannot judge TTL liveness more
@@ -414,7 +417,7 @@ pub fn execute_read_blocking(
         }
         ReadOp::GetNamespacePolicy { namespace } => {
             let (algorithm, explicit) =
-                crate::engine::get_namespace_policy_inner(&mut txn, &namespace)?;
+                crate::engine::get_namespace_policy_inner(&mut txn, &namespace, default_algorithm)?;
             Ok(ReadResult::NamespacePolicy {
                 algorithm,
                 explicit,

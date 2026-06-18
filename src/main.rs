@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
         cfg.raft_snapshot_max_bytes,
         batcher,
         PeerPool::new(),
+        cfg.default_lock_algorithm,
     )?;
 
     // Resume every group with prior local raft state (restart path). Whether

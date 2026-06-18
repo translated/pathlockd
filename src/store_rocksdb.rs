@@ -190,8 +190,13 @@ pub fn open_db(path: &Path, tuning: &DbTuning) -> anyhow::Result<Arc<DB>> {
     db_opts.set_max_total_wal_size(tuning.max_total_wal_size_mb.saturating_mul(MIB));
     db_opts.set_max_background_jobs(tuning.max_background_jobs);
 
-    let cache = rocksdb::Cache::new_lru_cache(
+    // AutoHyperClockCache (estimated_entry_charge = 0): lock-free clock eviction
+    // instead of LRU's per-shard mutex, which matters under the engine's many
+    // concurrent point gets. The auto-tuned charge suits our mixed cache
+    // contents (4 KiB data blocks plus differently-sized index/filter blocks).
+    let cache = rocksdb::Cache::new_hyper_clock_cache(
         usize::try_from(tuning.block_cache_mb.saturating_mul(MIB)).unwrap_or(usize::MAX),
+        0,
     );
 
     let cf_descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = store_keys::ALL_CFS
@@ -1102,6 +1107,46 @@ pub fn namespace_has_live_locks(
     )?;
 
     Ok(found)
+}
+
+/// Every LIVE held lock in this group whose path is contained by `namespace`,
+/// returned as `(owner, mode, path)` against the transaction's merged view
+/// (committed state plus the apply's own pending writes).
+///
+/// Used to force-clear a namespace when its lock algorithm changes. Like
+/// [`namespace_has_live_locks`] the scan is unbounded (administrative): the
+/// clear is all-or-nothing within a group rather than risking a partially
+/// cleared namespace under a scan cap.
+pub fn collect_namespace_holds(
+    txn: &WriteTxn,
+    namespace: &str,
+) -> anyhow::Result<Vec<(String, String, String)>> {
+    let now = txn.now_ms();
+    let mut out = Vec::new();
+    txn.scan_merged(store_keys::CF_OWNER_HOLDS, None, None, |key, value| {
+        // Owner-holds set key shape: `owner \0 \0 member`; the member value is
+        // `mode:path`. Owner ids never contain NUL, so the first `\0\0` is the
+        // set separator (mirrors `namespace_has_live_locks`).
+        let Some(sep) = key.windows(2).position(|w| w == [0, 0]) else {
+            return Ok(true);
+        };
+        let Ok(owner) = std::str::from_utf8(&key[..sep]) else {
+            return Ok(true);
+        };
+        let Some(member) = decode_record_lenient(value).and_then(|r| live_str(r, now)) else {
+            return Ok(true);
+        };
+        let Some(mode_sep) = member.find(':') else {
+            return Ok(true);
+        };
+        let (mode, rest) = member.split_at(mode_sep);
+        let path = &rest[1..]; // skip the ':'
+        if crate::cluster::placement::namespace_contains_path(namespace, path) {
+            out.push((owner.to_string(), mode.to_string(), path.to_string()));
+        }
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

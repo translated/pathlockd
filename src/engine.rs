@@ -333,17 +333,22 @@ pub fn delete_namespace_policy_inner<T: StoreTxn>(
     tx.del(NS_SETTINGS_CF, &namespace_policy_key(namespace))
 }
 
+/// Resolve a namespace's lock algorithm. `default` is the configured fallback
+/// (`Config::default_lock_algorithm`) applied when no explicit row exists; it is
+/// supplied by the caller rather than hardcoded so the cluster-wide default is
+/// overridable. The `bool` is whether an explicit row was found.
 pub fn get_namespace_policy_inner<T: StoreTxn>(
     tx: &mut T,
     namespace: &str,
+    default: LockAlgorithm,
 ) -> anyhow::Result<(LockAlgorithm, bool)> {
     match tx.get_str(NS_SETTINGS_CF, &namespace_policy_key(namespace))? {
-        None => Ok((LockAlgorithm::default(), false)),
+        None => Ok((default, false)),
         Some(raw) => match raw.parse::<LockAlgorithm>() {
             Ok(algorithm) => Ok((algorithm, true)),
             Err(e) => {
                 warn!(namespace, value = %raw, error = %e, "invalid namespace lock policy; using default");
-                Ok((LockAlgorithm::default(), true))
+                Ok((default, true))
             }
         },
     }

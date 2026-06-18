@@ -16,6 +16,7 @@
 //! gossip_max_packet_size = 1400
 //! gossip_seed_announce_interval_ms = 5000
 //! group_count      = 256
+//! default_lock_algorithm = "recursive_rw"
 //! replication_factor = 3
 //! group_gc_interval_secs = 1
 //! group_gc_batch   = 1024
@@ -37,6 +38,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use serde::Deserialize;
+
+use crate::engine::LockAlgorithm;
 
 const MAX_EVENT_BUFFER: usize = 1_000_000;
 
@@ -86,6 +89,17 @@ pub struct Config {
     /// routes `handler:/a/b` by `handler:/a`. 0 keeps the legacy handler-only
     /// fallback.
     pub routing_prefix_segments: u32,
+    /// Lock algorithm applied to any namespace with no explicit policy row
+    /// (the fallback resolved at acquire time). Accepts the same names as
+    /// `SetNamespacePolicy` (`recursive_rw` | `point_rw` | `recursive_write` |
+    /// `point_write`, plus their aliases).
+    ///
+    /// Cluster-wide invariant: every node must set the SAME value. Like
+    /// `group_count` and `routing_prefix_segments`, this is consumed by the
+    /// deterministic Raft state machine when resolving the default policy at
+    /// apply time — a value that differs between nodes makes replicas apply the
+    /// same log entry differently and corrupts replicated state.
+    pub default_lock_algorithm: LockAlgorithm,
     /// Voters per Raft group (must be odd).
     pub replication_factor: u32,
     /// Per-group GC sweep interval (seconds; 0 disables).
@@ -173,6 +187,7 @@ impl Default for Config {
             seed_nodes: Vec::new(),
             group_count: 32,
             routing_prefix_segments: 1,
+            default_lock_algorithm: LockAlgorithm::RecursiveRw,
             replication_factor: 3,
             group_gc_interval_secs: 1,
             group_gc_batch: 1024,
@@ -224,6 +239,8 @@ struct FileConfig {
     seed_nodes: Option<Vec<String>>,
     group_count: Option<u32>,
     routing_prefix_segments: Option<u32>,
+    #[serde(default, deserialize_with = "de_lock_algorithm")]
+    default_lock_algorithm: Option<LockAlgorithm>,
     replication_factor: Option<u32>,
     group_gc_interval_secs: Option<u64>,
     group_gc_batch: Option<u32>,
@@ -450,6 +467,7 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(seed_nodes);
     apply!(group_count);
     apply!(routing_prefix_segments);
+    apply!(default_lock_algorithm);
     apply!(replication_factor);
     apply!(group_gc_interval_secs);
     apply!(group_gc_batch);
@@ -529,6 +547,9 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     if let Some(v) = env_parse::<u32>("PATHLOCKD_ROUTING_PREFIX_SEGMENTS")? {
         cfg.routing_prefix_segments = v;
     }
+    if let Some(v) = env_parse::<LockAlgorithm>("PATHLOCKD_DEFAULT_LOCK_ALGORITHM")? {
+        cfg.default_lock_algorithm = v;
+    }
     if let Some(v) = env_parse::<u32>("PATHLOCKD_REPLICATION_FACTOR")? {
         cfg.replication_factor = v;
     }
@@ -607,6 +628,19 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse the TOML `default_lock_algorithm` string through [`LockAlgorithm`]'s
+/// `FromStr` so the friendly names/aliases work and a typo is a hard config
+/// error (not a silent fallback). Only invoked when the key is present.
+fn de_lock_algorithm<'de, D>(deserializer: D) -> Result<Option<LockAlgorithm>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    raw.parse::<LockAlgorithm>()
+        .map(Some)
+        .map_err(serde::de::Error::custom)
+}
+
 fn is_host_port(s: &str) -> bool {
     s.rsplit_once(':')
         .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok_and(|p| p > 0))
@@ -647,6 +681,28 @@ mod tests {
         assert!(is_host_port("pathlockd-headless:50051"));
         assert!(is_host_port("pathlockd.default.svc.cluster.local:50051"));
         assert!(is_host_port("10.0.0.1:50051"));
+    }
+
+    #[test]
+    fn default_lock_algorithm_defaults_to_recursive_rw() {
+        assert_eq!(
+            Config::default().default_lock_algorithm,
+            LockAlgorithm::RecursiveRw
+        );
+    }
+
+    #[test]
+    fn file_config_parses_and_overrides_default_lock_algorithm() {
+        let mut cfg = Config::default();
+        let file: FileConfig =
+            toml::from_str("default_lock_algorithm = \"point_write\"").unwrap();
+        apply_file(&mut cfg, file);
+        assert_eq!(cfg.default_lock_algorithm, LockAlgorithm::PointWrite);
+    }
+
+    #[test]
+    fn file_config_rejects_unknown_lock_algorithm() {
+        assert!(toml::from_str::<FileConfig>("default_lock_algorithm = \"nope\"").is_err());
     }
 
     #[test]

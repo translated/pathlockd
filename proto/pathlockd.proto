@@ -64,6 +64,12 @@ message SetNamespacePolicyRequest {
   // Namespace is either a handler ("google_drive") or a normalized path root
   // ("google_drive:/docs" or "google_drive:/docs/team"). A path namespace
   // also becomes an explicit routing root; longest explicit root wins.
+  //
+  // If this changes the namespace's effective algorithm, every lock under the
+  // namespace — held AND queued — is force-cleared: those locks were taken
+  // under the old conflict semantics, so they are dropped and each affected
+  // owner receives a KILLED event and must re-acquire. Re-setting the same
+  // algorithm clears nothing.
   string namespace = 1;
   LockAlgorithm algorithm = 2;
   // Optional apply-once key for safe client retries of this logical request.
@@ -87,6 +93,10 @@ message GetNamespacePolicyResponse {
 message DeleteNamespacePolicyRequest {
   // Removes the explicit policy/routing root. Future requests fall back to the
   // default resolver unless another explicit parent namespace matches.
+  //
+  // If reverting to the default changes the namespace's effective algorithm,
+  // its locks (held and queued) are force-cleared exactly as in
+  // SetNamespacePolicy, and each affected owner receives a KILLED event.
   string namespace = 1;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 2;

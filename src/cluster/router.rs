@@ -27,7 +27,7 @@
 //! safe: a group that wasn't reached simply keeps its previous lease until it
 //! expires.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -85,6 +85,20 @@ pub struct NamespaceNotDrained {
 pub struct CommandRejected {
     pub kind: RejectKind,
     pub detail: String,
+}
+
+/// Fold a namespace-policy apply response into the set of owners whose locks
+/// were force-cleared. `Unit` (no change) contributes nothing; any other shape
+/// is an unexpected response from these commands.
+fn collect_cleared(resp: ApplyResponse, into: &mut BTreeSet<String>) -> anyhow::Result<()> {
+    match resp {
+        ApplyResponse::Unit => Ok(()),
+        ApplyResponse::NamespaceCleared(owners) => {
+            into.extend(owners);
+            Ok(())
+        }
+        _ => anyhow::bail!("unexpected response type"),
+    }
 }
 
 /// Max leader-chasing hops before a write/read reports unavailable.
@@ -661,9 +675,12 @@ impl Router {
     async fn read_on(&self, group: GroupId, op: ReadOp) -> anyhow::Result<ReadResult> {
         if self.groups.get(group).is_some() {
             let db = self.groups.db_handle();
-            return tokio::task::spawn_blocking(move || execute_read_blocking(&db, group, op))
-                .await
-                .map_err(|e| anyhow::anyhow!("read task failed: {e}"))?;
+            let default_algorithm = self.groups.default_algorithm();
+            return tokio::task::spawn_blocking(move || {
+                execute_read_blocking(&db, group, op, default_algorithm)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("read task failed: {e}"))?;
         }
         self.read_forwarded(group, op).await
     }
@@ -677,8 +694,9 @@ impl Router {
             {
                 Ok(_) => {
                     let db = self.groups.db_handle();
+                    let default_algorithm = self.groups.default_algorithm();
                     return tokio::task::spawn_blocking(move || {
-                        execute_read_blocking(&db, group, op)
+                        execute_read_blocking(&db, group, op, default_algorithm)
                     })
                     .await
                     .map_err(|e| anyhow::anyhow!("read task failed: {e}"))?;
@@ -1179,12 +1197,15 @@ impl Router {
         Ok(())
     }
 
+    /// Set a namespace's lock algorithm. Returns the owners whose held/queued
+    /// locks were force-cleared because the effective algorithm changed (the
+    /// service layer emits a KILLED event for each).
     pub async fn set_namespace_policy(
         &self,
         namespace: &str,
         algorithm: LockAlgorithm,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
         self.refresh_namespace_cache_if_stale().await?;
         let (_, explicit) = self.namespace_policy(namespace).await?;
@@ -1209,14 +1230,12 @@ impl Router {
                 )
             })
             .collect();
+        let mut cleared: BTreeSet<String> = BTreeSet::new();
         for resp in self.fanout_apply(lock_cmds).await? {
-            match resp {
-                ApplyResponse::Unit => {}
-                _ => anyhow::bail!("unexpected response type"),
-            }
+            collect_cleared(resp, &mut cleared)?;
         }
-        match self
-            .apply_to(
+        collect_cleared(
+            self.apply_to(
                 SYS_GROUP,
                 self.command_with_idempotency(
                     Op::SetNamespacePolicy {
@@ -1226,23 +1245,25 @@ impl Router {
                     idempotency_key,
                 ),
             )
-            .await?
-        {
-            ApplyResponse::Unit => {}
-            _ => anyhow::bail!("unexpected response type"),
-        }
+            .await?,
+            &mut cleared,
+        )?;
         self.cache_namespace_root(namespace);
         if route_changes {
             tokio::time::sleep(Duration::from_millis(NAMESPACE_CACHE_REFRESH_MS)).await;
         }
-        Ok(())
+        Ok(cleared.into_iter().collect())
     }
 
+    /// Remove a namespace's explicit policy/routing root. Returns the owners
+    /// whose held/queued locks were force-cleared because reverting to the
+    /// default changed the effective algorithm (the service layer emits a
+    /// KILLED event for each).
     pub async fn delete_namespace_policy(
         &self,
         namespace: &str,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<String>> {
         self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
         self.refresh_namespace_cache_if_stale().await?;
         let (_, explicit) = self.namespace_policy(namespace).await?;
@@ -1265,14 +1286,12 @@ impl Router {
                 )
             })
             .collect();
+        let mut cleared: BTreeSet<String> = BTreeSet::new();
         for resp in self.fanout_apply(lock_cmds).await? {
-            match resp {
-                ApplyResponse::Unit => {}
-                _ => anyhow::bail!("unexpected response type"),
-            }
+            collect_cleared(resp, &mut cleared)?;
         }
-        match self
-            .apply_to(
+        collect_cleared(
+            self.apply_to(
                 SYS_GROUP,
                 self.command_with_idempotency(
                     Op::DeleteNamespacePolicy {
@@ -1281,16 +1300,14 @@ impl Router {
                     idempotency_key,
                 ),
             )
-            .await?
-        {
-            ApplyResponse::Unit => {}
-            _ => anyhow::bail!("unexpected response type"),
-        }
+            .await?,
+            &mut cleared,
+        )?;
         self.uncache_namespace_root(namespace);
         if explicit {
             tokio::time::sleep(Duration::from_millis(NAMESPACE_CACHE_REFRESH_MS)).await;
         }
-        Ok(())
+        Ok(cleared.into_iter().collect())
     }
 
     pub async fn namespace_policy(&self, namespace: &str) -> anyhow::Result<(LockAlgorithm, bool)> {
@@ -1603,6 +1620,7 @@ mod tests {
             cfg.raft_snapshot_max_bytes,
             batcher,
             crate::raft::network::PeerPool::new(),
+            cfg.default_lock_algorithm,
         )
         .unwrap();
         let routing = RoutingOptions {

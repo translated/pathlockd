@@ -106,7 +106,11 @@ pub fn apply_committing(
     group: GroupId,
     cmd: &Command,
 ) -> anyhow::Result<(ApplyResponse, bool)> {
-    apply_with_meta(db, group, cmd, None)
+    // Standalone helper (tests, ad-hoc apply): no Config in scope, so it pins
+    // the built-in default. The replicated apply path goes through
+    // `GroupStateMachine::apply` → `apply_entry`, which carries the configured
+    // `Config::default_lock_algorithm`.
+    apply_with_meta(db, group, cmd, None, LockAlgorithm::default())
 }
 
 /// Apply one Raft log entry's command, persisting the applied position
@@ -117,9 +121,10 @@ pub fn apply_entry(
     group: GroupId,
     cmd: &Command,
     log_id: &crate::raft::types::LogId,
+    default_algorithm: LockAlgorithm,
 ) -> anyhow::Result<ApplyResponse> {
     let applied = bincode::serde::encode_to_vec(log_id, bincode::config::standard())?;
-    apply_with_meta(db, group, cmd, Some(applied)).map(|(resp, _)| resp)
+    apply_with_meta(db, group, cmd, Some(applied), default_algorithm).map(|(resp, _)| resp)
 }
 
 fn apply_with_meta(
@@ -127,6 +132,7 @@ fn apply_with_meta(
     group: GroupId,
     cmd: &Command,
     applied_position: Option<Vec<u8>>,
+    default_algorithm: LockAlgorithm,
 ) -> anyhow::Result<(ApplyResponse, bool)> {
     // Deterministic monotone clock: a command's effective time is its stamped
     // `now_ms` clamped against the group's persisted high-water mark, so a
@@ -174,7 +180,7 @@ fn apply_with_meta(
         }
     }
 
-    let resp = match execute_op(&mut txn, cmd, now_eff) {
+    let resp = match execute_op(&mut txn, cmd, now_eff, default_algorithm) {
         Ok(resp) => resp,
         // Deterministic logical limits become rejections, never storage
         // errors: the entry is already committed, and a storage error here
@@ -333,7 +339,11 @@ fn execute_acquire(
     )
 }
 
-fn resolve_acquire_policy(txn: &mut WriteTxn, args: &AcquireArgs) -> anyhow::Result<LockAlgorithm> {
+fn resolve_acquire_policy(
+    txn: &mut WriteTxn,
+    args: &AcquireArgs,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<LockAlgorithm> {
     let namespace = args
         .requests
         .iter()
@@ -345,22 +355,83 @@ fn resolve_acquire_policy(txn: &mut WriteTxn, args: &AcquireArgs) -> anyhow::Res
         )
         .next();
     match namespace {
-        Some(namespace) => engine::get_namespace_policy_inner(txn, namespace).map(|(a, _)| a),
-        None => Ok(LockAlgorithm::default()),
+        Some(namespace) => {
+            engine::get_namespace_policy_inner(txn, namespace, default_algorithm).map(|(a, _)| a)
+        }
+        None => Ok(default_algorithm),
     }
 }
 
-fn resolve_namespace_policy(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<LockAlgorithm> {
-    engine::get_namespace_policy_inner(txn, namespace).map(|(algorithm, _)| algorithm)
+fn resolve_namespace_policy(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<LockAlgorithm> {
+    engine::get_namespace_policy_inner(txn, namespace, default_algorithm).map(|(algorithm, _)| algorithm)
+}
+
+/// Force-clear every lock — held and queued — whose path is contained by
+/// `namespace`, returning the affected owners (deterministic, sorted). Invoked
+/// when a namespace's effective lock algorithm changes: those locks were taken
+/// under the old algorithm's conflict semantics, so they are dropped and the
+/// owners are told (via a KILLED event) to re-establish under the new policy.
+///
+/// Held locks are released path-by-path (an owner keeps any locks it holds in
+/// other namespaces), and queued waiters targeting the namespace are dropped.
+fn clear_namespace(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Group the namespace's held locks by owner, then release each owner's set
+    // in one call. Collecting the full set up front means the release writes
+    // never mutate the scan mid-iteration.
+    let holds = crate::store_rocksdb::collect_namespace_holds(txn, namespace)?;
+    let mut by_owner: BTreeMap<String, Vec<engine::RelReq>> = BTreeMap::new();
+    for (owner, mode, path) in holds {
+        let mode = match mode.as_str() {
+            "read" => engine::Mode::Read,
+            _ => engine::Mode::Write,
+        };
+        by_owner
+            .entry(owner)
+            .or_default()
+            .push(engine::RelReq { path, mode });
+    }
+
+    let mut affected: BTreeSet<String> = BTreeSet::new();
+    for (owner, reqs) in by_owner {
+        engine::release_inner(txn, &owner, &reqs, false)?;
+        affected.insert(owner);
+    }
+
+    for owner in crate::queue::clear_namespace(txn, namespace)? {
+        affected.insert(owner);
+    }
+
+    Ok(affected.into_iter().collect())
+}
+
+/// `NamespaceCleared(..)` only when locks were actually cleared; otherwise
+/// `Unit`, so a policy write that changes nothing keeps its plain response.
+fn namespace_cleared_response(cleared: Vec<String>) -> ApplyResponse {
+    if cleared.is_empty() {
+        ApplyResponse::Unit
+    } else {
+        ApplyResponse::NamespaceCleared(cleared)
+    }
 }
 
 /// Run one command's op against the transaction. Errors bubble to
 /// [`apply_with_meta`], which separates deterministic logical rejections from
 /// genuine storage failures.
-fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result<ApplyResponse> {
+fn execute_op(
+    txn: &mut WriteTxn,
+    cmd: &Command,
+    now_eff: u64,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<ApplyResponse> {
     Ok(match &cmd.op {
         Op::Acquire(args) => {
-            let algorithm = resolve_acquire_policy(txn, args)?;
+            let algorithm = resolve_acquire_policy(txn, args, default_algorithm)?;
             execute_acquire(txn, args, algorithm)?
         }
         Op::Release {
@@ -436,15 +507,33 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
             namespace,
             algorithm,
         } => {
+            // The algorithm in force before this write: the explicit row's
+            // value, or the configured fallback when none exists.
+            let (before, _) =
+                engine::get_namespace_policy_inner(txn, namespace, default_algorithm)?;
             engine::set_namespace_policy_inner(txn, namespace, *algorithm)?;
-            ApplyResponse::Unit
+            if *algorithm == before {
+                // No effective change (re-set to the same value); locks stay.
+                ApplyResponse::Unit
+            } else {
+                namespace_cleared_response(clear_namespace(txn, namespace)?)
+            }
         }
         Op::DeleteNamespacePolicy { namespace } => {
+            let (before, explicit) =
+                engine::get_namespace_policy_inner(txn, namespace, default_algorithm)?;
             engine::delete_namespace_policy_inner(txn, namespace)?;
-            ApplyResponse::Unit
+            // Deleting reverts the namespace to the configured default. Clear
+            // only when that actually changes the effective algorithm — i.e. an
+            // explicit row existed and it differed from the default.
+            if explicit && before != default_algorithm {
+                namespace_cleared_response(clear_namespace(txn, namespace)?)
+            } else {
+                ApplyResponse::Unit
+            }
         }
         Op::AcquireInNamespace { namespace, args } => {
-            let algorithm = resolve_namespace_policy(txn, namespace)?;
+            let algorithm = resolve_namespace_policy(txn, namespace, default_algorithm)?;
             execute_acquire(txn, args, algorithm)?
         }
     })
@@ -586,11 +675,25 @@ pub struct GroupStateMachine {
     db: Arc<DB>,
     group: GroupId,
     batcher: FsyncBatcher,
+    /// Configured fallback algorithm for namespaces without an explicit policy
+    /// row (`Config::default_lock_algorithm`). Carried into the deterministic
+    /// apply path; must be identical on every replica.
+    default_algorithm: LockAlgorithm,
 }
 
 impl GroupStateMachine {
-    pub fn new(db: Arc<DB>, group: GroupId, batcher: FsyncBatcher) -> Self {
-        Self { db, group, batcher }
+    pub fn new(
+        db: Arc<DB>,
+        group: GroupId,
+        batcher: FsyncBatcher,
+        default_algorithm: LockAlgorithm,
+    ) -> Self {
+        Self {
+            db,
+            group,
+            batcher,
+            default_algorithm,
+        }
     }
 
     fn meta_cf(&self) -> io::Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
@@ -674,7 +777,8 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
                 EntryPayload::Normal(cmd) => {
                     // The engine's writes and the applied-position land
                     // atomically; rejected outcomes persist position only.
-                    apply_entry(&self.db, self.group, &cmd, &log_id).map_err(io_err)?
+                    apply_entry(&self.db, self.group, &cmd, &log_id, self.default_algorithm)
+                        .map_err(io_err)?
                 }
                 EntryPayload::Membership(m) => {
                     let stored = StoredMembership::new(Some(log_id), m);
