@@ -25,7 +25,7 @@
 //! cf:desc_read        ancestor\0 \0path -> member record
 //! cf:desc_claim       ancestor\0 \0path -> member record
 //! cf:owner_alive      owner -> liveness record
-//! cf:owner_holds      owner\0 \0mode:path -> member record
+//! cf:owner_holds      owner\0 mode\0namespace\0path -> member record
 //! cf:wait_edges       owner -> wait edge record
 //! cf:namespace_settings namespace -> lock algorithm policy / explicit route root
 //! cf:expiry           be_u64(expires_at)\0cf_name\0primary_key -> expiry record
@@ -194,7 +194,7 @@ pub fn alive_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
-/// Set key under which an owner's held `mode:path` members are stored.
+/// Set key under which an owner's held lock members are stored.
 pub fn own_prefix(owner: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(owner.len() + 1);
     buf.extend_from_slice(owner.as_bytes());
@@ -216,6 +216,14 @@ pub fn hold_algorithm_key(owner: &str, mode: &str, path: &str) -> Vec<u8> {
     buf.push(0);
     buf.extend_from_slice(mode.as_bytes());
     buf.push(0);
+    buf.extend_from_slice(path.as_bytes());
+    buf
+}
+
+/// Per-path semaphore capacity, stored in the lock group's meta CF.
+pub fn semaphore_permits_key(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12 + path.len());
+    buf.extend_from_slice(b"sem_permits:");
     buf.extend_from_slice(path.as_bytes());
     buf
 }
@@ -246,6 +254,7 @@ pub fn rddesc_prefix(anc: &str) -> Vec<u8> {
 /// 1-byte tag distinguishing the two key shapes that share `CF_QUEUE`.
 const QUEUE_ENTRY_TAG: u8 = b'e';
 const QUEUE_OWNER_TAG: u8 = b'o';
+const QUEUE_PATH_TAG: u8 = b'p';
 
 /// Queue entry key: `'e' ++ be_u64(seq)`. Big-endian seq makes a prefix scan
 /// of all entry keys iterate in FIFO (ascending seq) order.
@@ -281,6 +290,48 @@ pub fn queue_owner_key(owner: &str) -> Vec<u8> {
     buf.push(QUEUE_OWNER_TAG);
     buf.extend_from_slice(owner.as_bytes());
     buf
+}
+
+pub fn queue_path_prefix(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + path.len() + 1);
+    buf.push(QUEUE_PATH_TAG);
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(0);
+    buf
+}
+
+pub fn queue_path_upper(path: &str) -> Vec<u8> {
+    let mut upper = queue_path_prefix(path);
+    if let Some(last) = upper.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    upper
+}
+
+pub fn queue_path_key(path: &str, seq: u64) -> Vec<u8> {
+    let mut buf = queue_path_prefix(path);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+pub fn decode_queue_path_seq(key: &[u8]) -> Option<u64> {
+    if key.len() < 10 || key[0] != QUEUE_PATH_TAG {
+        return None;
+    }
+    let tail = key.len() - 8;
+    if key[tail - 1] != 0 {
+        return None;
+    }
+    Some(u64::from_be_bytes([
+        key[tail],
+        key[tail + 1],
+        key[tail + 2],
+        key[tail + 3],
+        key[tail + 4],
+        key[tail + 5],
+        key[tail + 6],
+        key[tail + 7],
+    ]))
 }
 
 /// Encode an expiry index key: `be_u64(expires_at):NUL:kind:NUL:primary_key_bytes`

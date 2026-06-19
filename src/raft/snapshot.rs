@@ -1,11 +1,10 @@
 //! Group snapshot image format: build and install one group's entire state
 //! as a stream of bincode frames.
 //!
-//! Lock state is small and TTL-bounded, so a snapshot is a full scan of the
-//! group's key range across every state column family (plus the non-raft
-//! group meta: monotone clock, GC cursor, fencing counter). Install replaces
-//! the group's keyspace atomically in one WriteBatch — local stale readers
-//! never observe a half-installed image.
+//! A snapshot is a full scan of the group's key range across every state
+//! column family (plus the non-raft group meta: monotone clock, GC cursor,
+//! fencing counter). Install replaces the group's keyspace atomically in one
+//! WriteBatch — local stale readers never observe a half-installed image.
 
 use std::sync::Arc;
 
@@ -26,6 +25,7 @@ struct Frame {
 }
 
 const META_CF_MARKER: u8 = u8::MAX;
+const IMAGE_MAGIC: &[u8] = b"pathlockd-snapshot\0";
 
 /// Raft-owned group meta keys that must NOT travel inside a snapshot image
 /// (vote safety; applied/membership/snapshot bookkeeping is carried in the
@@ -97,20 +97,56 @@ fn scan_group_cf_snapshot(
     Ok(())
 }
 
+fn push_frame(image: &mut Vec<u8>, frame: &Frame) -> anyhow::Result<()> {
+    let encoded = bincode::serde::encode_to_vec(frame, bincode::config::standard())?;
+    let len = u32::try_from(encoded.len())
+        .map_err(|_| anyhow::anyhow!("snapshot frame too large: {} bytes", encoded.len()))?;
+    image.extend_from_slice(&len.to_be_bytes());
+    image.extend_from_slice(&encoded);
+    Ok(())
+}
+
+fn for_each_frame(
+    image: &[u8],
+    mut visit: impl FnMut(Frame) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let Some(mut rest) = image.strip_prefix(IMAGE_MAGIC) else {
+        anyhow::bail!("unsupported snapshot image format");
+    };
+    while !rest.is_empty() {
+        if rest.len() < 4 {
+            anyhow::bail!("truncated snapshot frame length");
+        }
+        let len = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+        rest = &rest[4..];
+        if rest.len() < len {
+            anyhow::bail!("truncated snapshot frame payload");
+        }
+        let (frame, _): (Frame, _) =
+            bincode::serde::decode_from_slice(&rest[..len], bincode::config::standard())?;
+        visit(frame)?;
+        rest = &rest[len..];
+    }
+    Ok(())
+}
+
 /// Serialize one group's full state image from a single RocksDB snapshot view.
 pub fn build_group_image_from_snapshot(
     db: &Arc<DB>,
     snapshot: &rocksdb::Snapshot<'_>,
     group: GroupId,
 ) -> anyhow::Result<Vec<u8>> {
-    let mut frames: Vec<Frame> = Vec::new();
+    let mut image = Vec::from(IMAGE_MAGIC);
     for (idx, cf_name) in store_keys::STATE_CFS.iter().enumerate() {
         scan_group_cf_snapshot(db, snapshot, cf_name, group, |key, value| {
-            frames.push(Frame {
-                cf: idx as u8,
-                key: key.to_vec(),
-                value: value.to_vec(),
-            });
+            push_frame(
+                &mut image,
+                &Frame {
+                    cf: idx as u8,
+                    key: key.to_vec(),
+                    value: value.to_vec(),
+                },
+            )?;
             Ok(())
         })?;
     }
@@ -118,17 +154,17 @@ pub fn build_group_image_from_snapshot(
         if RAFT_META_KEYS.contains(&key) {
             return Ok(());
         }
-        frames.push(Frame {
-            cf: META_CF_MARKER,
-            key: key.to_vec(),
-            value: value.to_vec(),
-        });
+        push_frame(
+            &mut image,
+            &Frame {
+                cf: META_CF_MARKER,
+                key: key.to_vec(),
+                value: value.to_vec(),
+            },
+        )?;
         Ok(())
     })?;
-    Ok(bincode::serde::encode_to_vec(
-        &frames,
-        bincode::config::standard(),
-    )?)
+    Ok(image)
 }
 
 /// Replace one group's state with a snapshot image, atomically.
@@ -141,9 +177,6 @@ pub fn install_group_image(
     image: &[u8],
     batch: &mut rocksdb::WriteBatch,
 ) -> anyhow::Result<()> {
-    let (frames, _): (Vec<Frame>, _) =
-        bincode::serde::decode_from_slice(image, bincode::config::standard())?;
-
     let gp = store_keys::group_prefix(group);
     let upper = prefix_upper_bound(&gp).unwrap_or_else(|| vec![0xFF; 16]);
 
@@ -165,8 +198,7 @@ pub fn install_group_image(
         Ok(())
     })?;
 
-    // ...then lay down the image.
-    for frame in frames {
+    for_each_frame(image, |frame| {
         let scoped = store_keys::group_key(group, &frame.key);
         if frame.cf == META_CF_MARKER {
             batch.put_cf(&meta, &scoped, &frame.value);
@@ -179,7 +211,8 @@ pub fn install_group_image(
                 .ok_or_else(|| anyhow::anyhow!("missing column family {cf_name}"))?;
             batch.put_cf(&handle, &scoped, &frame.value);
         }
-    }
+        Ok(())
+    })?;
     Ok(())
 }
 

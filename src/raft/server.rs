@@ -7,6 +7,8 @@
 //! linearizable read barrier. Both reply with a serialized
 //! `Result<_, ForwardError>` so callers can chase `NotLeader` hints.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::sync::Arc;
 
 use tokio_stream::StreamExt;
@@ -388,21 +390,23 @@ pub fn execute_read_blocking(
     let mut txn = crate::store_rocksdb::RocksDbTxn::new(db.clone(), group, now_ms);
     match op {
         ReadOp::AssertFencing {
+            namespace,
             owner,
             token,
             paths,
-        } => crate::engine::assert_fencing_inner(&mut txn, &owner, token, &paths)
+        } => crate::engine::assert_fencing_inner(&mut txn, &namespace, &owner, token, &paths)
             .map(ReadResult::AssertFencing),
-        ReadOp::InspectPath { path } => {
-            crate::engine::inspect_path_inner(&mut txn, &path).map(ReadResult::InspectPath)
+        ReadOp::InspectPath { namespace, path } => {
+            crate::engine::inspect_path_inner(&mut txn, &namespace, &path)
+                .map(ReadResult::InspectPath)
         }
         ReadOp::IsBlocking {
+            namespace,
             path,
             owner,
             reason,
-        } => {
-            crate::engine::is_blocking_inner(&mut txn, &path, &owner, &reason).map(ReadResult::Bool)
-        }
+        } => crate::engine::is_blocking_inner(&mut txn, &namespace, &path, &owner, reason)
+            .map(ReadResult::Bool),
         ReadOp::IsOwnerAlive { owner } => {
             crate::engine::is_owner_alive_inner(&mut txn, &owner).map(ReadResult::Bool)
         }
@@ -416,11 +420,15 @@ pub fn execute_read_blocking(
             crate::engine::read_wait_edge(&mut txn, &owner).map(ReadResult::WaitEdge)
         }
         ReadOp::GetNamespacePolicy { namespace } => {
-            let (algorithm, explicit) =
-                crate::engine::get_namespace_policy_inner(&mut txn, &namespace, default_algorithm)?;
+            let (policy, explicit) = crate::engine::get_namespace_policy_record_inner(
+                &mut txn,
+                &namespace,
+                default_algorithm,
+            )?;
             Ok(ReadResult::NamespacePolicy {
-                algorithm,
+                algorithm: policy.algorithm,
                 explicit,
+                epoch: policy.epoch,
             })
         }
         ReadOp::ListNamespaces => crate::store_rocksdb::list_namespace_settings(db, group, now_ms)

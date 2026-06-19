@@ -177,33 +177,28 @@ in a flat namespace).
 ### `semaphore`
 
 A **counting semaphore**: point-scoped, write-only, but unlike `point_write`
-it admits **up to N concurrent holders** on the exact path. N is not a property
-of the namespace — each acquire carries its own permit count in
-`LockRequest.permits` (engine `LockReq.permits`). The admission rule:
+it admits **up to N concurrent holders** on the exact path. N is supplied by
+`LockRequest.permits` on the first acquire for that semaphore path and then
+held stable for later acquires of the same path. The admission rule:
 
 > `write P` is admitted iff `P` currently has **fewer live holders than the
-> requesting acquire's own `permits`**.
+> path's stored permit capacity**.
 
 | New request | Conflicts with an existing lock when it is… | Reason |
 |---|---|---|
 | `read P` | — | `read_locks_disabled` |
-| `write P` with `permits == 0` | (always) | `invalid_permits` (not waitable) |
-| `write P` | already at `permits` live holders on `P` | `semaphore_full` (waitable) |
+| `write P` | already at that path's permit capacity on `P` | `semaphore_full` (waitable) |
 | `write P` | a write on an **ancestor** of `P` (recursive holder, other namespace) | `ancestor_locked` |
 
 Key properties and deliberate consequences:
 
-- **Gate on the requester's own N.** Because each acquire brings its own
-  `permits`, the effective capacity of a path is dynamic — it is the *minimum*
-  N among current contenders. Two owners can ask for the same path with
-  different N: an owner with `permits=2` is refused while `2` are held, while a
-  concurrent owner with `permits=3` is admitted. This is the only
-  well-defined per-request rule and is intentional.
-- **`semaphore_full` is waitable; `invalid_permits` is not.** A full semaphore
-  frees a permit when a holder releases or its lease expires, so the waiter is
-  enqueued and granted in place by the post-release sweep (FIFO, like every
-  other contention conflict). `permits == 0` is a client error, returned as
-  `CONFLICT` and never enqueued.
+- **Gate on namespace policy capacity.** Capacity is stable for all contenders
+  in the namespace. Changing it is a namespace policy change and force-clears
+  held and queued locks under that namespace.
+- **`semaphore_full` is waitable.** A full semaphore frees a permit when a
+  holder releases or its owner lease expires, so the waiter is enqueued and
+  granted in place by the post-release sweep (FIFO, like every other contention
+  conflict).
 - **FIFO still applies per path.** Once a waiter is queued on a path, a later
   arrival on that same path yields to it (`blocked_by_earlier`) regardless of
   its own N — a larger-N newcomer cannot barge past an earlier waiter. The
@@ -247,8 +242,7 @@ read_locks_disabled → stale_fencing_token` for `point_write`.)
 `stale_fencing_token` always wins over a held-lock reason when both apply,
 because token staleness is a client-fault condition, not a contention
 condition. The response carries the **persisted fence value** in
-`AcquireResponse.owner` (a stringified integer), not a conflicting owner
-id, so the client can compute a fresh token without re-reading the path.
+`AcquireResponse.current_fencing_token`, not a conflicting owner id.
 
 ## Algorithm-aware wait queue
 
@@ -257,10 +251,10 @@ acquires — a waiter parks and gets a `GRANT` event when the blocker frees,
 no client retry loop. The queue must agree with the engine about
 **what conflicts**; that is implemented by `queue::requests_conflict`, a
 direct alias of `engine::locks_conflict`. The held locks' algorithms are
-stamped in `CF_QUEUE` entry payloads (`QueueEntry.algorithm` is
-`bincode`-serialized alongside the request), so a wake-time
-re-acquire uses the algorithm the request was originally made with, even
-if the namespace policy has since changed.
+stamped in `CF_QUEUE` entry payloads (`QueueEntry.namespace` and
+`QueueEntry.algorithm` are `bincode`-serialized alongside the request), so a
+wake-time re-acquire uses the routing namespace and algorithm the request was
+originally made with, even if the namespace policy has since changed.
 
 Cross-algorithm admission in the queue:
 
@@ -285,8 +279,8 @@ Stale-fence handling at wake time: a queued waiter whose stored fencing
 token has fallen behind the path's persisted fence is **woken to refresh,
 not silently dropped**. The grant sweep in `state_machine.rs` re-runs the
 acquire; a `stale_fencing_token` outcome publishes a `GRANT` event with
-the persisted fence, the client re-reads and re-queues, and FIFO order is
-preserved by the new entry.
+the persisted fence in `current_fencing_token`, the client re-queues, and FIFO
+order is preserved by the new entry.
 
 ## Interaction with routing
 
@@ -327,14 +321,13 @@ This couples the algorithm to the shard. Practical consequences:
   LOCK_ALGORITHM_POINT_RW = 1; LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
   LOCK_ALGORITHM_POINT_WRITE = 3; LOCK_ALGORITHM_SEMAPHORE = 4; }`. Default
   value is `RECURSIVE_RW` so a missing `algorithm` field on the wire is the
-  safest option. `LockRequest.permits` (uint32) carries the per-acquire permit
-  count; it is required `>= 1` in a semaphore namespace and ignored by every
-  other algorithm.
+  safest option. `LockRequest.permits` carries semaphore capacity for the
+  requested path.
 - **Raft commands** (`src/raft/command.rs`):
-  - `SetNamespacePolicy { namespace, algorithm }` — written to the
-    `namespace_settings` CF on every lock group and the system group, so
-    `GetNamespacePolicy` is a linearizable read against the system group
-    and `ListNamespaces` is the system-group listing the router caches.
+  - `SetNamespacePolicy { namespace, algorithm }` — written
+    to the `namespace_settings` CF on every lock group and the system group, so
+    `GetNamespacePolicy` is a linearizable read against the system group and
+    `ListNamespaces` is the system-group listing the router caches.
   - `DeleteNamespacePolicy { namespace }` — inverse, gated on drain.
   - `AcquireInNamespace { namespace, args }` — replaces the old
     `Acquire` in the router: the namespace is part of the command (not a
@@ -421,7 +414,7 @@ hits one group per namespace, no amplification.
 | Distributed mutex over a subtree, no read sharing | `recursive_write` | cheaper than `recursive_rw`; refuses reads cleanly |
 | Exclusive ownership of a single key, no read sharing | `point_write` | cheapest validation; O(1) per request |
 | Migration from a flat mutex service | `point_write` | smallest behavioural delta from a flat lock |
-| Bounded concurrency on a key (≤ N workers, pool cap) | `semaphore` | admits up to N holders; per-acquire `permits` |
+| Bounded concurrency on a key (≤ N workers, pool cap) | `semaphore` | each path admits up to its own `LockRequest.permits` capacity |
 
 ## Invariants preserved across all algorithms
 
@@ -431,8 +424,8 @@ hits one group per namespace, no amplification.
 - A `STALE_FENCING_TOKEN` always wins over a held-lock reason (it never arises
   under `semaphore`).
 - `semaphore` is the only algorithm that admits more than one holder per path;
-  all others are single-writer. Its capacity is per-acquire (`permits`), not a
-  fixed namespace property.
+  all others are single-writer. Its capacity is path-scoped and established by
+  `LockRequest.permits`.
 - A `read_locks_disabled` is never enqueued (the namespace forbids the
   mode); it is a non-waitable client fault.
 - A namespace policy change does not mutate a live lock's algorithm; it

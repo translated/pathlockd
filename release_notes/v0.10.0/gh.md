@@ -20,17 +20,19 @@ locks over a subtree, point reads on the exact path). The new
 | `point_rw` | shared point reads | exact path only |
 | `recursive_write` | reads disabled | path + descendants |
 | `point_write` | reads disabled | exact path only |
+| `semaphore` | reads disabled | exact path, up to that path's `LockRequest.permits` capacity |
 
 An existing lock keeps the policy it was acquired with until it is released
-or expires; a policy change therefore affects future acquisitions without
-retroactively shrinking or expanding live leases.
+or expires. A policy change that alters the effective algorithm or semaphore
+capacity force-clears held and queued locks under that namespace so stale
+conflict semantics cannot linger.
 
 ### Added: namespace policy RPCs
 
 Three new service methods on `PathLock`:
 
-- `SetNamespacePolicy(namespace, algorithm)` — Raft-replicated through every
-  group; idempotent under `idempotency_key`.
+- `SetNamespacePolicy(namespace, algorithm)` —
+  Raft-replicated through every group; idempotent under `idempotency_key`.
 - `GetNamespacePolicy(namespace)` — returns the algorithm and whether an
   explicit row exists (missing rows fall back to `recursive_rw`).
 - `DeleteNamespacePolicy(namespace)` — removes the explicit row; idempotent
@@ -60,8 +62,9 @@ and conflict-domain boundary. The router now resolves routing as:
    subtree.
 
 Namespace roots are persisted in the new `namespace_settings` RocksDB
-column family and replicated to every group; a best-effort 1 s cache on the
-router keeps the per-acquire hot path off the storage read.
+column family and replicated to every group. Acquires carry a policy epoch;
+if a lock group detects a stale router stamp it rejects the command and the
+router refreshes the namespace cache before retrying.
 
 ### Added: new conflict reason `read_locks_disabled`
 
@@ -92,23 +95,59 @@ the new resolver (or read the namespace table via `GetNamespacePolicy`).
 
 ### Changed: `AcquireResponse.reason` documentation
 
-The proto comment for `AcquireResponse.reason` is updated to include
-`read_locks_disabled` and to clarify the meaning of `stale_fencing_token`
-in the post-0.9.0 wait-queue world.
+`AcquireResponse.reason`, `RenewResponse.reason`, `AssertFencingResponse.reason`,
+`IsBlockingRequest.reason`, and wait-edge metadata now use the `ReasonCode`
+enum instead of string values. For stale fencing conflicts, the persisted fence
+is returned in `AcquireResponse.current_fencing_token` instead of overloading
+the conflicting owner field.
 
-### Storage: new `namespace_settings` column family
+### Changed: write acquire fencing is server-minted
+
+`AcquireRequest.fencing_token = 0` now asks the state machine to mint the next
+monotonic token for write acquires. Successful and queued acquires return the
+effective token in `AcquireResponse.fencing_token`; semaphore and read-only
+acquires still do not use fences.
+
+### Changed: semaphore capacity belongs to each path
+
+Semaphore namespaces choose only the semaphore algorithm. Each semaphore path
+gets its own stable capacity from `LockRequest.permits` on first acquire; later
+acquires for that path must use the same capacity.
+
+### Changed: renew is owner-lease based
+
+Held lock records and descendant indexes no longer carry per-lock lease TTLs.
+They reference the owner's `alive` marker, so `Renew` refreshes the owner lease
+in O(1) instead of enumerating every held path.
+
+### Changed: default `group_count` is now `256`
+
+Fresh clusters start over-partitioned into 256 virtual Raft groups, leaving more
+room for leadership balancing and later placement work. Existing clusters must
+not change `group_count` in place.
+
+### Storage: namespace-scoped lock keys and indexed queue admission
 
 RocksDB now ships 15 column families. The new one holds the persisted
 namespace policy / routing-root table and is replicated to every group
-plus the system group.
+plus the system group. Policy rows use the
+`epoch + algorithm` encoding. Held locks, fences,
+descendant indexes, inspection reads, and owner-hold members now use
+namespace-scoped paths; owner-hold members use
+`mode + namespace + path` encoding only. Queue entries also stamp their full
+`LockPolicy` and are indexed by scoped path for targeted FIFO admission.
+
+Snapshot images now encode frames incrementally instead of first materializing a
+full `Vec<Frame>` during build/install.
 
 ## Upgrading
 
 This release is **not** backward compatible:
 
 - **Wire/proto changed** — three new RPCs, the new `LockAlgorithm` enum,
-  the new `read_locks_disabled` reason, and updated doc comments on
-  `RenewRequest.domains` and `AcquireResponse.reason`. Regenerate/upgrade
+  the new `ReasonCode` enum, server-minted acquire fencing, namespace-owned
+  semaphore capacity, the new `read_locks_disabled` reason, and updated
+  `RenewRequest.domains` / `AcquireResponse` fields. Regenerate/upgrade
   all clients (including `pathlockd-nodejs-client`) and deploy them
   together with the daemon. Mixed 0.9.x/0.10.0 clients and daemons are
   unsupported.

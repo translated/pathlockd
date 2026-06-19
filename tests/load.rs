@@ -12,7 +12,9 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use pathlockd::engine::{AcquireArgs, AcquireOutcome, LockReq, Mode, RelReq, State};
+use pathlockd::engine::{
+    AcquireArgs, AcquireOutcome, LockAlgorithm, LockPolicy, LockReq, Mode, Reason, RelReq, State,
+};
 use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
 use pathlockd::store_keys;
@@ -60,6 +62,29 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
     }
 }
 
+fn namespace_of_args(args: &AcquireArgs) -> String {
+    args.requests
+        .iter()
+        .map(|r| store_keys::handler_of(&r.path))
+        .chain(
+            args.release_requests
+                .iter()
+                .map(|r| store_keys::handler_of(&r.path)),
+        )
+        .next()
+        .unwrap_or("h")
+        .to_string()
+}
+
+fn acquire_op(args: AcquireArgs) -> Op {
+    let namespace = namespace_of_args(&args);
+    Op::AcquireInNamespace {
+        namespace,
+        policy: LockPolicy::from_algorithm(LockAlgorithm::RecursiveRw),
+        args,
+    }
+}
+
 fn apply(db: &Arc<rocksdb::DB>, cmd: Command) -> ApplyResponse {
     state_machine::apply(db, G, &cmd).unwrap()
 }
@@ -87,7 +112,7 @@ fn high_domain_cardinality_throughput() {
                 Command {
                     request_id: None,
                     now_ms: now,
-                    op: Op::Acquire(acquire_args(
+                    op: acquire_op(acquire_args(
                         &owner,
                         10_000,
                         (d * ops_per_domain + op + 1) as i64,
@@ -96,7 +121,7 @@ fn high_domain_cardinality_throughput() {
                 },
             );
             assert!(
-                matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+                matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
                 "failed at domain {domain} op {op}"
             );
         }
@@ -135,7 +160,7 @@ fn hot_subtree_contention_rate() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("root-owner", 60_000, 1, vec![wr("hot:/")])),
+            op: acquire_op(acquire_args("root-owner", 60_000, 1, vec![wr("hot:/")])),
         },
     );
 
@@ -152,7 +177,7 @@ fn hot_subtree_contention_rate() {
                 Command {
                     request_id: None,
                     now_ms: now,
-                    op: Op::Acquire(acquire_args(
+                    op: acquire_op(acquire_args(
                         &owner,
                         5_000,
                         (o * ops + op + 2) as i64,
@@ -162,7 +187,7 @@ fn hot_subtree_contention_rate() {
             );
 
             match resp {
-                ApplyResponse::Acquire(AcquireOutcome::Ok) => successes += 1,
+                ApplyResponse::Acquire(AcquireOutcome::Ok { .. }) => successes += 1,
                 ApplyResponse::Acquire(
                     AcquireOutcome::Conflict { .. } | AcquireOutcome::Queued { .. },
                 ) => conflicts += 1,
@@ -203,11 +228,11 @@ fn read_heavy_workload() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
+                op: acquire_op(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
             },
         );
         assert!(
-            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
             "reader {r} should get shared read lock"
         );
     }
@@ -245,7 +270,7 @@ fn read_write_mixed_conflict_rate() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
+                op: acquire_op(acquire_args(&owner, 30_000, 0, vec![rd(path)])),
             },
         );
     }
@@ -256,11 +281,11 @@ fn read_write_mixed_conflict_rate() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("writer", 10_000, 1, vec![wr(path)])),
+            op: acquire_op(acquire_args("writer", 10_000, 1, vec![wr(path)])),
         },
     );
     assert!(
-        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. }) if reason == "read_locked"),
+        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. }) if reason == Reason::ReadLocked),
         "writer should be blocked by readers"
     );
 
@@ -292,7 +317,7 @@ fn acquire_release_throughput() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     &owner,
                     10_000,
                     (c + 1) as i64,
@@ -308,6 +333,7 @@ fn acquire_release_throughput() {
                 request_id: None,
                 now_ms: now,
                 op: Op::Release {
+                    namespace: "h".into(),
                     owner,
                     reqs: vec![RelReq {
                         path,
@@ -347,7 +373,7 @@ fn gc_reclaims_expired_locks() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     &owner,
                     1,
                     (i + 1) as i64,
@@ -365,7 +391,7 @@ fn gc_reclaims_expired_locks() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     &owner,
                     300_000,
                     (ephemeral_count + i + 1) as i64,
@@ -469,7 +495,7 @@ fn many_owner_release_all_throughput() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(AcquireArgs {
+                op: acquire_op(AcquireArgs {
                     owner_id: owner.clone(),
                     ttl_ms: 60_000,
                     fencing_token: (o + 1) as i64,

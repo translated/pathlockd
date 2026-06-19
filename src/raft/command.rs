@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{AcquireArgs, LockAlgorithm, RelReq};
+use crate::engine::{AcquireArgs, LockAlgorithm, LockPolicy, RelReq};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
@@ -28,8 +28,8 @@ pub struct RequestId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {
-    Acquire(AcquireArgs),
     Release {
+        namespace: String,
         owner: String,
         reqs: Vec<RelReq>,
         del_wait: bool,
@@ -54,9 +54,8 @@ pub enum Op {
         owner: String,
     },
     GcSweep {
-        /// Unused (the apply path uses the command's clamped `now_ms`), but
-        /// retained: removing it would change the bincode log encoding and
-        /// break replay of existing raft logs.
+        /// Unused by apply; retained as an explicit command payload timestamp
+        /// for callers that want to include the requested sweep time.
         now_ms: u64,
         batch: u32,
     },
@@ -87,11 +86,10 @@ pub enum Op {
     DeleteNamespacePolicy {
         namespace: String,
     },
-    /// Acquire using the router-resolved namespace. Kept separate from
-    /// `Acquire` so older logs that used handler-only policy lookup still
-    /// replay with their original semantics.
+    /// Acquire using the router-resolved namespace and policy snapshot.
     AcquireInNamespace {
         namespace: String,
+        policy: LockPolicy,
         args: AcquireArgs,
     },
 }
@@ -113,6 +111,7 @@ pub enum RejectKind {
     /// The request id was already used by a different command within the
     /// dedupe window.
     IdempotencyMismatch,
+    PolicyEpochStale,
 }
 
 /// Responses returned by the state machine after applying an Op.
@@ -131,24 +130,20 @@ pub enum ApplyResponse {
     },
     Unit,
     /// The command was refused and none of its writes committed. Logical
-    /// limits are rejections the proposer must surface to the client — unlike
-    /// storage errors they must not shut the raft core down, because the
-    /// entry is already committed and every replica would fail it identically
-    /// (a poison-pill log entry). Appended last so existing variant encodings
-    /// stay stable.
+    /// limits are rejections the proposer must surface to the client. Unlike
+    /// storage errors they must not shut the raft core down, because the entry
+    /// is already committed and every replica would fail it identically.
     Rejected {
         kind: RejectKind,
         detail: String,
     },
     /// Owners whose queued acquire was granted in place by this command's grant
     /// sweep (release / release-all / force-release). The service layer emits a
-    /// GRANT event for each. Appended last so existing variant encodings stay
-    /// stable.
+    /// GRANT event for each.
     Granted(Vec<String>),
     /// An acquire that succeeded *and*, via its inline releases, granted queued
     /// waiters in place: the acquire outcome plus the granted owners. The
-    /// service layer emits a GRANT event for each. Appended last to keep
-    /// existing variant encodings stable.
+    /// service layer emits a GRANT event for each.
     AcquireGranted {
         outcome: crate::engine::AcquireOutcome,
         granted: Vec<String>,
@@ -158,7 +153,6 @@ pub enum ApplyResponse {
     /// different algorithm, or `DeleteNamespacePolicy` reverting an explicit
     /// non-default policy). Those locks were acquired under the old algorithm's
     /// conflict semantics, so they are dropped and the owners told to
-    /// re-establish; the service layer emits a KILLED event for each. Appended
-    /// last to keep existing variant encodings stable.
+    /// re-establish; the service layer emits a KILLED event for each.
     NamespaceCleared(Vec<String>),
 }

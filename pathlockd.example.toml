@@ -39,7 +39,7 @@ bootstrap = true
 
 # Number of Raft groups (deterministic sharding via HRW hashing; fixed at
 # cluster birth — changing it remaps every routing domain).
-group_count = 32
+group_count = 256
 
 # Path segments (beyond the handler) in the routing domain. 0 shards by
 # handler only (no restrictions); K > 0 shards deeper for write parallelism
@@ -47,7 +47,7 @@ group_count = 32
 routing_prefix_segments = 0
 
 # Lock algorithm applied to namespaces with no explicit SetNamespacePolicy row.
-# One of: recursive_rw (default) | point_rw | recursive_write | point_write.
+# One of: recursive_rw (default) | point_rw | recursive_write | point_write | semaphore.
 # Cluster-wide invariant: every node MUST set the same value — it feeds the
 # deterministic Raft state machine, so a divergent value corrupts replicated
 # state (same rule as group_count / routing_prefix_segments). Changing a

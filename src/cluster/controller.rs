@@ -62,7 +62,7 @@ pub struct ControllerOptions {
 impl Default for ControllerOptions {
     fn default() -> Self {
         Self {
-            group_count: 32,
+            group_count: 256,
             replication_factor: 3,
             stability_window: Duration::from_secs(30),
             eviction_window: Duration::from_secs(60),

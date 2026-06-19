@@ -13,21 +13,24 @@ are inherently sync.
 
 ## `acquire`
 
-Args: owner, ttl, `requests: [{path, mode, state}]`, fencing token, optional
-inline `release_requests`. The router resolves the path's routing namespace
-and looks up its `LockAlgorithm`; the apply layer invokes
-`acquire_inner_with_policy(args, algorithm)`. The default policy is
-`recursive_rw`; opt-in policies (`point_rw`, `recursive_write`, `point_write`)
-narrow the conflict scan and may reject `MODE_READ` outright as
-`read_locks_disabled`. See [08-lock-algorithms.md](08-lock-algorithms.md) for
-the per-algorithm matrices and the rationale.
+Args: owner, ttl, `requests: [{path, mode, state}]`, optional fencing token,
+and optional inline `release_requests`. The router resolves the path's routing
+namespace and stamps the Raft command with that namespace plus its `LockPolicy`
+(algorithm, epoch, semaphore capacity); the apply layer mints a fencing token
+for write acquires that pass `0`, then invokes `acquire_inner_in_namespace`. The
+default policy is `recursive_rw`; opt-in policies (`point_rw`,
+`recursive_write`, `point_write`, `semaphore`) narrow the conflict scan and may
+reject `MODE_READ` outright as `read_locks_disabled`. See
+[08-lock-algorithms.md](08-lock-algorithms.md) for the per-algorithm matrices
+and the rationale.
 
 1. **Liveness gate.** If any request is `Held` and the owner's `alive` key is
    gone → `LOST(missing_alive)`.
 2. **Validation**, per request, in order:
    - *Held write*: `wr:<path>` must equal owner (else `LOST(missing_write)`);
      `fence:<path>` must exist (else `LOST(missing_fence)`) and be ≤ the token
-     (else `CONFLICT(stale_fencing_token)`, with the persisted fence in `owner`).
+     (else `CONFLICT(stale_fencing_token)`, with the persisted fence surfaced as
+     `current_fencing_token`).
    - *Held read*: owner must be in `rd:<path>` (else `LOST(missing_read)`).
    - *New*: if the policy is `recursive_write` or `point_write` and the
      request is a read → `CONFLICT(read_locks_disabled)` (non-waitable, never
@@ -40,20 +43,14 @@ the per-algorithm matrices and the rationale.
      (`descendant_read_locked`). The `point_*` policies do not consult the
      descendant index and never produce those reasons. Every policy then
      checks the persisted fence (`stale_fencing_token`).
-3. **Execution.** Refresh `alive`; for each request add to `own:<owner>`,
-   stamp the resolved `LockAlgorithm` in `META_CF` under
-   `hold_algorithm_key(owner, mode, path)` (so the held lock keeps its
-   algorithm even if the namespace policy later changes), and write
-   `wr`/`rd` + fence + descendant indexes via the `StoreTxn`. Re-acquiring an
-   owned path refreshes its TTL and advances the fence to the (validated ≥)
-   token. Since the call advances `alive` and the whole `own` set to
-   `now+ttl`, it then refreshes every *other* still-held path to the same
-   horizon too, so the single owner lease never outlives the keys backing it.
-   If one of those unlisted held paths has vanished, acquire reports `LOST`
-   instead of masking the loss. A read-only acquire can refresh an unlisted
-   write by preserving its existing fence value; a positive token advances it
-   and still fails if stale. A call with no requests and no releases is a
-   no-op.
+3. **Execution.** Refresh the owner's `alive` lease; for each request add a
+   non-expiring member to `own:<owner>`, stamp the resolved `LockAlgorithm` in
+   `META_CF` under `hold_algorithm_key(owner, mode, path)` (so the held lock
+   keeps its algorithm even if the namespace policy later changes), and write
+   `wr`/`rd`/semaphore state + fence + descendant indexes via the `StoreTxn`.
+   Held lock records reference owner liveness instead of carrying their own
+   lease TTL, so acquire does not enumerate and refresh the rest of the
+   portfolio. A call with no requests and no releases is a no-op.
 4. **Inline release.** Any `release_requests` are applied in the same
    `WriteBatch` (used for shadowing transitions: acquire the covering ancestor
    and drop now-redundant child keys atomically).
@@ -73,10 +70,10 @@ publishes a `GRANT` to every waiter it grants in place.
 
 ## `renew`
 
-Refresh `alive` and `own` TTLs, then re-validate and refresh every held path's
-TTL (write key + fence; read membership). Any missing key → `LOST` with the
-reason. A renew that finds nothing to renew → `LOST(empty_owner_set)`. This is
-how a holder learns it lost the lock.
+Refresh `alive` only after confirming the owner has at least one held-lock
+member. Held lock records reference owner liveness, so renew is O(1) with
+portfolio size. Missing owner lease → `LOST(missing_alive)`; an empty portfolio
+→ `LOST(missing_owner_set)`.
 
 ## `force_release`
 
@@ -85,10 +82,10 @@ yield) and publish `KILLED` for the victim.
 
 ## `assert_fencing`
 
-For each path: `wr:<path>` must equal the owner (else `FAIL(stale_owner)`) and
-`fence:<path>` must equal the token (else `FAIL(stale_fencing_token)`). A holder
-calls this to prove, just before an external side effect, that it still owns the
-covering write lock at its token.
+For each path in its resolved namespace: `wr:<scoped-path>` must equal the owner
+(else `FAIL(stale_owner)`) and `fence:<scoped-path>` must equal the token (else
+`FAIL(stale_fencing_token)`). A holder calls this to prove, just before an
+external side effect, that it still owns the covering write lock at its token.
 
 ## `detect_cycle`
 
@@ -117,9 +114,9 @@ deterministic transaction and the persisted clock:
   or `read_locks_disabled`), the apply **enqueues** the request (`CF_QUEUE`)
   and returns `Queued` instead of discarding the conflict. FIFO admission makes
   a newcomer yield to strictly earlier waiters whose scope covers its path
-  (anti-starvation). The queue entry carries the request's `LockAlgorithm`, so
-  the wake-time re-acquire uses the algorithm the request was made with — even
-  if the namespace policy has since changed.
+  (anti-starvation). The queue entry carries the request's `LockPolicy`, so the
+  wake-time re-acquire uses the algorithm and semaphore capacity the request was
+  made with — even if the namespace policy has since changed.
 - Conflict detection at admission goes through `queue::requests_conflict`, an
   alias of `engine::locks_conflict` with the **per-pair algorithms** plugged
   in. A point-policy waiter can be blocked by a recursive-policy holder on an

@@ -53,17 +53,20 @@ pub type RaftMetrics = openraft::metrics::RaftMetrics<TypeConfig>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReadOp {
     AssertFencing {
+        namespace: String,
         owner: String,
         token: i64,
         paths: Vec<String>,
     },
     InspectPath {
+        namespace: String,
         path: String,
     },
     IsBlocking {
+        namespace: String,
         path: String,
         owner: String,
-        reason: String,
+        reason: crate::engine::Reason,
     },
     IsOwnerAlive {
         owner: String,
@@ -106,8 +109,9 @@ pub enum ReadResult {
     NamespacePolicy {
         algorithm: crate::engine::LockAlgorithm,
         explicit: bool,
+        epoch: u64,
     },
-    NamespaceList(Vec<String>),
+    NamespaceList(Vec<crate::engine::NamespacePolicyEntry>),
 }
 
 /// Error half of a forwarded command/read response.

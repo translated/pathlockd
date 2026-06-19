@@ -12,7 +12,7 @@ use std::time::Duration;
 use pathlockd::cluster::placement::SYS_GROUP;
 use pathlockd::cluster::router::{Router, RoutingOptions};
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, CycleOutcome, LockReq, Mode, State, WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, CycleOutcome, LockReq, Mode, Reason, State, WaitEdgeMetadata,
 };
 use pathlockd::raft::log_store::FsyncBatcher;
 use pathlockd::raft::manager::{raft_config, RaftGroups};
@@ -82,7 +82,7 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
         .await
         .unwrap();
     assert!(
-        matches!(outcome, AcquireOutcome::Ok),
+        matches!(outcome, AcquireOutcome::Ok { .. }),
         "{owner} locking {path}: {outcome:?}"
     );
 }
@@ -90,7 +90,7 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
 async fn edge(router: &Router, owner: &str, blocker: &str, meta: Option<(&str, &str)>) {
     let metadata = meta.map(|(path, reason)| WaitEdgeMetadata {
         conflict_path: path.into(),
-        reason: reason.into(),
+        reason: reason.parse::<Reason>().unwrap(),
     });
     router
         .set_wait_edge(owner, blocker, 60_000, metadata.as_ref())

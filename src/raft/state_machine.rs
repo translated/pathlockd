@@ -16,21 +16,20 @@ use std::sync::Arc;
 use rocksdb::DB;
 
 use crate::cluster::placement::GroupId;
-use crate::engine::{self, AcquireArgs, AcquireOutcome, LockAlgorithm, RenewOutcome};
+use crate::engine::{
+    self, AcquireArgs, AcquireOutcome, LockAlgorithm, LockPolicy, Mode, Reason, RenewOutcome,
+};
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::store_keys;
 use crate::store_rocksdb::{
-    decode_record, encode_record, SetScanLimitExceeded, StoredRecord, WriteTxn,
+    decode_record, encode_record, SetScanLimitExceeded, StoreTxn, StoredRecord, WriteTxn,
 };
 
 /// How long a request-id → response dedupe record is retained. Must exceed
 /// the longest plausible client/forwarding retry window.
 const DEDUPE_TTL_MS: u64 = 300_000;
 
-/// Version marker for fingerprinted dedupe records. Legacy records are raw
-/// bincode `ApplyResponse` bytes whose first byte is a small variant index,
-/// never this value.
-const DEDUPE_RECORD_V2: u8 = 0xD1;
+const DEDUPE_RECORD: u8 = 0xD1;
 
 /// Deterministic fingerprint of a command's op, binding a dedupe record to
 /// the request that produced it. Every replica re-encodes the op decoded from
@@ -41,7 +40,7 @@ fn op_fingerprint(op: &Op) -> anyhow::Result<u64> {
 }
 
 fn encode_dedupe_record(fingerprint: u64, resp: &ApplyResponse) -> anyhow::Result<Vec<u8>> {
-    let mut buf = vec![DEDUPE_RECORD_V2];
+    let mut buf = vec![DEDUPE_RECORD];
     buf.extend_from_slice(&bincode::serde::encode_to_vec(
         (fingerprint, resp),
         bincode::config::standard(),
@@ -49,23 +48,16 @@ fn encode_dedupe_record(fingerprint: u64, resp: &ApplyResponse) -> anyhow::Resul
     Ok(buf)
 }
 
-/// Decode a cached dedupe record into `(fingerprint, response)`; legacy
-/// records carry no fingerprint. `None` means undecodable — the caller treats
-/// it as a cache miss (re-evaluating the command is deterministic and safe),
-/// never as a fatal storage error.
-fn decode_dedupe_record(bytes: &[u8]) -> Option<(Option<u64>, ApplyResponse)> {
-    match bytes.split_first() {
-        Some((&DEDUPE_RECORD_V2, rest)) => {
-            let ((fingerprint, resp), _): ((u64, ApplyResponse), _) =
-                bincode::serde::decode_from_slice(rest, bincode::config::standard()).ok()?;
-            Some((Some(fingerprint), resp))
-        }
-        _ => {
-            let (resp, _): (ApplyResponse, _) =
-                bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
-            Some((None, resp))
-        }
+/// Decode a cached dedupe record into `(fingerprint, response)`. `None` means
+/// undecodable, and the caller treats it as a cache miss.
+fn decode_dedupe_record(bytes: &[u8]) -> Option<(u64, ApplyResponse)> {
+    let (&version, rest) = bytes.split_first()?;
+    if version != DEDUPE_RECORD {
+        return None;
     }
+    let ((fingerprint, resp), _): ((u64, ApplyResponse), _) =
+        bincode::serde::decode_from_slice(rest, bincode::config::standard()).ok()?;
+    Some((fingerprint, resp))
 }
 
 /// Applies a committed command to one group's RocksDB state machine.
@@ -158,7 +150,7 @@ fn apply_with_meta(
     if let (Some(id), Some(fingerprint)) = (&cmd.request_id, fingerprint) {
         if let Some(cached) = txn.get_bytes(store_keys::CF_DEDUPE, &dedupe_key(id))? {
             match decode_dedupe_record(&cached) {
-                Some((Some(cached_fp), _)) if cached_fp != fingerprint => {
+                Some((cached_fp, _)) if cached_fp != fingerprint => {
                     return Ok((
                         ApplyResponse::Rejected {
                             kind: RejectKind::IdempotencyMismatch,
@@ -251,20 +243,8 @@ fn apply_with_meta(
 /// Whether a conflict reason represents *waiting for a held lock to free* — the
 /// only conflicts the queue parks. `stale_fencing_token` (refresh-and-retry) is
 /// not a held-lock wait and is returned as a conflict instead.
-fn is_queueable_conflict(reason: &str) -> bool {
-    matches!(
-        reason,
-        "write_locked"
-            | "read_locked"
-            | "ancestor_locked"
-            | "descendant_write_locked"
-            | "descendant_read_locked"
-            // A full semaphore frees a permit when a holder releases/expires, so
-            // the waiter is granted in place by the post-release sweep. (An
-            // `invalid_permits` request is a client error, not contention, and
-            // is deliberately *not* queueable.)
-            | "semaphore_full"
-    )
+fn is_queueable_conflict(reason: Reason) -> bool {
+    reason.is_queueable()
 }
 
 /// After any operation that frees lock state, grant queued waiters that can now
@@ -272,8 +252,8 @@ fn is_queueable_conflict(reason: &str) -> bool {
 /// acquire), in per-resource FIFO order. Returns the granted owners; a later
 /// increment emits a GRANT event per owner via the service layer.
 fn sweep_grants(txn: &mut WriteTxn) -> anyhow::Result<Vec<String>> {
-    crate::queue::grant_sweep(txn, |txn, args, algorithm| {
-        engine::acquire_inner_with_policy(txn, args, algorithm)
+    crate::queue::grant_sweep(txn, |txn, namespace, args, policy| {
+        engine::acquire_inner_in_namespace(txn, args, policy, namespace)
     })
 }
 
@@ -289,34 +269,37 @@ fn granted_response(granted: Vec<String>) -> ApplyResponse {
 
 fn execute_acquire(
     txn: &mut WriteTxn,
+    namespace: &str,
     args: &AcquireArgs,
-    algorithm: LockAlgorithm,
+    policy: LockPolicy,
 ) -> anyhow::Result<ApplyResponse> {
+    let args = mint_fence_if_needed(txn, namespace, args, policy.algorithm)?;
     // FIFO admission: a newcomer yields to any earlier waiter it
     // conflicts with, queueing behind them instead of barging ahead.
-    if let Some((owner, path, reason)) = crate::queue::blocked_by_earlier(txn, args, algorithm)? {
-        crate::queue::enqueue(txn, args, algorithm)?;
+    if let Some((owner, path, reason)) =
+        crate::queue::blocked_by_earlier(txn, namespace, &args, policy)?
+    {
+        crate::queue::enqueue(txn, namespace, &args, policy)?;
         return Ok(ApplyResponse::Acquire(AcquireOutcome::Queued {
             path,
             owner,
             reason,
+            fencing_token: args.fencing_token,
         }));
     }
 
     Ok(
-        match engine::acquire_inner_with_policy(txn, args, algorithm)? {
-            AcquireOutcome::Ok => {
+        match engine::acquire_inner_in_namespace(txn, &args, policy, namespace)? {
+            AcquireOutcome::Ok { fencing_token } => {
                 // No longer waiting; inline releases may free paths and
                 // grant queued waiters — surface them so a GRANT fires.
                 crate::queue::dequeue(txn, &args.owner_id)?;
                 let granted = sweep_grants(txn)?;
+                let outcome = AcquireOutcome::Ok { fencing_token };
                 if granted.is_empty() {
-                    ApplyResponse::Acquire(AcquireOutcome::Ok)
+                    ApplyResponse::Acquire(outcome)
                 } else {
-                    ApplyResponse::AcquireGranted {
-                        outcome: AcquireOutcome::Ok,
-                        granted,
-                    }
+                    ApplyResponse::AcquireGranted { outcome, granted }
                 }
             }
             AcquireOutcome::Conflict {
@@ -324,12 +307,13 @@ fn execute_acquire(
                 owner,
                 reason,
             } => {
-                if is_queueable_conflict(&reason) {
-                    crate::queue::enqueue(txn, args, algorithm)?;
+                if is_queueable_conflict(reason) {
+                    crate::queue::enqueue(txn, namespace, &args, policy)?;
                     ApplyResponse::Acquire(AcquireOutcome::Queued {
                         path,
                         owner,
                         reason,
+                        fencing_token: args.fencing_token,
                     })
                 } else {
                     ApplyResponse::Acquire(AcquireOutcome::Conflict {
@@ -344,35 +328,47 @@ fn execute_acquire(
     )
 }
 
-fn resolve_acquire_policy(
-    txn: &mut WriteTxn,
-    args: &AcquireArgs,
-    default_algorithm: LockAlgorithm,
-) -> anyhow::Result<LockAlgorithm> {
-    let namespace = args
-        .requests
-        .iter()
-        .map(|r| crate::store_keys::handler_of(&r.path))
-        .chain(
-            args.release_requests
-                .iter()
-                .map(|r| crate::store_keys::handler_of(&r.path)),
-        )
-        .next();
-    match namespace {
-        Some(namespace) => {
-            engine::get_namespace_policy_inner(txn, namespace, default_algorithm).map(|(a, _)| a)
-        }
-        None => Ok(default_algorithm),
-    }
-}
-
-fn resolve_namespace_policy(
+fn mint_fence_if_needed(
     txn: &mut WriteTxn,
     namespace: &str,
-    default_algorithm: LockAlgorithm,
-) -> anyhow::Result<LockAlgorithm> {
-    engine::get_namespace_policy_inner(txn, namespace, default_algorithm).map(|(algorithm, _)| algorithm)
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<AcquireArgs> {
+    if args.fencing_token > 0 || algorithm.is_semaphore() {
+        return Ok(args.clone());
+    }
+    if !args
+        .requests
+        .iter()
+        .any(|req| req.mode == Mode::Write && !algorithm.is_semaphore())
+    {
+        return Ok(args.clone());
+    }
+
+    let mut max_seen = match txn.get_raw(store_keys::CF_META, store_keys::META_FENCE_COUNTER_KEY)? {
+        Some(bytes) => match decode_record(&bytes)? {
+            StoredRecord::Counter { v } => v,
+            _ => 0,
+        },
+        None => 0,
+    };
+    for req in args.requests.iter().filter(|req| req.mode == Mode::Write) {
+        let key_path = engine::scoped_path(namespace, &req.path);
+        if let Some(cur) = engine::parse_fence(
+            txn.get_str(store_keys::CF_FENCES, &store_keys::fence_key(&key_path))?,
+        ) {
+            max_seen = max_seen.max(cur);
+        }
+    }
+    let token = max_seen.saturating_add(1);
+    txn.put_raw(
+        store_keys::CF_META,
+        store_keys::META_FENCE_COUNTER_KEY,
+        encode_record(&StoredRecord::Counter { v: token })?,
+    )?;
+    let mut minted = args.clone();
+    minted.fencing_token = token;
+    Ok(minted)
 }
 
 /// Force-clear every lock — held and queued — whose path is contained by
@@ -435,16 +431,13 @@ fn execute_op(
     default_algorithm: LockAlgorithm,
 ) -> anyhow::Result<ApplyResponse> {
     Ok(match &cmd.op {
-        Op::Acquire(args) => {
-            let algorithm = resolve_acquire_policy(txn, args, default_algorithm)?;
-            execute_acquire(txn, args, algorithm)?
-        }
         Op::Release {
+            namespace,
             owner,
             reqs,
             del_wait,
         } => {
-            engine::release_inner(txn, owner, reqs, *del_wait)?;
+            engine::release_inner_in_namespace(txn, namespace, owner, reqs, *del_wait)?;
             granted_response(sweep_grants(txn)?)
         }
         Op::ReleaseAll { owner, del_wait } => {
@@ -515,9 +508,10 @@ fn execute_op(
             // The algorithm in force before this write: the explicit row's
             // value, or the configured fallback when none exists.
             let (before, _) =
-                engine::get_namespace_policy_inner(txn, namespace, default_algorithm)?;
+                engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
+            let after = LockPolicy::new(*algorithm, before.epoch);
             engine::set_namespace_policy_inner(txn, namespace, *algorithm)?;
-            if *algorithm == before {
+            if after.algorithm == before.algorithm {
                 // No effective change (re-set to the same value); locks stay.
                 ApplyResponse::Unit
             } else {
@@ -526,22 +520,55 @@ fn execute_op(
         }
         Op::DeleteNamespacePolicy { namespace } => {
             let (before, explicit) =
-                engine::get_namespace_policy_inner(txn, namespace, default_algorithm)?;
+                engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
             engine::delete_namespace_policy_inner(txn, namespace)?;
             // Deleting reverts the namespace to the configured default. Clear
             // only when that actually changes the effective algorithm — i.e. an
             // explicit row existed and it differed from the default.
-            if explicit && before != default_algorithm {
+            if explicit && before != LockPolicy::from_algorithm(default_algorithm) {
                 namespace_cleared_response(clear_namespace(txn, namespace)?)
             } else {
                 ApplyResponse::Unit
             }
         }
-        Op::AcquireInNamespace { namespace, args } => {
-            let algorithm = resolve_namespace_policy(txn, namespace, default_algorithm)?;
-            execute_acquire(txn, args, algorithm)?
+        Op::AcquireInNamespace {
+            namespace,
+            policy,
+            args,
+        } => {
+            if cmd.request_id.is_some() {
+                if let Some(resp) =
+                    reject_stale_policy_epoch(txn, namespace, *policy, default_algorithm)?
+                {
+                    return Ok(resp);
+                }
+            }
+            execute_acquire(txn, namespace, args, *policy)?
         }
     })
+}
+
+fn reject_stale_policy_epoch(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    stamped: LockPolicy,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<Option<ApplyResponse>> {
+    let (current, _) =
+        engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
+    if current == stamped {
+        return Ok(None);
+    }
+    Ok(Some(ApplyResponse::Rejected {
+        kind: RejectKind::PolicyEpochStale,
+        detail: format!(
+            "namespace policy for {namespace} changed: stamped epoch {} {}, current epoch {} {}",
+            stamped.epoch,
+            stamped.algorithm.as_str(),
+            current.epoch,
+            current.algorithm.as_str(),
+        ),
+    }))
 }
 
 // ---------------------------------------------------------------------------

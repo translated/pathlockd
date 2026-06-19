@@ -17,8 +17,8 @@ use tracing::warn;
 
 use crate::store_keys::{
     alive_key, fence_key, hold_algorithm_key, namespace_policy_key, own_prefix, rd_prefix,
-    rddesc_prefix, sem_prefix, wait_key, wr_key, wrdesc_key, FENCE_MIN_TTL_MS,
-    MAX_SET_ENUM_MEMBERS,
+    rddesc_prefix, sem_prefix, semaphore_permits_key, wait_key, wr_key, wrdesc_key,
+    FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
 
@@ -46,7 +46,7 @@ const RELEASE_PAGE: usize = 4096;
 /// descendant-index removals) accumulate in a single WriteBatch + overlay
 /// held in memory and applied synchronously by every replica's apply loop.
 const MAX_RELEASE_MEMBERS: usize = 1 << 16;
-
+const SCOPED_PATH_SEP: char = '\x1f';
 // ---------------------------------------------------------------------------
 // Public value types
 // ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Mode::Write => "write",
             Mode::Read => "read",
@@ -66,10 +66,11 @@ impl Mode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LockAlgorithm {
     /// Default: multiple point reads on a path; writes exclude the path and
     /// descendants.
+    #[default]
     RecursiveRw,
     /// Multiple point reads on a path; writes exclude only the exact path.
     PointRw,
@@ -77,15 +78,284 @@ pub enum LockAlgorithm {
     RecursiveWrite,
     /// Write locks only; writes exclude only the exact path.
     PointWrite,
-    /// Counting semaphore: point-scoped, write-only. A path admits up to the
-    /// acquirer's requested permit count (`LockReq::permits`) concurrent
-    /// holders; no read mode, no descendant exclusion, no fencing.
+    /// Counting semaphore: point-scoped, write-only. Each path has its own
+    /// permit capacity; no read mode, no descendant exclusion, no fencing.
     Semaphore,
 }
 
-impl Default for LockAlgorithm {
-    fn default() -> Self {
-        Self::RecursiveRw
+#[derive(Debug, Clone, Copy)]
+struct AlgorithmStrategy {
+    allows_read: bool,
+    recursive: bool,
+    semaphore: bool,
+}
+
+const ALGORITHM_STRATEGIES: &[(LockAlgorithm, AlgorithmStrategy)] = &[
+    (
+        LockAlgorithm::RecursiveRw,
+        AlgorithmStrategy {
+            allows_read: true,
+            recursive: true,
+            semaphore: false,
+        },
+    ),
+    (
+        LockAlgorithm::PointRw,
+        AlgorithmStrategy {
+            allows_read: true,
+            recursive: false,
+            semaphore: false,
+        },
+    ),
+    (
+        LockAlgorithm::RecursiveWrite,
+        AlgorithmStrategy {
+            allows_read: false,
+            recursive: true,
+            semaphore: false,
+        },
+    ),
+    (
+        LockAlgorithm::PointWrite,
+        AlgorithmStrategy {
+            allows_read: false,
+            recursive: false,
+            semaphore: false,
+        },
+    ),
+    (
+        LockAlgorithm::Semaphore,
+        AlgorithmStrategy {
+            allows_read: false,
+            recursive: false,
+            semaphore: true,
+        },
+    ),
+];
+
+fn algorithm_strategy(algorithm: LockAlgorithm) -> AlgorithmStrategy {
+    ALGORITHM_STRATEGIES
+        .iter()
+        .find_map(|(candidate, strategy)| (*candidate == algorithm).then_some(*strategy))
+        .expect("all lock algorithms have a strategy")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Reason {
+    AncestorLocked,
+    WriteLocked,
+    ReadLocked,
+    DescendantWriteLocked,
+    DescendantReadLocked,
+    ReadLocksDisabled,
+    StaleFencingToken,
+    InvalidPermits,
+    SemaphoreFull,
+    MissingSemaphore,
+    MissingWrite,
+    MissingRead,
+    MissingFence,
+    MissingAlive,
+    MissingOwnerSet,
+    EmptyOwnerSet,
+    Queued,
+    StaleOwner,
+}
+
+pub type ConflictReason = Reason;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct OwnerId(String);
+
+impl OwnerId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for OwnerId {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for OwnerId {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for OwnerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Namespace(String);
+
+impl Namespace {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for Namespace {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for Namespace {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for Namespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct NormalizedPath(String);
+
+impl NormalizedPath {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl From<&str> for NormalizedPath {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for NormalizedPath {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl std::fmt::Display for NormalizedPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct FenceToken(i64);
+
+impl FenceToken {
+    pub fn new(value: i64) -> Self {
+        Self(value)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+impl Reason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::AncestorLocked => "ancestor_locked",
+            Self::WriteLocked => "write_locked",
+            Self::ReadLocked => "read_locked",
+            Self::DescendantWriteLocked => "descendant_write_locked",
+            Self::DescendantReadLocked => "descendant_read_locked",
+            Self::ReadLocksDisabled => "read_locks_disabled",
+            Self::StaleFencingToken => "stale_fencing_token",
+            Self::InvalidPermits => "invalid_permits",
+            Self::SemaphoreFull => "semaphore_full",
+            Self::MissingSemaphore => "missing_semaphore",
+            Self::MissingWrite => "missing_write",
+            Self::MissingRead => "missing_read",
+            Self::MissingFence => "missing_fence",
+            Self::MissingAlive => "missing_alive",
+            Self::MissingOwnerSet => "missing_owner_set",
+            Self::EmptyOwnerSet => "empty_owner_set",
+            Self::Queued => "queued",
+            Self::StaleOwner => "stale_owner",
+        }
+    }
+
+    pub fn is_queueable(self) -> bool {
+        matches!(
+            self,
+            Self::WriteLocked
+                | Self::ReadLocked
+                | Self::AncestorLocked
+                | Self::DescendantWriteLocked
+                | Self::DescendantReadLocked
+                | Self::SemaphoreFull
+        )
+    }
+
+    pub fn is_blocking_reason(self) -> bool {
+        matches!(
+            self,
+            Self::AncestorLocked
+                | Self::WriteLocked
+                | Self::ReadLocked
+                | Self::DescendantWriteLocked
+                | Self::DescendantReadLocked
+                | Self::SemaphoreFull
+        )
+    }
+}
+
+impl std::fmt::Display for Reason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Reason {
+    type Err = anyhow::Error;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim() {
+            "ancestor_locked" => Ok(Self::AncestorLocked),
+            "write_locked" => Ok(Self::WriteLocked),
+            "read_locked" => Ok(Self::ReadLocked),
+            "descendant_write_locked" => Ok(Self::DescendantWriteLocked),
+            "descendant_read_locked" => Ok(Self::DescendantReadLocked),
+            "read_locks_disabled" => Ok(Self::ReadLocksDisabled),
+            "stale_fencing_token" => Ok(Self::StaleFencingToken),
+            "invalid_permits" => Ok(Self::InvalidPermits),
+            "semaphore_full" => Ok(Self::SemaphoreFull),
+            "missing_semaphore" => Ok(Self::MissingSemaphore),
+            "missing_write" => Ok(Self::MissingWrite),
+            "missing_read" => Ok(Self::MissingRead),
+            "missing_fence" => Ok(Self::MissingFence),
+            "missing_alive" => Ok(Self::MissingAlive),
+            "missing_owner_set" => Ok(Self::MissingOwnerSet),
+            "empty_owner_set" => Ok(Self::EmptyOwnerSet),
+            "queued" => Ok(Self::Queued),
+            "stale_owner" => Ok(Self::StaleOwner),
+            _ => anyhow::bail!("unknown reason {raw:?}"),
+        }
     }
 }
 
@@ -101,17 +371,16 @@ impl LockAlgorithm {
     }
 
     pub fn allows_read(self) -> bool {
-        matches!(self, Self::RecursiveRw | Self::PointRw)
+        algorithm_strategy(self).allows_read
     }
 
     pub fn recursive(self) -> bool {
-        matches!(self, Self::RecursiveRw | Self::RecursiveWrite)
+        algorithm_strategy(self).recursive
     }
 
-    /// A counting semaphore rather than an exclusive lock: a path admits up to
-    /// the acquirer's requested permit count concurrent holders.
+    /// A counting semaphore rather than an exclusive lock.
     pub fn is_semaphore(self) -> bool {
-        matches!(self, Self::Semaphore)
+        algorithm_strategy(self).semaphore
     }
 
     pub fn allows_mode(self, mode: Mode) -> bool {
@@ -165,9 +434,6 @@ pub struct LockReq {
     pub path: String,
     pub mode: Mode,
     pub state: State,
-    /// Concurrent-holder cap for a [`LockAlgorithm::Semaphore`] namespace: the
-    /// acquire is admitted iff the path currently has fewer than `permits` live
-    /// holders. Required `>= 1` in a semaphore namespace; ignored otherwise.
     #[serde(default)]
     pub permits: u32,
 }
@@ -194,15 +460,17 @@ pub struct AcquireArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AcquireOutcome {
-    Ok,
+    Ok {
+        fencing_token: i64,
+    },
     Conflict {
         path: String,
         owner: String,
-        reason: String,
+        reason: Reason,
     },
     Lost {
         path: String,
-        reason: String,
+        reason: Reason,
     },
     /// Like `Conflict`, but the request was *enqueued* in the wait queue rather
     /// than refused: it will be granted in place once the contended path frees.
@@ -213,20 +481,21 @@ pub enum AcquireOutcome {
     Queued {
         path: String,
         owner: String,
-        reason: String,
+        reason: Reason,
+        fencing_token: i64,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenewOutcome {
     Ok,
-    Lost { path: String, reason: String },
+    Lost { path: String, reason: Reason },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AssertOutcome {
     Ok,
-    Fail { path: String, reason: String },
+    Fail { path: String, reason: Reason },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -239,7 +508,7 @@ pub enum CycleOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WaitEdgeMetadata {
     pub conflict_path: String,
-    pub reason: String,
+    pub reason: Reason,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -248,13 +517,188 @@ pub struct WaitEdge {
     pub metadata: Option<WaitEdgeMetadata>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct NamespacePolicyEntry {
+    pub namespace: String,
+    pub algorithm: LockAlgorithm,
+    pub epoch: u64,
+}
+
+impl NamespacePolicyEntry {
+    pub fn policy(&self) -> LockPolicy {
+        LockPolicy::new(self.algorithm, self.epoch)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LockPolicy {
+    pub algorithm: LockAlgorithm,
+    pub epoch: u64,
+}
+
+impl LockPolicy {
+    pub fn new(algorithm: LockAlgorithm, epoch: u64) -> Self {
+        Self { algorithm, epoch }
+    }
+
+    pub fn from_algorithm(algorithm: LockAlgorithm) -> Self {
+        Self::new(algorithm, 0)
+    }
+}
+
+impl Default for LockPolicy {
+    fn default() -> Self {
+        Self::from_algorithm(LockAlgorithm::default())
+    }
+}
+
+impl From<LockAlgorithm> for LockPolicy {
+    fn from(value: LockAlgorithm) -> Self {
+        Self::from_algorithm(value)
+    }
+}
+
 const WAIT_EDGE_V1_PREFIX: &str = "v1:";
+
+// ---------------------------------------------------------------------------
+// Namespace-scoped paths / owner-hold members
+// ---------------------------------------------------------------------------
+
+pub fn scoped_path(namespace: &str, path: &str) -> String {
+    let relative = relative_path(namespace, path);
+    format!("{namespace}{SCOPED_PATH_SEP}{relative}")
+}
+
+pub fn public_path(namespace: &str, path: &str) -> String {
+    let Some((_ns, rel)) = path.split_once(SCOPED_PATH_SEP) else {
+        return path.to_string();
+    };
+    if rel == "/" {
+        return if namespace.contains(':') {
+            namespace.to_string()
+        } else {
+            format!("{namespace}:/")
+        };
+    }
+    if namespace.contains(':') {
+        if namespace.ends_with(":/") {
+            format!("{}{}", namespace, rel.trim_start_matches('/'))
+        } else {
+            format!("{namespace}{rel}")
+        }
+    } else {
+        format!("{namespace}:{rel}")
+    }
+}
+
+fn relative_path(namespace: &str, path: &str) -> String {
+    if !namespace.contains(':') {
+        let Some(colon) = path.find(':') else {
+            return path.to_string();
+        };
+        return path[colon + 1..].to_string();
+    }
+    if path == namespace {
+        return "/".to_string();
+    }
+    if namespace.ends_with(":/") {
+        let suffix = path.strip_prefix(namespace).unwrap_or_default();
+        if suffix.is_empty() {
+            "/".to_string()
+        } else {
+            format!("/{suffix}")
+        }
+    } else {
+        path.strip_prefix(namespace)
+            .filter(|rest| rest.starts_with('/'))
+            .unwrap_or(path)
+            .to_string()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HeldLock {
+    pub namespace: Namespace,
+    pub mode: Mode,
+    pub path: NormalizedPath,
+}
+
+impl HeldLock {
+    pub fn new(
+        namespace: impl Into<Namespace>,
+        mode: Mode,
+        path: impl Into<NormalizedPath>,
+    ) -> Self {
+        Self {
+            namespace: namespace.into(),
+            mode,
+            path: path.into(),
+        }
+    }
+
+    pub fn member(&self) -> String {
+        format!(
+            "{}\0{}\0{}",
+            self.mode.as_str(),
+            self.namespace.as_str(),
+            self.path.as_str()
+        )
+    }
+
+    pub fn key_path(&self) -> String {
+        scoped_path(self.namespace.as_str(), self.path.as_str())
+    }
+
+    pub fn parse_member(member: &str) -> Option<Self> {
+        let mut parts = member.splitn(3, '\0');
+        let mode = match parts.next()? {
+            "write" => Mode::Write,
+            "read" => Mode::Read,
+            _ => return None,
+        };
+        Some(Self::new(parts.next()?, mode, parts.next()?))
+    }
+}
+
+fn hold_member(namespace: &str, mode: Mode, path: &str) -> String {
+    HeldLock::new(namespace, mode, path).member()
+}
+
+pub fn parse_hold_member(member: &str) -> Option<HeldLock> {
+    HeldLock::parse_member(member)
+}
+
+fn held_key_path(held: &HeldLock) -> String {
+    held.key_path()
+}
 
 // ---------------------------------------------------------------------------
 // get_ancestors
 // ---------------------------------------------------------------------------
 
 pub fn get_ancestors(full_path: &str) -> Vec<String> {
+    if let Some((namespace, relative)) = full_path.split_once(SCOPED_PATH_SEP) {
+        let mut ancestors = Vec::new();
+        let mut current = relative.to_string();
+        while current != "/" && !current.is_empty() {
+            match current.rfind('/') {
+                None => break,
+                Some(idx) => {
+                    current = if idx == 0 {
+                        "/".to_string()
+                    } else {
+                        current[..idx].to_string()
+                    };
+                    ancestors.push(format!("{namespace}{SCOPED_PATH_SEP}{current}"));
+                    if current == "/" {
+                        break;
+                    }
+                }
+            }
+        }
+        return ancestors;
+    }
+
     let mut ancestors = Vec::new();
     let col_idx = match full_path.find(':') {
         Some(i) => i,
@@ -324,13 +768,23 @@ pub fn set_namespace_policy_inner<T: StoreTxn>(
     tx: &mut T,
     namespace: &str,
     algorithm: LockAlgorithm,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
+    let (current, explicit) =
+        get_namespace_policy_record_inner(tx, namespace, LockAlgorithm::default())?;
+    let policy = LockPolicy::new(algorithm, current.epoch);
+    let next_epoch = if explicit && current.algorithm == policy.algorithm {
+        current.epoch
+    } else {
+        current.epoch.saturating_add(1)
+    };
+    let next_policy = LockPolicy::new(algorithm, next_epoch);
     tx.set_str(
         NS_SETTINGS_CF,
         &namespace_policy_key(namespace),
-        algorithm.as_str(),
+        &format!("{next_epoch}:{}", next_policy.algorithm.as_str()),
         0,
-    )
+    )?;
+    Ok(next_epoch)
 }
 
 pub fn delete_namespace_policy_inner<T: StoreTxn>(
@@ -349,16 +803,32 @@ pub fn get_namespace_policy_inner<T: StoreTxn>(
     namespace: &str,
     default: LockAlgorithm,
 ) -> anyhow::Result<(LockAlgorithm, bool)> {
+    get_namespace_policy_record_inner(tx, namespace, default)
+        .map(|(policy, explicit)| (policy.algorithm, explicit))
+}
+
+pub fn get_namespace_policy_record_inner<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+    default: LockAlgorithm,
+) -> anyhow::Result<(LockPolicy, bool)> {
     match tx.get_str(NS_SETTINGS_CF, &namespace_policy_key(namespace))? {
-        None => Ok((default, false)),
-        Some(raw) => match raw.parse::<LockAlgorithm>() {
-            Ok(algorithm) => Ok((algorithm, true)),
-            Err(e) => {
-                warn!(namespace, value = %raw, error = %e, "invalid namespace lock policy; using default");
-                Ok((default, true))
-            }
-        },
+        None => Ok((LockPolicy::from_algorithm(default), false)),
+        Some(raw) => Ok((parse_namespace_policy_value(&raw)?, true)),
     }
+}
+
+pub fn parse_namespace_policy_value(raw: &str) -> anyhow::Result<LockPolicy> {
+    let mut parts = raw.splitn(2, ':');
+    let epoch = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed namespace policy record"))?
+        .parse::<u64>()?;
+    let algorithm = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("malformed namespace policy record"))?
+        .parse::<LockAlgorithm>()?;
+    Ok(LockPolicy::new(algorithm, epoch))
 }
 
 fn hold_algorithm<T: StoreTxn>(
@@ -369,9 +839,7 @@ fn hold_algorithm<T: StoreTxn>(
 ) -> anyhow::Result<LockAlgorithm> {
     match tx.get_str(META_CF, &hold_algorithm_key(owner, mode.as_str(), path))? {
         None => Ok(LockAlgorithm::default()),
-        Some(raw) => raw
-            .parse::<LockAlgorithm>()
-            .or(Ok(LockAlgorithm::default())),
+        Some(raw) => raw.parse::<LockAlgorithm>(),
     }
 }
 
@@ -400,6 +868,22 @@ fn del_hold_algorithm<T: StoreTxn>(
     tx.del(META_CF, &hold_algorithm_key(owner, mode.as_str(), path))
 }
 
+fn semaphore_capacity<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Option<u32>> {
+    tx.get_str(META_CF, &semaphore_permits_key(path))?
+        .map(|raw| raw.parse::<u32>())
+        .transpose()
+        .map_err(Into::into)
+}
+
+fn set_semaphore_capacity<T: StoreTxn>(tx: &mut T, path: &str, permits: u32) -> anyhow::Result<()> {
+    tx.set_str(
+        META_CF,
+        &semaphore_permits_key(path),
+        &permits.to_string(),
+        0,
+    )
+}
+
 fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Vec<String>> {
     let rd_pfx = rd_prefix(path);
     let owners = tx.smembers_limited(RD_CF, &rd_pfx, MAX_SET_ENUM_MEMBERS)?;
@@ -418,10 +902,7 @@ fn prune_dead_read_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
 /// Live semaphore holders at `path`, dropping any whose owner is dead (and the
 /// dead owner's per-hold algorithm marker). Semaphore holds are stored under
 /// the engine's `Mode::Write` string, mirroring their wire mode.
-fn prune_dead_semaphore_owners<T: StoreTxn>(
-    tx: &mut T,
-    path: &str,
-) -> anyhow::Result<Vec<String>> {
+fn prune_dead_semaphore_owners<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<Vec<String>> {
     let pfx = sem_prefix(path);
     let owners = tx.smembers_limited(SEM_CF, &pfx, MAX_SET_ENUM_MEMBERS)?;
     let mut alive = Vec::new();
@@ -487,7 +968,8 @@ fn find_descendant_write_conflict<T: StoreTxn>(
     tx: &mut T,
     owner_id: &str,
     path: &str,
-) -> anyhow::Result<Option<(String, String, String)>> {
+    namespace: &str,
+) -> anyhow::Result<Option<(String, String, Reason)>> {
     let idx = wrdesc_key(path);
     let candidates = tx.smembers_limited(WRDESC_CF, &idx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
@@ -500,7 +982,11 @@ fn find_descendant_write_conflict<T: StoreTxn>(
                 remove_descendant_indexes(tx, Mode::Write, &candidate)?;
             }
             Some(owner) if owner != owner_id => {
-                return Ok(Some((candidate, owner, "descendant_write_locked".into())));
+                return Ok(Some((
+                    public_path(namespace, &candidate),
+                    owner,
+                    Reason::DescendantWriteLocked,
+                )));
             }
             Some(_) => {}
         }
@@ -512,7 +998,8 @@ fn find_descendant_read_conflict<T: StoreTxn>(
     tx: &mut T,
     owner_id: &str,
     path: &str,
-) -> anyhow::Result<Option<(String, String, String)>> {
+    namespace: &str,
+) -> anyhow::Result<Option<(String, String, Reason)>> {
     let idx_pfx = rddesc_prefix(path);
     let candidates = tx.smembers_limited(RDDESC_CF, &idx_pfx, MAX_SET_ENUM_MEMBERS)?;
     if candidates.len() > SCAN_WARN_THRESHOLD {
@@ -530,7 +1017,11 @@ fn find_descendant_read_conflict<T: StoreTxn>(
         } else {
             for owner in owners {
                 if owner != owner_id {
-                    return Ok(Some((candidate, owner, "descendant_read_locked".into())));
+                    return Ok(Some((
+                        public_path(namespace, &candidate),
+                        owner,
+                        Reason::DescendantReadLocked,
+                    )));
                 }
             }
         }
@@ -554,6 +1045,32 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
     args: &AcquireArgs,
     request_algorithm: LockAlgorithm,
 ) -> anyhow::Result<AcquireOutcome> {
+    let namespace = args
+        .requests
+        .iter()
+        .map(|r| crate::store_keys::handler_of(&r.path))
+        .chain(
+            args.release_requests
+                .iter()
+                .map(|r| crate::store_keys::handler_of(&r.path)),
+        )
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    acquire_inner_in_namespace(
+        tx,
+        args,
+        LockPolicy::from_algorithm(request_algorithm),
+        &namespace,
+    )
+}
+
+pub fn acquire_inner_in_namespace<T: StoreTxn>(
+    tx: &mut T,
+    args: &AcquireArgs,
+    policy: LockPolicy,
+    namespace: &str,
+) -> anyhow::Result<AcquireOutcome> {
     let owner = &args.owner_id;
     let ttl = args.ttl_ms;
     let fence_ttl = ttl.max(FENCE_MIN_TTL_MS);
@@ -562,273 +1079,387 @@ pub fn acquire_inner_with_policy<T: StoreTxn>(
     let own_pfx = own_prefix(owner);
 
     if args.requests.is_empty() && args.release_requests.is_empty() {
-        return Ok(AcquireOutcome::Ok);
+        return Ok(AcquireOutcome::Ok { fencing_token: 0 });
     }
 
     let has_held = args.requests.iter().any(|r| r.state == State::Held);
     if has_held && tx.get_str(ALIVE_CF, &alive_k)?.is_none() {
         return Ok(AcquireOutcome::Lost {
             path: String::new(),
-            reason: "missing_alive".into(),
+            reason: Reason::MissingAlive,
         });
     }
 
-    // 1. VALIDATION PHASE
+    if let Some(outcome) = validate_acquire(tx, owner, token, &args.requests, namespace, policy)? {
+        return Ok(outcome);
+    }
+
+    let apply_ctx = AcquireApplyCtx {
+        owner,
+        namespace,
+        request_algorithm: policy.algorithm,
+        token,
+        fence_ttl,
+        own_pfx: &own_pfx,
+    };
     for req in &args.requests {
-        let path = &req.path;
-        match req.state {
-            State::Held => {
-                if request_algorithm.is_semaphore() {
-                    // A held semaphore lock lives in the holder set, not WR_CF,
-                    // and carries no fence.
-                    if !tx.sismember(SEM_CF, &sem_prefix(path), owner)? {
-                        return Ok(lost(path, "missing_semaphore"));
-                    }
-                } else if req.mode == Mode::Write {
-                    if tx.get_str(WR_CF, &wr_key(path))?.as_deref() != Some(owner.as_str()) {
-                        return Ok(lost(path, "missing_write"));
-                    }
-                    match parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?) {
-                        None => return Ok(lost(path, "missing_fence")),
-                        Some(cur) if cur > token => {
-                            return Ok(conflict(path, &cur.to_string(), "stale_fencing_token"))
-                        }
-                        Some(_) => {}
-                    }
-                } else {
-                    let rd_pfx = rd_prefix(path);
-                    if !tx.sismember(RD_CF, &rd_pfx, owner)? {
-                        return Ok(lost(path, "missing_read"));
-                    }
-                }
-            }
-            State::New => {
-                if !request_algorithm.allows_mode(req.mode) {
-                    return Ok(conflict(path, "", "read_locks_disabled"));
-                }
-                for anc in get_ancestors(path) {
-                    if let Some(anc_owner) = get_live_write_owner(tx, &anc)? {
-                        if anc_owner != *owner
-                            && hold_algorithm(tx, &anc_owner, Mode::Write, &anc)?.recursive()
-                        {
-                            return Ok(conflict(&anc, &anc_owner, "ancestor_locked"));
-                        }
-                    }
-                }
-                if request_algorithm.is_semaphore() {
-                    // Point, write-only counting semaphore: admit iff the path
-                    // has fewer live holders than this request's own permit
-                    // count. An owner already holding refreshes in place (no
-                    // double-count). Ancestor exclusion above still applies; no
-                    // descendant scan, read check, or fence.
-                    if req.permits == 0 {
-                        return Ok(conflict(path, "", "invalid_permits"));
-                    }
-                    if !tx.sismember(SEM_CF, &sem_prefix(path), owner)? {
-                        let holders = prune_dead_semaphore_owners(tx, path)?;
-                        if holders.len() as u32 >= req.permits {
-                            let blocker = holders.into_iter().next().unwrap_or_default();
-                            return Ok(conflict(path, &blocker, "semaphore_full"));
-                        }
-                    }
-                    continue;
-                }
-                if let Some(wr_owner) = get_live_write_owner(tx, path)? {
-                    if wr_owner != *owner {
-                        return Ok(conflict(path, &wr_owner, "write_locked"));
-                    }
-                }
-                if req.mode == Mode::Write {
-                    let rd_owners = prune_dead_read_owners(tx, path)?;
-                    if rd_owners.is_empty() {
-                        remove_descendant_indexes(tx, Mode::Read, path)?;
-                    }
-                    for o in &rd_owners {
-                        if o != owner {
-                            return Ok(conflict(path, o, "read_locked"));
-                        }
-                    }
-                    if request_algorithm.recursive() {
-                        if let Some((p, o, r)) = find_descendant_write_conflict(tx, owner, path)? {
-                            return Ok(AcquireOutcome::Conflict {
-                                path: p,
-                                owner: o,
-                                reason: r,
-                            });
-                        }
-                        if let Some((p, o, r)) = find_descendant_read_conflict(tx, owner, path)? {
-                            return Ok(AcquireOutcome::Conflict {
-                                path: p,
-                                owner: o,
-                                reason: r,
-                            });
-                        }
-                    }
-                    if let Some(cur) = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?) {
-                        if cur > token {
-                            return Ok(conflict(path, &cur.to_string(), "stale_fencing_token"));
-                        }
-                    }
-                }
-            }
+        if let Some(outcome) = apply_acquire(tx, req, &apply_ctx)? {
+            return Ok(outcome);
         }
     }
 
-    // 2. EXECUTION PHASE
-    //
-    // One owner has one lease: the latest acquire/renew TTL re-leases the
-    // owner's liveness marker *and* (in phase 2b) every other lock it holds,
-    // so the whole portfolio always expires together with `alive`.
-    tx.set_str(ALIVE_CF, &alive_k, "1", ttl)?;
+    refresh_portfolio(tx, &alive_k, ttl)?;
 
-    for req in &args.requests {
-        let path = &req.path;
-        let member = format!("{}:{}", req.mode.as_str(), path);
-        tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
-        let held_algorithm = if req.state == State::Held {
-            hold_algorithm(tx, owner, req.mode, path)?
-        } else {
-            request_algorithm
-        };
-        set_hold_algorithm(tx, owner, req.mode, path, held_algorithm, ttl)?;
-
-        if held_algorithm.is_semaphore() {
-            // Validated above; just (re)join the holder set under the lease TTL.
-            tx.sadd(SEM_CF, &sem_prefix(path), owner, ttl)?;
-        } else if req.mode == Mode::Write {
-            let wr_k = wr_key(path);
-            let fence_k = fence_key(path);
-            match req.state {
-                State::Held => {
-                    tx.pexpire_str(WR_CF, &wr_k, ttl)?;
-                    tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
-                    add_descendant_indexes(tx, Mode::Write, path, ttl)?;
-                }
-                State::New => {
-                    if tx.get_str(WR_CF, &wr_k)?.is_none() {
-                        tx.set_str(WR_CF, &wr_k, owner, ttl)?;
-                        tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
-                        add_descendant_indexes(tx, Mode::Write, path, ttl)?;
-                    } else {
-                        let current = tx.get_str(WR_CF, &wr_k)?.unwrap_or_default();
-                        if current == *owner {
-                            tx.pexpire_str(WR_CF, &wr_k, ttl)?;
-                            tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
-                            add_descendant_indexes(tx, Mode::Write, path, ttl)?;
-                        } else {
-                            return Ok(conflict(path, &current, "write_locked"));
-                        }
-                    }
-                }
-            }
-        } else {
-            let rd_pfx = rd_prefix(path);
-            tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
-            add_descendant_indexes(tx, Mode::Read, path, ttl)?;
-        }
-    }
-
-    // 2b. REFRESH THE REST OF THE LEASE
-    let requested: std::collections::HashSet<String> = args
-        .requests
-        .iter()
-        .map(|r| format!("{}:{}", r.mode.as_str(), &r.path))
-        .collect();
-    for member in tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)? {
-        if requested.contains(&member) {
-            continue;
-        }
-        let Some(sep) = member.find(':') else {
-            continue;
-        };
-        let (mode, path) = (&member[..sep], member[sep + 1..].to_string());
-        if mode == "write" {
-            let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
-            if lock_algorithm.is_semaphore() {
-                // Semaphore hold: refresh membership + per-hold algorithm under
-                // the new lease TTL; no WR_CF, fence, or descendant index.
-                if !tx.sismember(SEM_CF, &sem_prefix(&path), owner)? {
-                    return Ok(lost(&path, "missing_semaphore"));
-                }
-                tx.sadd(SEM_CF, &sem_prefix(&path), owner, ttl)?;
-                set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl)?;
-                tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
-                continue;
-            }
-            let wr_k = wr_key(&path);
-            if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner.as_str()) {
-                return Ok(lost(&path, "missing_write"));
-            }
-            tx.pexpire_str(WR_CF, &wr_k, ttl)?;
-            match parse_fence(tx.get_str(FENCE_CF, &fence_key(&path))?) {
-                None => return Ok(lost(&path, "missing_fence")),
-                Some(cur) if token > 0 && cur > token => {
-                    return Ok(conflict(&path, &cur.to_string(), "stale_fencing_token"));
-                }
-                Some(cur) => {
-                    let refreshed = if token > 0 { token.max(cur) } else { cur };
-                    tx.set_str(
-                        FENCE_CF,
-                        &fence_key(&path),
-                        &refreshed.to_string(),
-                        fence_ttl,
-                    )?;
-                }
-            }
-            set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl)?;
-            add_descendant_indexes(tx, Mode::Write, &path, ttl)?;
-            tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
-        } else if mode == "read" {
-            let rd_pfx = rd_prefix(&path);
-            if !tx.sismember(RD_CF, &rd_pfx, owner)? {
-                return Ok(lost(&path, "missing_read"));
-            }
-            let lock_algorithm = hold_algorithm(tx, owner, Mode::Read, &path)?;
-            tx.sadd(RD_CF, &rd_pfx, owner, ttl)?;
-            set_hold_algorithm(tx, owner, Mode::Read, &path, lock_algorithm, ttl)?;
-            add_descendant_indexes(tx, Mode::Read, &path, ttl)?;
-            tx.sadd(OWN_CF, &own_pfx, &member, ttl)?;
-        }
-    }
-
-    // 3. INLINE RELEASE PHASE
     if !args.release_requests.is_empty() {
-        for req in &args.release_requests {
-            let path = &req.path;
-            let member = format!("{}:{}", req.mode.as_str(), path);
-            tx.srem(OWN_CF, &own_pfx, &member)?;
-
-            if req.mode == Mode::Write && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore()
-            {
-                // Semaphore hold (no WR_CF / fence / descendant index): just
-                // leave the holder set, freeing a permit for the next waiter.
-                tx.srem(SEM_CF, &sem_prefix(path), owner)?;
-                del_hold_algorithm(tx, owner, Mode::Write, path)?;
-            } else if req.mode == Mode::Write {
-                let wr_k = wr_key(path);
-                if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner.as_str()) {
-                    tx.del(WR_CF, &wr_k)?;
-                    del_hold_algorithm(tx, owner, Mode::Write, path)?;
-                    remove_descendant_indexes(tx, Mode::Write, path)?;
-                }
-            } else {
-                let rd_pfx = rd_prefix(path);
-                tx.srem(RD_CF, &rd_pfx, owner)?;
-                del_hold_algorithm(tx, owner, Mode::Read, path)?;
-                if !tx.has_live_member(RD_CF, &rd_pfx)? {
-                    remove_descendant_indexes(tx, Mode::Read, path)?;
-                }
-            }
-        }
-        // The liveness marker survives iff any held lock remains. Reads
-        // observe this command's own writes, so locks acquired above count
-        // and the members released just now don't.
-        if !tx.has_live_member(OWN_CF, &own_pfx)? {
-            tx.del(ALIVE_CF, &alive_k)?;
-        }
+        apply_releases(
+            tx,
+            owner,
+            namespace,
+            &args.release_requests,
+            &own_pfx,
+            &alive_k,
+        )?;
     }
 
-    Ok(AcquireOutcome::Ok)
+    Ok(AcquireOutcome::Ok {
+        fencing_token: if token > 0 { token } else { 0 },
+    })
+}
+
+fn validate_acquire<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    token: i64,
+    requests: &[LockReq],
+    namespace: &str,
+    policy: LockPolicy,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    for req in requests {
+        let outcome = match req.state {
+            State::Held => validate_held(tx, owner, token, req, namespace)?,
+            State::New => validate_new(tx, owner, token, req, namespace, policy)?,
+        };
+        if outcome.is_some() {
+            return Ok(outcome);
+        }
+    }
+    Ok(None)
+}
+
+fn validate_held<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    token: i64,
+    req: &LockReq,
+    namespace: &str,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let path = &req.path;
+    let key_path = scoped_path(namespace, path);
+    let held_algorithm = hold_algorithm(tx, owner, req.mode, &key_path)?;
+    if held_algorithm.is_semaphore() {
+        if !tx.sismember(SEM_CF, &sem_prefix(&key_path), owner)? {
+            return Ok(Some(lost(path, Reason::MissingSemaphore)));
+        }
+    } else if req.mode == Mode::Write {
+        if tx.get_str(WR_CF, &wr_key(&key_path))?.as_deref() != Some(owner) {
+            return Ok(Some(lost(path, Reason::MissingWrite)));
+        }
+        match parse_fence(tx.get_str(FENCE_CF, &fence_key(&key_path))?) {
+            None => return Ok(Some(lost(path, Reason::MissingFence))),
+            Some(cur) if cur > token => {
+                return Ok(Some(conflict(
+                    path,
+                    &cur.to_string(),
+                    Reason::StaleFencingToken,
+                )));
+            }
+            Some(_) => {}
+        }
+    } else if !tx.sismember(RD_CF, &rd_prefix(&key_path), owner)? {
+        return Ok(Some(lost(path, Reason::MissingRead)));
+    }
+    Ok(None)
+}
+
+fn validate_new<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    token: i64,
+    req: &LockReq,
+    namespace: &str,
+    policy: LockPolicy,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let path = &req.path;
+    let key_path = scoped_path(namespace, path);
+    let algorithm = policy.algorithm;
+    if !algorithm.allows_mode(req.mode) {
+        return Ok(Some(conflict(path, "", Reason::ReadLocksDisabled)));
+    }
+    if let Some(outcome) = validate_new_ancestors(tx, owner, namespace, &key_path)? {
+        return Ok(Some(outcome));
+    }
+    if algorithm.is_semaphore() {
+        if req.permits == 0 {
+            return Ok(Some(conflict(path, "", Reason::InvalidPermits)));
+        }
+        if let Some(capacity) = semaphore_capacity(tx, &key_path)? {
+            if capacity != req.permits {
+                return Ok(Some(conflict(
+                    path,
+                    &capacity.to_string(),
+                    Reason::InvalidPermits,
+                )));
+            }
+        }
+        if !tx.sismember(SEM_CF, &sem_prefix(&key_path), owner)? {
+            let holders = prune_dead_semaphore_owners(tx, &key_path)?;
+            if holders.len() as u32 >= req.permits {
+                let blocker = holders.into_iter().next().unwrap_or_default();
+                return Ok(Some(conflict(path, &blocker, Reason::SemaphoreFull)));
+            }
+        }
+        return Ok(None);
+    }
+    if let Some(wr_owner) = get_live_write_owner(tx, &key_path)? {
+        if wr_owner != owner {
+            return Ok(Some(conflict(path, &wr_owner, Reason::WriteLocked)));
+        }
+    }
+    if req.mode == Mode::Write {
+        if let Some(outcome) =
+            validate_new_write(tx, owner, token, path, namespace, &key_path, algorithm)?
+        {
+            return Ok(Some(outcome));
+        }
+    }
+    Ok(None)
+}
+
+fn validate_new_ancestors<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    namespace: &str,
+    key_path: &str,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    for anc in get_ancestors(key_path) {
+        if let Some(anc_owner) = get_live_write_owner(tx, &anc)? {
+            if anc_owner != owner && hold_algorithm(tx, &anc_owner, Mode::Write, &anc)?.recursive()
+            {
+                return Ok(Some(conflict(
+                    &public_path(namespace, &anc),
+                    &anc_owner,
+                    Reason::AncestorLocked,
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn validate_new_write<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    token: i64,
+    path: &str,
+    namespace: &str,
+    key_path: &str,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let rd_owners = prune_dead_read_owners(tx, key_path)?;
+    if rd_owners.is_empty() {
+        remove_descendant_indexes(tx, Mode::Read, key_path)?;
+    }
+    for o in &rd_owners {
+        if o != owner {
+            return Ok(Some(conflict(path, o, Reason::ReadLocked)));
+        }
+    }
+    if algorithm.recursive() {
+        if let Some((path, owner, reason)) =
+            find_descendant_write_conflict(tx, owner, key_path, namespace)?
+        {
+            return Ok(Some(AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            }));
+        }
+        if let Some((path, owner, reason)) =
+            find_descendant_read_conflict(tx, owner, key_path, namespace)?
+        {
+            return Ok(Some(AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            }));
+        }
+    }
+    if let Some(cur) = parse_fence(tx.get_str(FENCE_CF, &fence_key(key_path))?) {
+        if cur > token {
+            return Ok(Some(conflict(
+                path,
+                &cur.to_string(),
+                Reason::StaleFencingToken,
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn refresh_portfolio<T: StoreTxn>(tx: &mut T, alive_k: &[u8], ttl_ms: u64) -> anyhow::Result<()> {
+    tx.set_str(ALIVE_CF, alive_k, "1", ttl_ms)
+}
+
+struct AcquireApplyCtx<'a> {
+    owner: &'a str,
+    namespace: &'a str,
+    request_algorithm: LockAlgorithm,
+    token: i64,
+    fence_ttl: u64,
+    own_pfx: &'a [u8],
+}
+
+fn apply_acquire<T: StoreTxn>(
+    tx: &mut T,
+    req: &LockReq,
+    ctx: &AcquireApplyCtx<'_>,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let path = &req.path;
+    let key_path = scoped_path(ctx.namespace, path);
+    let member = hold_member(ctx.namespace, req.mode, path);
+    let held_algorithm = if req.state == State::Held {
+        hold_algorithm(tx, ctx.owner, req.mode, &key_path)?
+    } else {
+        ctx.request_algorithm
+    };
+
+    let outcome = if held_algorithm.is_semaphore() {
+        if req.state == State::New {
+            match semaphore_capacity(tx, &key_path)? {
+                Some(capacity) if capacity != req.permits => Some(conflict(
+                    path,
+                    &capacity.to_string(),
+                    Reason::InvalidPermits,
+                )),
+                Some(_) => None,
+                None => {
+                    set_semaphore_capacity(tx, &key_path, req.permits)?;
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else if req.mode == Mode::Write {
+        apply_write_acquire(
+            tx,
+            ctx.owner,
+            path,
+            req.state,
+            &key_path,
+            ctx.token,
+            ctx.fence_ttl,
+        )?
+    } else {
+        let rd_pfx = rd_prefix(&key_path);
+        tx.sadd(RD_CF, &rd_pfx, ctx.owner, 0)?;
+        add_descendant_indexes(tx, Mode::Read, &key_path, 0)?;
+        None
+    };
+    if outcome.is_some() {
+        return Ok(outcome);
+    }
+    if held_algorithm.is_semaphore() {
+        tx.sadd(SEM_CF, &sem_prefix(&key_path), ctx.owner, 0)?;
+    }
+    tx.sadd(OWN_CF, ctx.own_pfx, &member, 0)?;
+    set_hold_algorithm(tx, ctx.owner, req.mode, &key_path, held_algorithm, 0)?;
+    Ok(None)
+}
+
+fn apply_write_acquire<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    path: &str,
+    state: State,
+    key_path: &str,
+    token: i64,
+    fence_ttl: u64,
+) -> anyhow::Result<Option<AcquireOutcome>> {
+    let wr_k = wr_key(key_path);
+    let fence_k = fence_key(key_path);
+    match state {
+        State::Held => {
+            tx.set_str(WR_CF, &wr_k, owner, 0)?;
+            tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+            add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
+        }
+        State::New => match tx.get_str(WR_CF, &wr_k)? {
+            None => {
+                tx.set_str(WR_CF, &wr_k, owner, 0)?;
+                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
+            }
+            Some(current) if current == owner => {
+                tx.set_str(WR_CF, &wr_k, owner, 0)?;
+                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
+            }
+            Some(current) => return Ok(Some(conflict(path, &current, Reason::WriteLocked))),
+        },
+    }
+    Ok(None)
+}
+
+fn apply_releases<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    namespace: &str,
+    release_requests: &[RelReq],
+    own_pfx: &[u8],
+    alive_k: &[u8],
+) -> anyhow::Result<()> {
+    for req in release_requests {
+        apply_release(tx, owner, namespace, req, own_pfx)?;
+    }
+    if !tx.has_live_member(OWN_CF, own_pfx)? {
+        tx.del(ALIVE_CF, alive_k)?;
+    }
+    Ok(())
+}
+
+fn apply_release<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    namespace: &str,
+    req: &RelReq,
+    own_pfx: &[u8],
+) -> anyhow::Result<()> {
+    let path = &req.path;
+    let key_path = scoped_path(namespace, path);
+    let member = hold_member(namespace, req.mode, path);
+    tx.srem(OWN_CF, own_pfx, &member)?;
+
+    if req.mode == Mode::Write && hold_algorithm(tx, owner, Mode::Write, &key_path)?.is_semaphore()
+    {
+        tx.srem(SEM_CF, &sem_prefix(&key_path), owner)?;
+        del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
+    } else if req.mode == Mode::Write {
+        let wr_k = wr_key(&key_path);
+        if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
+            tx.del(WR_CF, &wr_k)?;
+            del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
+            remove_descendant_indexes(tx, Mode::Write, &key_path)?;
+        }
+    } else {
+        let rd_pfx = rd_prefix(&key_path);
+        tx.srem(RD_CF, &rd_pfx, owner)?;
+        del_hold_algorithm(tx, owner, Mode::Read, &key_path)?;
+        if !tx.has_live_member(RD_CF, &rd_pfx)? {
+            remove_descendant_indexes(tx, Mode::Read, &key_path)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -841,30 +1472,49 @@ pub fn release_inner<T: StoreTxn>(
     reqs: &[RelReq],
     del_wait_key: bool,
 ) -> anyhow::Result<()> {
+    let namespace = reqs
+        .iter()
+        .map(|r| crate::store_keys::handler_of(&r.path))
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    release_inner_in_namespace(tx, &namespace, owner, reqs, del_wait_key)
+}
+
+pub fn release_inner_in_namespace<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+    owner: &str,
+    reqs: &[RelReq],
+    del_wait_key: bool,
+) -> anyhow::Result<()> {
     let own_pfx = own_prefix(owner);
     let alive_k = alive_key(owner);
 
     for req in reqs {
         let path = &req.path;
-        let member = format!("{}:{}", req.mode.as_str(), path);
+        let key_path = scoped_path(namespace, path);
+        let member = hold_member(namespace, req.mode, path);
         tx.srem(OWN_CF, &own_pfx, &member)?;
 
-        if req.mode == Mode::Write && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore() {
-            tx.srem(SEM_CF, &sem_prefix(path), owner)?;
-            del_hold_algorithm(tx, owner, Mode::Write, path)?;
+        if req.mode == Mode::Write
+            && hold_algorithm(tx, owner, Mode::Write, &key_path)?.is_semaphore()
+        {
+            tx.srem(SEM_CF, &sem_prefix(&key_path), owner)?;
+            del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
         } else if req.mode == Mode::Write {
-            let wr_k = wr_key(path);
+            let wr_k = wr_key(&key_path);
             if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
                 tx.del(WR_CF, &wr_k)?;
-                del_hold_algorithm(tx, owner, Mode::Write, path)?;
-                remove_descendant_indexes(tx, Mode::Write, path)?;
+                del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
+                remove_descendant_indexes(tx, Mode::Write, &key_path)?;
             }
         } else {
-            let rd_pfx = rd_prefix(path);
+            let rd_pfx = rd_prefix(&key_path);
             tx.srem(RD_CF, &rd_pfx, owner)?;
-            del_hold_algorithm(tx, owner, Mode::Read, path)?;
+            del_hold_algorithm(tx, owner, Mode::Read, &key_path)?;
             if !tx.has_live_member(RD_CF, &rd_pfx)? {
-                remove_descendant_indexes(tx, Mode::Read, path)?;
+                remove_descendant_indexes(tx, Mode::Read, &key_path)?;
             }
         }
     }
@@ -888,30 +1538,33 @@ pub fn release_inner<T: StoreTxn>(
 // RELEASE_ALL
 // ---------------------------------------------------------------------------
 
-/// Release the lock state behind one `mode:path` member of an owner's hold
-/// set. The member's own `OWN_CF` entry is removed by the caller.
+/// Release the lock state behind one member of an owner's hold set. The
+/// member's own `OWN_CF` entry is removed by the caller.
 fn release_held_member<T: StoreTxn>(tx: &mut T, owner: &str, item: &str) -> anyhow::Result<()> {
-    let Some(sep) = item.find(':') else {
+    let Some(held) = parse_hold_member(item) else {
         return Ok(());
     };
-    let mode = &item[..sep];
-    let path = &item[sep + 1..];
-    if mode == "write" && hold_algorithm(tx, owner, Mode::Write, path)?.is_semaphore() {
-        tx.srem(SEM_CF, &sem_prefix(path), owner)?;
-        del_hold_algorithm(tx, owner, Mode::Write, path)?;
-    } else if mode == "write" {
-        let wr_k = wr_key(path);
-        if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
-            tx.del(WR_CF, &wr_k)?;
-            del_hold_algorithm(tx, owner, Mode::Write, path)?;
-            remove_descendant_indexes(tx, Mode::Write, path)?;
+    let key_path = held_key_path(&held);
+    match held.mode {
+        Mode::Write if hold_algorithm(tx, owner, Mode::Write, &key_path)?.is_semaphore() => {
+            tx.srem(SEM_CF, &sem_prefix(&key_path), owner)?;
+            del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
         }
-    } else if mode == "read" {
-        let rd_pfx = rd_prefix(path);
-        tx.srem(RD_CF, &rd_pfx, owner)?;
-        del_hold_algorithm(tx, owner, Mode::Read, path)?;
-        if !tx.has_live_member(RD_CF, &rd_pfx)? {
-            remove_descendant_indexes(tx, Mode::Read, path)?;
+        Mode::Write => {
+            let wr_k = wr_key(&key_path);
+            if tx.get_str(WR_CF, &wr_k)?.as_deref() == Some(owner) {
+                tx.del(WR_CF, &wr_k)?;
+                del_hold_algorithm(tx, owner, Mode::Write, &key_path)?;
+                remove_descendant_indexes(tx, Mode::Write, &key_path)?;
+            }
+        }
+        Mode::Read => {
+            let rd_pfx = rd_prefix(&key_path);
+            tx.srem(RD_CF, &rd_pfx, owner)?;
+            del_hold_algorithm(tx, owner, Mode::Read, &key_path)?;
+            if !tx.has_live_member(RD_CF, &rd_pfx)? {
+                remove_descendant_indexes(tx, Mode::Read, &key_path)?;
+            }
         }
     }
     Ok(())
@@ -979,82 +1632,16 @@ pub fn renew_inner<T: StoreTxn>(
     owner: &str,
     ttl_ms: u64,
 ) -> anyhow::Result<RenewOutcome> {
-    let fence_ttl = ttl_ms.max(FENCE_MIN_TTL_MS);
     let alive_k = alive_key(owner);
     let own_pfx = own_prefix(owner);
 
     if tx.get_str(ALIVE_CF, &alive_k)?.is_none() {
-        return Ok(renew_lost("", "missing_alive"));
+        return Ok(renew_lost("", Reason::MissingAlive));
+    }
+    if !tx.has_live_member(OWN_CF, &own_pfx)? {
+        return Ok(renew_lost("", Reason::MissingOwnerSet));
     }
     tx.pexpire_str(ALIVE_CF, &alive_k, ttl_ms)?;
-
-    let held = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
-    if held.is_empty() {
-        return Ok(renew_lost("", "missing_owner_set"));
-    }
-
-    let mut renewed = 0usize;
-
-    for item in &held {
-        match item.find(':') {
-            None => {
-                tx.srem(OWN_CF, &own_pfx, item)?;
-            }
-            Some(sep) => {
-                let mode = &item[..sep];
-                let path = item[sep + 1..].to_string();
-                if mode == "write" {
-                    let lock_algorithm = hold_algorithm(tx, owner, Mode::Write, &path)?;
-                    if lock_algorithm.is_semaphore() {
-                        if !tx.sismember(SEM_CF, &sem_prefix(&path), owner)? {
-                            return Ok(renew_lost(&path, "missing_semaphore"));
-                        }
-                        tx.sadd(SEM_CF, &sem_prefix(&path), owner, ttl_ms)?;
-                        set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl_ms)?;
-                        tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
-                        renewed += 1;
-                        continue;
-                    }
-                    let wr_k = wr_key(&path);
-                    if tx.get_str(WR_CF, &wr_k)?.as_deref() != Some(owner) {
-                        return Ok(renew_lost(&path, "missing_write"));
-                    }
-                    tx.pexpire_str(WR_CF, &wr_k, ttl_ms)?;
-                    let fence_k = fence_key(&path);
-                    if tx.get_str(FENCE_CF, &fence_k)?.is_none() {
-                        return Ok(renew_lost(&path, "missing_fence"));
-                    }
-                    tx.pexpire_str(FENCE_CF, &fence_k, fence_ttl)?;
-                    set_hold_algorithm(tx, owner, Mode::Write, &path, lock_algorithm, ttl_ms)?;
-                    add_descendant_indexes(tx, Mode::Write, &path, ttl_ms)?;
-                    tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
-                    renewed += 1;
-                } else if mode == "read" {
-                    let rd_pfx = rd_prefix(&path);
-                    let owners = prune_dead_read_owners(tx, &path)?;
-                    if owners.is_empty() {
-                        remove_descendant_indexes(tx, Mode::Read, &path)?;
-                    }
-                    if owners.iter().any(|o| o == owner) {
-                        let lock_algorithm = hold_algorithm(tx, owner, Mode::Read, &path)?;
-                        tx.sadd(RD_CF, &rd_pfx, owner, ttl_ms)?;
-                        set_hold_algorithm(tx, owner, Mode::Read, &path, lock_algorithm, ttl_ms)?;
-                        add_descendant_indexes(tx, Mode::Read, &path, ttl_ms)?;
-                        tx.sadd(OWN_CF, &own_pfx, item, ttl_ms)?;
-                        renewed += 1;
-                    } else {
-                        return Ok(renew_lost(&path, "missing_read"));
-                    }
-                } else {
-                    tx.srem(OWN_CF, &own_pfx, item)?;
-                }
-            }
-        }
-    }
-
-    if renewed == 0 {
-        return Ok(renew_lost("", "empty_owner_set"));
-    }
     Ok(RenewOutcome::Ok)
 }
 
@@ -1072,22 +1659,24 @@ pub fn force_release_inner<T: StoreTxn>(tx: &mut T, victim: &str) -> anyhow::Res
 
 pub fn assert_fencing_inner<T: StoreTxn>(
     tx: &mut T,
+    namespace: &str,
     owner: &str,
     fencing_token: i64,
     paths: &[String],
 ) -> anyhow::Result<AssertOutcome> {
     let token_str = fencing_token.to_string();
     for path in paths {
-        if tx.get_str(WR_CF, &wr_key(path))?.as_deref() != Some(owner) {
+        let key_path = scoped_path(namespace, path);
+        if tx.get_str(WR_CF, &wr_key(&key_path))?.as_deref() != Some(owner) {
             return Ok(AssertOutcome::Fail {
                 path: path.clone(),
-                reason: "stale_owner".into(),
+                reason: Reason::StaleOwner,
             });
         }
-        if tx.get_str(FENCE_CF, &fence_key(path))?.as_deref() != Some(token_str.as_str()) {
+        if tx.get_str(FENCE_CF, &fence_key(&key_path))?.as_deref() != Some(token_str.as_str()) {
             return Ok(AssertOutcome::Fail {
                 path: path.clone(),
-                reason: "stale_fencing_token".into(),
+                reason: Reason::StaleFencingToken,
             });
         }
     }
@@ -1102,14 +1691,15 @@ pub fn encode_wait_edge(conflict_owner: &str, metadata: Option<&WaitEdgeMetadata
     let Some(metadata) = metadata else {
         return conflict_owner.to_string();
     };
+    let reason = metadata.reason.as_str();
     format!(
         "{WAIT_EDGE_V1_PREFIX}{}:{}:{}:{}{}{}",
         conflict_owner.len(),
         metadata.conflict_path.len(),
-        metadata.reason.len(),
+        reason.len(),
         conflict_owner,
         metadata.conflict_path,
-        metadata.reason
+        reason
     )
 }
 
@@ -1149,7 +1739,7 @@ pub fn parse_wait_edge(raw: String) -> anyhow::Result<WaitEdge> {
         conflict_owner: conflict_owner.to_string(),
         metadata: Some(WaitEdgeMetadata {
             conflict_path: conflict_path.to_string(),
-            reason: reason.to_string(),
+            reason: reason.parse::<Reason>()?,
         }),
     })
 }
@@ -1182,14 +1772,16 @@ pub fn read_wait_edge<T: StoreTxn>(tx: &mut T, owner: &str) -> anyhow::Result<Op
 
 pub fn is_blocking_inner<T: StoreTxn>(
     tx: &mut T,
+    namespace: &str,
     conflict_path: &str,
     conflict_owner: &str,
-    reason: &str,
+    reason: Reason,
 ) -> anyhow::Result<bool> {
-    let is_read = reason == "read_locked" || reason == "descendant_read_locked";
+    let key_path = scoped_path(namespace, conflict_path);
+    let is_read = matches!(reason, Reason::ReadLocked | Reason::DescendantReadLocked);
 
     if is_read {
-        let rd_pfx = rd_prefix(conflict_path);
+        let rd_pfx = rd_prefix(&key_path);
         if !tx.sismember(RD_CF, &rd_pfx, conflict_owner)? {
             return Ok(false);
         }
@@ -1197,14 +1789,26 @@ pub fn is_blocking_inner<T: StoreTxn>(
             return Ok(true);
         }
         tx.srem(RD_CF, &rd_pfx, conflict_owner)?;
-        del_hold_algorithm(tx, conflict_owner, Mode::Read, conflict_path)?;
+        del_hold_algorithm(tx, conflict_owner, Mode::Read, &key_path)?;
         if !tx.has_live_member(RD_CF, &rd_pfx)? {
-            remove_descendant_indexes(tx, Mode::Read, conflict_path)?;
+            remove_descendant_indexes(tx, Mode::Read, &key_path)?;
         }
         return Ok(false);
     }
 
-    Ok(get_live_write_owner(tx, conflict_path)?.as_deref() == Some(conflict_owner))
+    if reason == Reason::SemaphoreFull {
+        if !tx.sismember(SEM_CF, &sem_prefix(&key_path), conflict_owner)? {
+            return Ok(false);
+        }
+        if tx.get_str(ALIVE_CF, &alive_key(conflict_owner))?.is_some() {
+            return Ok(true);
+        }
+        tx.srem(SEM_CF, &sem_prefix(&key_path), conflict_owner)?;
+        del_hold_algorithm(tx, conflict_owner, Mode::Write, &key_path)?;
+        return Ok(false);
+    }
+
+    Ok(get_live_write_owner(tx, &key_path)?.as_deref() == Some(conflict_owner))
 }
 
 // ---------------------------------------------------------------------------
@@ -1264,13 +1868,18 @@ pub struct LockDumpPage {
     pub next_cursor: Option<Vec<u8>>,
 }
 
-pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result<PathInfo> {
-    let write_owner = match tx.get_str(WR_CF, &wr_key(path))? {
+pub fn inspect_path_inner<T: StoreTxn>(
+    tx: &mut T,
+    namespace: &str,
+    path: &str,
+) -> anyhow::Result<PathInfo> {
+    let key_path = scoped_path(namespace, path);
+    let write_owner = match tx.get_str(WR_CF, &wr_key(&key_path))? {
         Some(owner) if owner_alive(tx, &owner)? => Some(owner),
         _ => None,
     };
 
-    let rd_pfx = rd_prefix(path);
+    let rd_pfx = rd_prefix(&key_path);
     let mut read_owners = Vec::new();
     for owner in tx.smembers_limited(RD_CF, &rd_pfx, MAX_SET_ENUM_MEMBERS)? {
         if owner_alive(tx, &owner)? {
@@ -1278,10 +1887,10 @@ pub fn inspect_path_inner<T: StoreTxn>(tx: &mut T, path: &str) -> anyhow::Result
         }
     }
 
-    let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(path))?);
+    let fence = parse_fence(tx.get_str(FENCE_CF, &fence_key(&key_path))?);
 
     let mut semaphore_owners = Vec::new();
-    for owner in tx.smembers_limited(SEM_CF, &sem_prefix(path), MAX_SET_ENUM_MEMBERS)? {
+    for owner in tx.smembers_limited(SEM_CF, &sem_prefix(&key_path), MAX_SET_ENUM_MEMBERS)? {
         if owner_alive(tx, &owner)? {
             semaphore_owners.push(owner);
         }
@@ -1308,17 +1917,12 @@ pub fn list_owner_locks_inner<T: StoreTxn>(
 
     let mut locks = Vec::with_capacity(members.len());
     for member in members {
-        let Some(sep) = member.find(':') else {
+        let Some(held) = parse_hold_member(&member) else {
             continue;
         };
-        let mode = match &member[..sep] {
-            "write" => Mode::Write,
-            "read" => Mode::Read,
-            _ => continue,
-        };
         locks.push(OwnedLock {
-            path: member[sep + 1..].to_string(),
-            mode,
+            path: held.path.into_string(),
+            mode: held.mode,
         });
     }
     Ok((alive, locks))
@@ -1328,29 +1932,29 @@ pub fn list_owner_locks_inner<T: StoreTxn>(
 // Constructors
 // ---------------------------------------------------------------------------
 
-fn parse_fence(v: Option<String>) -> Option<i64> {
+pub fn parse_fence(v: Option<String>) -> Option<i64> {
     v.and_then(|s| s.parse::<i64>().ok())
 }
 
-fn conflict(path: &str, owner: &str, reason: &str) -> AcquireOutcome {
+fn conflict(path: &str, owner: &str, reason: Reason) -> AcquireOutcome {
     AcquireOutcome::Conflict {
         path: path.to_string(),
         owner: owner.to_string(),
-        reason: reason.to_string(),
+        reason,
     }
 }
 
-fn lost(path: &str, reason: &str) -> AcquireOutcome {
+fn lost(path: &str, reason: Reason) -> AcquireOutcome {
     AcquireOutcome::Lost {
         path: path.to_string(),
-        reason: reason.to_string(),
+        reason,
     }
 }
 
-fn renew_lost(path: &str, reason: &str) -> RenewOutcome {
+fn renew_lost(path: &str, reason: Reason) -> RenewOutcome {
     RenewOutcome::Lost {
         path: path.to_string(),
-        reason: reason.to_string(),
+        reason,
     }
 }
 
@@ -1409,7 +2013,13 @@ mod tests {
     #[test]
     fn lock_algorithm_rejects_removed_aliases() {
         // The legacy synonym set was trimmed to one canonical name per variant.
-        for alias in ["rwlock", "rwlock_no_recursion", "mutex", "flat_write", "bogus"] {
+        for alias in [
+            "rwlock",
+            "rwlock_no_recursion",
+            "mutex",
+            "flat_write",
+            "bogus",
+        ] {
             assert!(
                 alias.parse::<LockAlgorithm>().is_err(),
                 "{alias:?} should no longer parse"
@@ -1442,7 +2052,7 @@ mod tests {
             "owner:with:colons",
             Some(&WaitEdgeMetadata {
                 conflict_path: "h:/a/b".into(),
-                reason: "descendant_write_locked".into(),
+                reason: Reason::DescendantWriteLocked,
             }),
         ))
         .unwrap();
@@ -1451,7 +2061,7 @@ mod tests {
             edge.metadata,
             Some(WaitEdgeMetadata {
                 conflict_path: "h:/a/b".into(),
-                reason: "descendant_write_locked".into()
+                reason: Reason::DescendantWriteLocked
             })
         );
     }

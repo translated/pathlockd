@@ -88,7 +88,7 @@ pub enum StoredRecord {
         v: i64,
     },
     /// Arbitrary binary payload with an expiry (e.g. cached ApplyResponses in
-    /// the dedupe CF). Appended last so existing variant encodings are stable.
+    /// the dedupe CF).
     Bytes {
         v: Vec<u8>,
         exp: u64,
@@ -919,7 +919,7 @@ pub fn dump_owner_holds(
     cursor: Option<Vec<u8>>,
     page: usize,
 ) -> anyhow::Result<crate::engine::LockDumpPage> {
-    use crate::engine::{LockDumpPage, LockEntry, Mode};
+    use crate::engine::{scoped_path, LockDumpPage, LockEntry, Mode};
 
     let mut entries: Vec<LockEntry> = Vec::new();
     let mut alive_memo: HashMap<String, bool> = HashMap::new();
@@ -970,23 +970,21 @@ pub fn dump_owner_holds(
             let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
                 return Ok(true);
             };
-            let Some(mode_sep) = member.find(':') else {
+            let Some(held) = crate::engine::parse_hold_member(&member) else {
                 return Ok(true);
             };
-            let mode = match &member[..mode_sep] {
-                "write" => Mode::Write,
-                "read" => Mode::Read,
-                _ => return Ok(true),
-            };
-            let path = &member[mode_sep + 1..];
+            let namespace = held.namespace.as_str();
+            let mode = held.mode;
+            let path = held.path.as_str();
 
             if !owner_alive(owner, &mut fence_txn)? {
                 return Ok(true);
             }
 
             let fence = if mode == Mode::Write {
+                let key_path = scoped_path(namespace, path);
                 fence_txn
-                    .get_str(store_keys::CF_FENCES, &store_keys::fence_key(path))?
+                    .get_str(store_keys::CF_FENCES, &store_keys::fence_key(&key_path))?
                     .and_then(|s| s.parse::<i64>().ok())
             } else {
                 None
@@ -1016,7 +1014,7 @@ pub fn list_namespace_settings(
     db: &Arc<DB>,
     group: GroupId,
     now_ms: u64,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<crate::engine::NamespacePolicyEntry>> {
     let gp = store_keys::group_prefix(group);
     let start = gp.to_vec();
     let upper = prefix_upper_bound(&gp);
@@ -1028,21 +1026,23 @@ pub fn list_namespace_settings(
         Some(&start),
         upper.as_deref(),
         |full_key, v| {
-            if decode_record_lenient(v)
-                .and_then(|r| live_str(r, now_ms))
-                .is_none()
-            {
+            let Some(raw) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
                 return Ok(true);
-            }
+            };
             let key = &full_key[gp.len()..];
             if let Ok(namespace) = std::str::from_utf8(key) {
-                namespaces.push(namespace.to_string());
+                let policy = crate::engine::parse_namespace_policy_value(&raw)?;
+                namespaces.push(crate::engine::NamespacePolicyEntry {
+                    namespace: namespace.to_string(),
+                    algorithm: policy.algorithm,
+                    epoch: policy.epoch,
+                });
             }
             Ok(true)
         },
     )?;
-    namespaces.sort();
-    namespaces.dedup();
+    namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+    namespaces.dedup_by(|a, b| a.namespace == b.namespace);
     Ok(namespaces)
 }
 
@@ -1081,11 +1081,10 @@ pub fn namespace_has_live_locks(
             let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
                 return Ok(true);
             };
-            let Some(mode_sep) = member.find(':') else {
+            let Some(held) = crate::engine::parse_hold_member(&member) else {
                 return Ok(true);
             };
-            let path = &member[mode_sep + 1..];
-            if !crate::cluster::placement::namespace_contains_path(namespace, path) {
+            if !crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str()) {
                 return Ok(true);
             }
             let alive = match alive_memo.get(owner) {
@@ -1124,9 +1123,6 @@ pub fn collect_namespace_holds(
     let now = txn.now_ms();
     let mut out = Vec::new();
     txn.scan_merged(store_keys::CF_OWNER_HOLDS, None, None, |key, value| {
-        // Owner-holds set key shape: `owner \0 \0 member`; the member value is
-        // `mode:path`. Owner ids never contain NUL, so the first `\0\0` is the
-        // set separator (mirrors `namespace_has_live_locks`).
         let Some(sep) = key.windows(2).position(|w| w == [0, 0]) else {
             return Ok(true);
         };
@@ -1136,13 +1132,15 @@ pub fn collect_namespace_holds(
         let Some(member) = decode_record_lenient(value).and_then(|r| live_str(r, now)) else {
             return Ok(true);
         };
-        let Some(mode_sep) = member.find(':') else {
+        let Some(held) = crate::engine::parse_hold_member(&member) else {
             return Ok(true);
         };
-        let (mode, rest) = member.split_at(mode_sep);
-        let path = &rest[1..]; // skip the ':'
-        if crate::cluster::placement::namespace_contains_path(namespace, path) {
-            out.push((owner.to_string(), mode.to_string(), path.to_string()));
+        if crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str()) {
+            out.push((
+                owner.to_string(),
+                held.mode.as_str().to_string(),
+                held.path.into_string(),
+            ));
         }
         Ok(true)
     })?;
@@ -1541,19 +1539,19 @@ mod tests {
                 60_000,
             )
             .unwrap();
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "write:h:/a", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "write\0h\0h:/a", 60_000)
                 .unwrap();
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "read:h:/b", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "read\0h\0h:/b", 60_000)
                 .unwrap();
             txn.set_str(
                 store_keys::CF_FENCES,
-                &store_keys::fence_key("h:/a"),
+                &store_keys::fence_key(&crate::engine::scoped_path("h", "h:/a")),
                 "7",
                 60_000,
             )
             .unwrap();
             // A dead owner's residue must not be reported.
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &ghost, "write:h:/g", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &ghost, "write\0h\0h:/g", 60_000)
                 .unwrap();
             txn.commit().unwrap();
         }
@@ -1586,7 +1584,7 @@ mod tests {
                 txn.sadd(
                     store_keys::CF_OWNER_HOLDS,
                     &alice,
-                    &format!("read:h:/p{i}"),
+                    &format!("read\0h\0h:/p{i}"),
                     60_000,
                 )
                 .unwrap();

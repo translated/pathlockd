@@ -185,7 +185,7 @@ impl Default for Config {
             gossip_foca_periodic: true,
             gossip_send_queue_depth: 1024,
             seed_nodes: Vec::new(),
-            group_count: 32,
+            group_count: 256,
             routing_prefix_segments: 1,
             default_lock_algorithm: LockAlgorithm::RecursiveRw,
             replication_factor: 3,
@@ -694,8 +694,7 @@ mod tests {
     #[test]
     fn file_config_parses_and_overrides_default_lock_algorithm() {
         let mut cfg = Config::default();
-        let file: FileConfig =
-            toml::from_str("default_lock_algorithm = \"point_write\"").unwrap();
+        let file: FileConfig = toml::from_str("default_lock_algorithm = \"point_write\"").unwrap();
         apply_file(&mut cfg, file);
         assert_eq!(cfg.default_lock_algorithm, LockAlgorithm::PointWrite);
     }

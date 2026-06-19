@@ -5,7 +5,9 @@
 
 use std::sync::Arc;
 
-use pathlockd::engine::{AcquireArgs, AcquireOutcome, LockReq, Mode, RelReq, State};
+use pathlockd::engine::{
+    AcquireArgs, AcquireOutcome, LockAlgorithm, LockPolicy, LockReq, Mode, Reason, RelReq, State,
+};
 use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
 use pathlockd::store_keys;
@@ -41,6 +43,29 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
     }
 }
 
+fn namespace_of_args(args: &AcquireArgs) -> String {
+    args.requests
+        .iter()
+        .map(|r| store_keys::handler_of(&r.path))
+        .chain(
+            args.release_requests
+                .iter()
+                .map(|r| store_keys::handler_of(&r.path)),
+        )
+        .next()
+        .unwrap_or("h")
+        .to_string()
+}
+
+fn acquire_op(args: AcquireArgs) -> Op {
+    let namespace = namespace_of_args(&args);
+    Op::AcquireInNamespace {
+        namespace,
+        policy: LockPolicy::from_algorithm(LockAlgorithm::RecursiveRw),
+        args,
+    }
+}
+
 fn apply(db: &Arc<rocksdb::DB>, cmd: Command) -> ApplyResponse {
     state_machine::apply(db, G, &cmd).unwrap()
 }
@@ -63,7 +88,7 @@ fn crash_after_commit_state_survives() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
             },
         );
         apply(
@@ -71,7 +96,7 @@ fn crash_after_commit_state_survives() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/b")])),
+                op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/b")])),
             },
         );
         // Drop the DB handle (simulates process crash — RocksDB flushes on drop)
@@ -85,16 +110,25 @@ fn crash_after_commit_state_survives() {
 
         // Alice should still hold h:/a
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/a",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
 
         // Bob should still hold h:/b
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "bob").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/b", "bob", "write_locked").unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/b",
+            "bob",
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 }
 
@@ -116,7 +150,7 @@ fn crash_after_commit_sequence_preserves_all_mutations() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     "alice",
                     60_000,
                     1,
@@ -130,7 +164,7 @@ fn crash_after_commit_sequence_preserves_all_mutations() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(AcquireArgs {
+                op: acquire_op(AcquireArgs {
                     owner_id: "alice".into(),
                     ttl_ms: 60_000,
                     fencing_token: 1,
@@ -152,6 +186,7 @@ fn crash_after_commit_sequence_preserves_all_mutations() {
                 request_id: None,
                 now_ms: now + 2,
                 op: Op::Release {
+                    namespace: "h".into(),
                     owner: "alice".into(),
                     reqs: vec![RelReq {
                         path: "h:/b".into(),
@@ -191,19 +226,32 @@ fn crash_after_commit_sequence_preserves_all_mutations() {
         let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 10);
 
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/a",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
         // h:/b should be free
-        assert!(
-            !pathlockd::engine::is_blocking_inner(&mut txn, "h:/b", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(!pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/b",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
         // h:/c has a read lock
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/c", "alice", "read_locked").unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/c",
+            "alice",
+            Reason::ReadLocked
+        )
+        .unwrap());
     }
 }
 
@@ -225,7 +273,7 @@ fn crash_before_apply_mutations_disappear() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/keep")])),
+                op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/keep")])),
             },
         );
 
@@ -241,17 +289,25 @@ fn crash_before_apply_mutations_disappear() {
         let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
 
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/keep", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/keep",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
 
         // bob's lock should NOT exist (never committed)
         assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "bob").unwrap());
-        assert!(
-            !pathlockd::engine::is_blocking_inner(&mut txn, "h:/lost", "bob", "write_locked")
-                .unwrap()
-        );
+        assert!(!pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/lost",
+            "bob",
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 }
 
@@ -275,7 +331,7 @@ fn write_batch_atomicity_per_command() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
             },
         );
 
@@ -286,7 +342,7 @@ fn write_batch_atomicity_per_command() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     "alice",
                     30_000,
                     2,
@@ -310,14 +366,23 @@ fn write_batch_atomicity_per_command() {
         // Alice should not be alive (her failed acquire was rolled back)
         assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
         // Bob still holds h:/a
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "bob", "write_locked").unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/a",
+            "bob",
+            Reason::WriteLocked
+        )
+        .unwrap());
         // h:/b should be free (Alice's partial write was rolled back)
-        assert!(
-            !pathlockd::engine::is_blocking_inner(&mut txn, "h:/b", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(!pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/b",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 }
 
@@ -340,7 +405,7 @@ fn checkpoint_preserves_full_state() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     "alice",
                     120_000,
                     10,
@@ -353,7 +418,7 @@ fn checkpoint_preserves_full_state() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(AcquireArgs {
+                op: acquire_op(AcquireArgs {
                     owner_id: "bob".into(),
                     ttl_ms: 60_000,
                     fencing_token: 20,
@@ -382,25 +447,43 @@ fn checkpoint_preserves_full_state() {
 
         // Alice: alive + write locks on h:/x and h:/y
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/x", "alice", "write_locked")
-                .unwrap()
-        );
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/y", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/x",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/y",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
 
         // Bob: alive + read lock on h:/z
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "bob").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/z", "bob", "read_locked").unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/z",
+            "bob",
+            Reason::ReadLocked
+        )
+        .unwrap());
 
         // Fencing tokens
-        let outcome =
-            pathlockd::engine::assert_fencing_inner(&mut txn, "alice", 10, &["h:/x".to_string()])
-                .unwrap();
+        let outcome = pathlockd::engine::assert_fencing_inner(
+            &mut txn,
+            "h",
+            "alice",
+            10,
+            &["h:/x".to_string()],
+        )
+        .unwrap();
         assert_eq!(outcome, pathlockd::engine::AssertOutcome::Ok);
     }
 }
@@ -426,7 +509,7 @@ fn repeated_crash_recovery_cycle() {
                 Command {
                     request_id: None,
                     now_ms: now,
-                    op: Op::Acquire(acquire_args(
+                    op: acquire_op(acquire_args(
                         &owner,
                         300_000,
                         (cycle + 1) as i64,
@@ -450,8 +533,14 @@ fn repeated_crash_recovery_cycle() {
                     "cycle {cycle}: owner {owner} should be alive"
                 );
                 assert!(
-                    pathlockd::engine::is_blocking_inner(&mut txn, &path, &owner, "write_locked")
-                        .unwrap(),
+                    pathlockd::engine::is_blocking_inner(
+                        &mut txn,
+                        "h",
+                        &path,
+                        &owner,
+                        Reason::WriteLocked
+                    )
+                    .unwrap(),
                     "cycle {cycle}: {path} should be held by {owner}"
                 );
             }
@@ -477,7 +566,7 @@ fn clock_skew_forward_jump_does_not_expire_early() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("alice", 30_000, 1, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("alice", 30_000, 1, vec![wr("h:/a")])),
             },
         );
     }
@@ -491,10 +580,14 @@ fn clock_skew_forward_jump_does_not_expire_early() {
         let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, recovery_time);
         // Alice should still be alive (30s TTL from 100000 = expires at 130000)
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/a",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 
     // Recovery after TTL would expire
@@ -504,10 +597,14 @@ fn clock_skew_forward_jump_does_not_expire_early() {
 
         let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, expired_time);
         assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap());
-        assert!(
-            !pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked")
-                .unwrap()
-        );
+        assert!(!pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            "h:/a",
+            "alice",
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 }
 
@@ -528,7 +625,7 @@ fn gc_sweep_after_expiry_makes_locks_invisible() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("short-lived", 1, 1, vec![wr("h:/ephemeral")])),
+                op: acquire_op(acquire_args("short-lived", 1, 1, vec![wr("h:/ephemeral")])),
             },
         );
         apply(
@@ -536,7 +633,7 @@ fn gc_sweep_after_expiry_makes_locks_invisible() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     "long-lived",
                     300_000,
                     2,
@@ -569,9 +666,10 @@ fn gc_sweep_after_expiry_makes_locks_invisible() {
         assert!(!pathlockd::engine::is_owner_alive_inner(&mut txn, "short-lived").unwrap());
         assert!(!pathlockd::engine::is_blocking_inner(
             &mut txn,
+            "h",
             "h:/ephemeral",
             "short-lived",
-            "write_locked"
+            Reason::WriteLocked
         )
         .unwrap());
 
@@ -579,9 +677,10 @@ fn gc_sweep_after_expiry_makes_locks_invisible() {
         assert!(pathlockd::engine::is_owner_alive_inner(&mut txn, "long-lived").unwrap());
         assert!(pathlockd::engine::is_blocking_inner(
             &mut txn,
+            "h",
             "h:/permanent",
             "long-lived",
-            "write_locked"
+            Reason::WriteLocked
         )
         .unwrap());
     }
@@ -647,6 +746,7 @@ fn release_of_unlocked_path_is_idempotent() {
                 request_id: None,
                 now_ms: now,
                 op: Op::Release {
+                    namespace: "h".into(),
                     owner: "nobody".into(),
                     reqs: vec![RelReq {
                         path: "h:/void".into(),
@@ -691,11 +791,11 @@ fn concurrent_disjoint_acquires_do_not_conflict() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args(owner, 60_000, (i + 1) as i64, vec![wr(&path)])),
+                op: acquire_op(acquire_args(owner, 60_000, (i + 1) as i64, vec![wr(&path)])),
             },
         );
         assert!(
-            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
             "owner {owner} should acquire {path}"
         );
     }
@@ -704,8 +804,13 @@ fn concurrent_disjoint_acquires_do_not_conflict() {
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     for (i, owner) in ["alice", "bob", "carol", "dave"].iter().enumerate() {
         let path = format!("h:/tree-{i}");
-        assert!(
-            pathlockd::engine::is_blocking_inner(&mut txn, &path, owner, "write_locked").unwrap()
-        );
+        assert!(pathlockd::engine::is_blocking_inner(
+            &mut txn,
+            "h",
+            &path,
+            owner,
+            Reason::WriteLocked
+        )
+        .unwrap());
     }
 }

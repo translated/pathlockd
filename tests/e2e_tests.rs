@@ -11,8 +11,8 @@ use pathlockd::proto::{
     AcquireRequest, AcquireStatus, AssertFencingRequest, AssertStatus, CycleKind,
     DeleteNamespacePolicyRequest, DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest,
     GetNamespacePolicyRequest, IsOwnerAliveRequest, ListOwnerLocksRequest,
-    LockAlgorithm as ProtoLockAlgorithm, LockRequest, LockState, Mode, ReleaseLocksRequest,
-    RenewRequest, RenewStatus, SetNamespacePolicyRequest, SetWaitEdgeRequest,
+    LockAlgorithm as ProtoLockAlgorithm, LockRequest, LockState, Mode, ReasonCode,
+    ReleaseLocksRequest, RenewRequest, RenewStatus, SetNamespacePolicyRequest, SetWaitEdgeRequest,
 };
 use tonic::transport::Channel;
 
@@ -28,6 +28,14 @@ struct Daemon {
     _dir: tempfile::TempDir,
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[allow(clippy::zombie_processes)]
 async fn start_daemon() -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -254,7 +262,7 @@ async fn e2e_namespace_policy_set_get_and_apply() {
         .unwrap()
         .into_inner();
     assert_eq!(read_resp.status(), AcquireStatus::Conflict);
-    assert_eq!(read_resp.reason, "read_locks_disabled");
+    assert_eq!(read_resp.reason, ReasonCode::ReadLocksDisabled as i32);
 
     daemon
         .client
@@ -296,7 +304,7 @@ async fn e2e_namespace_policy_set_get_and_apply() {
         .unwrap()
         .into_inner();
     assert_eq!(path_read.status(), AcquireStatus::Conflict);
-    assert_eq!(path_read.reason, "read_locks_disabled");
+    assert_eq!(path_read.reason, ReasonCode::ReadLocksDisabled as i32);
 
     daemon
         .client
@@ -404,7 +412,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
         .into_inner();
     assert_eq!(resp.status(), AcquireStatus::Queued);
     assert_eq!(resp.owner, "bulk-owner");
-    assert_eq!(resp.reason, "write_locked");
+    assert_eq!(resp.reason, ReasonCode::WriteLocked as i32);
 }
 
 #[tokio::test]
@@ -726,7 +734,7 @@ async fn e2e_detect_cycle() {
             conflict_owner: "b".into(),
             ttl_ms: 30000,
             conflict_path: "h:/x".into(),
-            reason: "write_locked".into(),
+            reason: ReasonCode::WriteLocked as i32,
             idempotency_key: String::new(),
         })
         .await
@@ -739,7 +747,7 @@ async fn e2e_detect_cycle() {
             conflict_owner: "a".into(),
             ttl_ms: 30000,
             conflict_path: "h:/y".into(),
-            reason: "write_locked".into(),
+            reason: ReasonCode::WriteLocked as i32,
             idempotency_key: String::new(),
         })
         .await
@@ -796,7 +804,7 @@ async fn e2e_dump_locks() {
 
     // DumpLocks may or may not return entries depending on implementation.
     // At minimum, verify the response is well-formed.
-    assert_eq!(resp.done, true);
+    assert!(resp.done);
 
     daemon.child.kill().ok();
 }

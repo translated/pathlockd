@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, AssertOutcome, LockAlgorithm, LockReq, Mode, RelReq, RenewOutcome,
-    State, WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, AssertOutcome, LockAlgorithm, LockPolicy, LockReq, Mode, Reason,
+    RelReq, RenewOutcome, State, WaitEdgeMetadata,
 };
 use pathlockd::raft::command::{ApplyResponse, Command, Op};
 use pathlockd::raft::state_machine;
@@ -91,6 +91,54 @@ fn acquire_args(owner: &str, ttl_ms: u64, fence_token: i64, reqs: Vec<LockReq>) 
     }
 }
 
+fn namespace_of_args(args: &AcquireArgs) -> String {
+    args.requests
+        .iter()
+        .map(|r| store_keys::handler_of(&r.path))
+        .chain(
+            args.release_requests
+                .iter()
+                .map(|r| store_keys::handler_of(&r.path)),
+        )
+        .next()
+        .unwrap_or("h")
+        .to_string()
+}
+
+fn test_algorithm(namespace: &str) -> LockAlgorithm {
+    match namespace {
+        "sem" => LockAlgorithm::Semaphore,
+        "sem3" => LockAlgorithm::Semaphore,
+        "prw" => LockAlgorithm::PointRw,
+        "pt" | "pw" => LockAlgorithm::PointWrite,
+        "rec" => LockAlgorithm::RecursiveWrite,
+        _ => LockAlgorithm::RecursiveRw,
+    }
+}
+
+fn test_policy(namespace: &str) -> LockPolicy {
+    let algorithm = test_algorithm(namespace);
+    LockPolicy::new(algorithm, 0)
+}
+
+fn acquire_op(args: AcquireArgs) -> Op {
+    let namespace = namespace_of_args(&args);
+    Op::AcquireInNamespace {
+        policy: test_policy(&namespace),
+        namespace,
+        args,
+    }
+}
+
+fn acquire_op_with_algorithm(args: AcquireArgs, algorithm: LockAlgorithm) -> Op {
+    let namespace = namespace_of_args(&args);
+    Op::AcquireInNamespace {
+        policy: LockPolicy::new(algorithm, 0),
+        namespace,
+        args,
+    }
+}
+
 fn set_policy(db: &Arc<rocksdb::DB>, now_ms: u64, namespace: &str, algorithm: LockAlgorithm) {
     // A policy change force-clears locks under the namespace when the effective
     // algorithm changes, so the response is either `Unit` (no change, or an
@@ -118,10 +166,13 @@ fn acquire_root_write_succeeds() {
     let cmd = Command {
         request_id: None,
         now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 30_000, 1, vec![wr("h:/")])),
+        op: acquire_op(acquire_args("alice", 30_000, 1, vec![wr("h:/")])),
     };
     let resp = apply(&db, cmd);
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -133,18 +184,18 @@ fn acquire_rejects_ancestor_write_block() {
     let cmd = Command {
         request_id: None,
         now_ms: now,
-        op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/")])),
+        op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/")])),
     };
     assert!(matches!(
         apply(&db, cmd),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Bob tries to lock a descendant
     let cmd = Command {
         request_id: None,
         now_ms: now + 1,
-        op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+        op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
     };
     match apply(&db, cmd) {
         ApplyResponse::Acquire(
@@ -157,11 +208,12 @@ fn acquire_rejects_ancestor_write_block() {
                 path,
                 owner,
                 reason,
+                ..
             },
         ) => {
             assert_eq!(path, "h:/");
             assert_eq!(owner, "alice");
-            assert_eq!(reason, "ancestor_locked");
+            assert_eq!(reason, Reason::AncestorLocked);
         }
         other => panic!("expected Conflict, got {:?}", other),
     }
@@ -178,7 +230,7 @@ fn descendant_write_rejects_ancestor_write_acquire() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b")])),
         },
     );
 
@@ -188,7 +240,7 @@ fn descendant_write_rejects_ancestor_write_acquire() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
         },
     );
     match resp {
@@ -202,10 +254,11 @@ fn descendant_write_rejects_ancestor_write_acquire() {
                 path,
                 owner,
                 reason,
+                ..
             },
         ) => {
             assert_eq!(owner, "alice");
-            assert!(reason.contains("descendant"));
+            assert!(reason.as_str().contains("descendant"));
             assert!(path.starts_with("h:/a"));
         }
         other => panic!("expected Conflict, got {:?}", other),
@@ -223,7 +276,7 @@ fn read_write_share_if_same_path() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
         },
     );
 
@@ -233,10 +286,13 @@ fn read_write_share_if_same_path() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // Carol tries a write → conflict (read_locked)
     let resp = apply(
@@ -244,14 +300,14 @@ fn read_write_share_if_same_path() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("carol", 30_000, 3, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("carol", 30_000, 3, vec![wr("h:/a")])),
         },
     );
     match resp {
         ApplyResponse::Acquire(
             AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. },
         ) => {
-            assert_eq!(reason, "read_locked");
+            assert_eq!(reason, Reason::ReadLocked);
         }
         other => panic!("expected Conflict, got {:?}", other),
     }
@@ -268,7 +324,7 @@ fn reads_are_point_only() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b/c")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b/c")])),
         },
     );
 
@@ -278,10 +334,13 @@ fn reads_are_point_only() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 0, vec![rd("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -295,7 +354,7 @@ fn ancestor_write_blocked_by_descendant_read() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
         },
     );
 
@@ -305,7 +364,7 @@ fn ancestor_write_blocked_by_descendant_read() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
         },
     );
     match resp {
@@ -319,11 +378,12 @@ fn ancestor_write_blocked_by_descendant_read() {
                 path,
                 owner,
                 reason,
+                ..
             },
         ) => {
             assert_eq!(path, "h:/a/b/c");
             assert_eq!(owner, "alice");
-            assert_eq!(reason, "descendant_read_locked");
+            assert_eq!(reason, Reason::DescendantReadLocked);
         }
         other => panic!("expected descendant_read_locked conflict, got {other:?}"),
     }
@@ -335,6 +395,7 @@ fn ancestor_write_blocked_by_descendant_read() {
             request_id: None,
             now_ms: now + 2,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a/b/c", Mode::Read)],
                 del_wait: false,
@@ -346,10 +407,13 @@ fn ancestor_write_blocked_by_descendant_read() {
         Command {
             request_id: None,
             now_ms: now + 3,
-            op: Op::Acquire(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -367,7 +431,7 @@ fn combined_acquire_and_release_keeps_owner_alive() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 1, vec![wr("h:/old")])),
+            op: acquire_op(acquire_args("alice", 1, 1, vec![wr("h:/old")])),
         },
     );
 
@@ -385,10 +449,13 @@ fn combined_acquire_and_release_keeps_owner_alive() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // Alice must still be alive and own /new.
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
@@ -396,7 +463,7 @@ fn combined_acquire_and_release_keeps_owner_alive() {
         pathlockd::engine::is_owner_alive_inner(&mut txn, "alice").unwrap(),
         "owner lost liveness after combined acquire/release"
     );
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/new").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/new").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
 }
 
@@ -411,7 +478,7 @@ fn release_unlocks_path() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -422,6 +489,7 @@ fn release_unlocks_path() {
             request_id: None,
             now_ms: now + 1,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a", Mode::Write)],
                 del_wait: false,
@@ -435,10 +503,13 @@ fn release_unlocks_path() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -460,7 +531,7 @@ fn release_all_clears_everything() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
 
@@ -485,11 +556,11 @@ fn release_all_clears_everything() {
             Command {
                 request_id: None,
                 now_ms: now + 2,
-                op: Op::Acquire(args),
+                op: acquire_op(args),
             },
         );
         assert!(
-            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+            matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
             "failed on {path}"
         );
     }
@@ -506,7 +577,7 @@ fn renew_extends_lease() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 5_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 5_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -538,10 +609,13 @@ fn renew_extends_lease() {
         Command {
             request_id: None,
             now_ms: now + 6_000,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -555,7 +629,7 @@ fn renew_lost_when_owner_expired() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 5_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 5_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -588,7 +662,7 @@ fn force_release_clears_owner() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -610,10 +684,13 @@ fn force_release_clears_owner() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -627,25 +704,26 @@ fn assert_fencing_validates_ownership() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
     // Read-only check via StoreTxn
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     let outcome =
-        pathlockd::engine::assert_fencing_inner(&mut txn, "alice", 1, &["h:/a".to_string()])
+        pathlockd::engine::assert_fencing_inner(&mut txn, "h", "alice", 1, &["h:/a".to_string()])
             .unwrap();
     assert_eq!(outcome, AssertOutcome::Ok);
 
     // Wrong owner
     let outcome =
-        pathlockd::engine::assert_fencing_inner(&mut txn, "bob", 1, &["h:/a".to_string()]).unwrap();
+        pathlockd::engine::assert_fencing_inner(&mut txn, "h", "bob", 1, &["h:/a".to_string()])
+            .unwrap();
     assert_eq!(
         outcome,
         AssertOutcome::Fail {
             path: "h:/a".to_string(),
-            reason: "stale_owner".to_string()
+            reason: Reason::StaleOwner
         }
     );
 }
@@ -661,7 +739,7 @@ fn fencing_token_rejects_stale_token() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 10, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 10, vec![wr("h:/a")])),
         },
     );
 
@@ -679,14 +757,14 @@ fn fencing_token_rejects_stale_token() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
     match resp {
         ApplyResponse::Acquire(
             AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. },
         ) => {
-            assert_eq!(reason, "stale_fencing_token");
+            assert_eq!(reason, Reason::StaleFencingToken);
         }
         other => panic!("expected Conflict, got {:?}", other),
     }
@@ -732,7 +810,7 @@ fn dead_owner_pruning_unblocks_contender() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 1, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -742,10 +820,13 @@ fn dead_owner_pruning_unblocks_contender() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -759,7 +840,7 @@ fn wait_edge_cycle_detection() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
+            op: acquire_op(acquire_args("a", 60_000, 1, vec![wr("h:/x")])),
         },
     );
     apply(
@@ -767,14 +848,14 @@ fn wait_edge_cycle_detection() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
+            op: acquire_op(acquire_args("b", 60_000, 2, vec![wr("h:/y")])),
         },
     );
 
     // Owner A waits on B
     let meta = WaitEdgeMetadata {
         conflict_path: "h:/x".into(),
-        reason: "write_locked".into(),
+        reason: Reason::WriteLocked,
     };
     apply(
         &db,
@@ -811,9 +892,15 @@ fn wait_edge_cycle_detection() {
 
     // With alive owners, verify the wait edges via is_blocking
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    assert!(pathlockd::engine::is_blocking_inner(&mut txn, "h:/x", "a", "write_locked").unwrap());
+    assert!(
+        pathlockd::engine::is_blocking_inner(&mut txn, "h", "h:/x", "a", Reason::WriteLocked)
+            .unwrap()
+    );
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    assert!(pathlockd::engine::is_blocking_inner(&mut txn, "h:/y", "b", "write_locked").unwrap());
+    assert!(
+        pathlockd::engine::is_blocking_inner(&mut txn, "h", "h:/y", "b", Reason::WriteLocked)
+            .unwrap()
+    );
 }
 
 #[test]
@@ -827,7 +914,7 @@ fn gc_sweep_cleans_expiry_entries() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 100, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 100, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -869,7 +956,7 @@ fn inline_release_shadows_acquired_paths() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
 
@@ -888,10 +975,13 @@ fn inline_release_shadows_acquired_paths() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // Bob cannot acquire /a/b because ancestor /a is still locked by Alice
     let resp = apply(
@@ -899,7 +989,7 @@ fn inline_release_shadows_acquired_paths() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a/b")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a/b")])),
         },
     );
     assert!(matches!(
@@ -914,6 +1004,7 @@ fn inline_release_shadows_acquired_paths() {
             request_id: None,
             now_ms: now + 3,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a", Mode::Write)],
                 del_wait: false,
@@ -927,11 +1018,11 @@ fn inline_release_shadows_acquired_paths() {
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("bob", 30_000, 3, vec![wr("h:/a/b")])),
+            op: acquire_op(acquire_args("bob", 30_000, 3, vec![wr("h:/a/b")])),
         },
     );
     assert!(
-        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
         "Bob should acquire after Alice releases ancestor"
     );
 }
@@ -947,7 +1038,7 @@ fn disjoint_handlers_dont_conflict() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("google_drive:/")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("google_drive:/")])),
         },
     );
 
@@ -957,10 +1048,13 @@ fn disjoint_handlers_dont_conflict() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("s3:/")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("s3:/")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -986,10 +1080,13 @@ fn multi_domain_acquire_is_rejected() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -1003,17 +1100,27 @@ fn is_blocking_detects_write_block() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    assert!(
-        pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "write_locked").unwrap()
-    );
-    assert!(
-        !pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "bob", "write_locked").unwrap()
-    );
+    assert!(pathlockd::engine::is_blocking_inner(
+        &mut txn,
+        "h",
+        "h:/a",
+        "alice",
+        Reason::WriteLocked
+    )
+    .unwrap());
+    assert!(!pathlockd::engine::is_blocking_inner(
+        &mut txn,
+        "h",
+        "h:/a",
+        "bob",
+        Reason::WriteLocked
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1027,14 +1134,19 @@ fn is_blocking_detects_read_block() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
         },
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    assert!(
-        pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "read_locked").unwrap()
-    );
+    assert!(pathlockd::engine::is_blocking_inner(
+        &mut txn,
+        "h",
+        "h:/a",
+        "alice",
+        Reason::ReadLocked
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1048,7 +1160,7 @@ fn renew_lost_does_not_extend_liveness() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 1, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1075,10 +1187,13 @@ fn renew_lost_does_not_extend_liveness() {
         Command {
             request_id: None,
             now_ms: now + 3,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -1092,7 +1207,7 @@ fn expired_read_owner_is_pruned() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 1, 0, vec![rd("h:/a")])),
         },
     );
 
@@ -1102,10 +1217,13 @@ fn expired_read_owner_is_pruned() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 1, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1241,7 @@ fn read_blocked_by_ancestor_write() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1133,7 +1251,7 @@ fn read_blocked_by_ancestor_write() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 0, vec![rd("h:/a/b")])),
+            op: acquire_op(acquire_args("bob", 30_000, 0, vec![rd("h:/a/b")])),
         },
     );
     match resp {
@@ -1147,11 +1265,12 @@ fn read_blocked_by_ancestor_write() {
                 path,
                 owner,
                 reason,
+                ..
             },
         ) => {
             assert_eq!(path, "h:/a");
             assert_eq!(owner, "alice");
-            assert_eq!(reason, "ancestor_locked");
+            assert_eq!(reason, Reason::AncestorLocked);
         }
         other => panic!("expected ancestor_locked, got {:?}", other),
     }
@@ -1168,7 +1287,7 @@ fn read_blocked_by_self_write() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1178,7 +1297,7 @@ fn read_blocked_by_self_write() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("bob", 30_000, 0, vec![rd("h:/a")])),
         },
     );
     match resp {
@@ -1192,11 +1311,12 @@ fn read_blocked_by_self_write() {
                 path,
                 owner,
                 reason,
+                ..
             },
         ) => {
             assert_eq!(path, "h:/a");
             assert_eq!(owner, "alice");
-            assert_eq!(reason, "write_locked");
+            assert_eq!(reason, Reason::WriteLocked);
         }
         other => panic!("expected write_locked, got {:?}", other),
     }
@@ -1217,7 +1337,7 @@ fn new_write_stale_fencing_token_is_rejected() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 10, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 1, 10, vec![wr("h:/a")])),
         },
     );
 
@@ -1228,7 +1348,7 @@ fn new_write_stale_fencing_token_is_rejected() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 1, 20, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 1, 20, vec![wr("h:/a")])),
         },
     );
 
@@ -1239,14 +1359,14 @@ fn new_write_stale_fencing_token_is_rejected() {
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("alice", 60_000, 10, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 10, vec![wr("h:/a")])),
         },
     );
     match resp {
         ApplyResponse::Acquire(
             AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. },
         ) => {
-            assert_eq!(reason, "stale_fencing_token");
+            assert_eq!(reason, Reason::StaleFencingToken);
         }
         other => panic!("expected stale_fencing_token, got {:?}", other),
     }
@@ -1267,7 +1387,7 @@ fn same_owner_reacquire_is_idempotent() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1277,10 +1397,13 @@ fn same_owner_reacquire_is_idempotent() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 2, vec![wr("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -1294,7 +1417,7 @@ fn same_owner_read_and_write_same_path() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1304,10 +1427,13 @@ fn same_owner_read_and_write_same_path() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,7 +1451,7 @@ fn held_read_missing_returns_lost() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/unrelated")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/unrelated")])),
         },
     );
 
@@ -1335,7 +1461,7 @@ fn held_read_missing_returns_lost() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(AcquireArgs {
+            op: acquire_op(AcquireArgs {
                 owner_id: "alice".into(),
                 ttl_ms: 60_000,
                 fencing_token: 0,
@@ -1348,7 +1474,7 @@ fn held_read_missing_returns_lost() {
     match resp {
         ApplyResponse::Acquire(AcquireOutcome::Lost { path, reason }) => {
             assert_eq!(path, "h:/a");
-            assert_eq!(reason, "missing_read");
+            assert_eq!(reason, Reason::MissingRead);
         }
         other => panic!("expected Lost missing_read, got {:?}", other),
     }
@@ -1365,7 +1491,7 @@ fn held_write_with_wrong_owner_returns_lost() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1375,7 +1501,7 @@ fn held_write_with_wrong_owner_returns_lost() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/unrelated")])),
+            op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/unrelated")])),
         },
     );
 
@@ -1385,7 +1511,7 @@ fn held_write_with_wrong_owner_returns_lost() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(AcquireArgs {
+            op: acquire_op(AcquireArgs {
                 owner_id: "bob".into(),
                 ttl_ms: 60_000,
                 fencing_token: 3,
@@ -1398,7 +1524,7 @@ fn held_write_with_wrong_owner_returns_lost() {
     match resp {
         ApplyResponse::Acquire(AcquireOutcome::Lost { path, reason }) => {
             assert_eq!(path, "h:/a");
-            assert_eq!(reason, "missing_write");
+            assert_eq!(reason, Reason::MissingWrite);
         }
         other => panic!("expected Lost missing_write, got {:?}", other),
     }
@@ -1419,7 +1545,7 @@ fn combined_held_and_new_in_same_op() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1437,15 +1563,18 @@ fn combined_held_and_new_in_same_op() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // Alice now holds both
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    let info_a = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
-    let info_b = pathlockd::engine::inspect_path_inner(&mut txn, "h:/b").unwrap();
+    let info_a = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
+    let info_b = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/b").unwrap();
     assert_eq!(info_a.write_owner.as_deref(), Some("alice"));
     assert_eq!(info_b.write_owner.as_deref(), Some("alice"));
 }
@@ -1469,16 +1598,17 @@ fn is_blocking_descendant_read_locked() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a/b/c")])),
         },
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
     assert!(pathlockd::engine::is_blocking_inner(
         &mut txn,
+        "h",
         "h:/a/b/c",
         "alice",
-        "descendant_read_locked"
+        Reason::DescendantReadLocked
     )
     .unwrap());
 }
@@ -1493,14 +1623,19 @@ fn is_blocking_rejects_wrong_owner() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    assert!(
-        !pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "bob", "write_locked").unwrap()
-    );
+    assert!(!pathlockd::engine::is_blocking_inner(
+        &mut txn,
+        "h",
+        "h:/a",
+        "bob",
+        Reason::WriteLocked
+    )
+    .unwrap());
 }
 
 #[test]
@@ -1514,18 +1649,23 @@ fn is_blocking_dead_owner_prunes_read() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 1, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 1, 0, vec![rd("h:/a")])),
         },
     );
 
     // After TTL, is_blocking should return false (owner dead, pruned)
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    assert!(
-        !pathlockd::engine::is_blocking_inner(&mut txn, "h:/a", "alice", "read_locked").unwrap()
-    );
+    assert!(!pathlockd::engine::is_blocking_inner(
+        &mut txn,
+        "h",
+        "h:/a",
+        "alice",
+        Reason::ReadLocked
+    )
+    .unwrap());
 
     // Also check that the read entry is now gone (pruned)
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
     assert!(info.read_owners.is_empty());
 }
 
@@ -1548,7 +1688,7 @@ fn multiple_readers_on_same_path() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
         },
     );
 
@@ -1558,10 +1698,13 @@ fn multiple_readers_on_same_path() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // Carol reads same path → ok
     let resp = apply(
@@ -1569,14 +1712,17 @@ fn multiple_readers_on_same_path() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("carol", 60_000, 0, vec![rd("h:/a")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 
     // All three appear in inspect
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
     assert_eq!(info.read_owners.len(), 3);
 }
 
@@ -1590,7 +1736,7 @@ fn release_one_reader_preserves_others() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("h:/a")])),
         },
     );
     apply(
@@ -1598,7 +1744,7 @@ fn release_one_reader_preserves_others() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 0, vec![rd("h:/a")])),
         },
     );
 
@@ -1609,6 +1755,7 @@ fn release_one_reader_preserves_others() {
             request_id: None,
             now_ms: now + 2,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a", Mode::Read)],
                 del_wait: false,
@@ -1622,14 +1769,14 @@ fn release_one_reader_preserves_others() {
         Command {
             request_id: None,
             now_ms: now + 3,
-            op: Op::Acquire(acquire_args("carol", 30_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("carol", 30_000, 1, vec![wr("h:/a")])),
         },
     );
     match resp {
         ApplyResponse::Acquire(
             AcquireOutcome::Conflict { reason, .. } | AcquireOutcome::Queued { reason, .. },
         ) => {
-            assert_eq!(reason, "read_locked");
+            assert_eq!(reason, Reason::ReadLocked);
         }
         other => panic!("expected read_locked, got {:?}", other),
     }
@@ -1650,7 +1797,7 @@ fn force_release_unknown_owner_is_noop() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1668,7 +1815,7 @@ fn force_release_unknown_owner_is_noop() {
 
     // Bob still holds
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("bob"));
 }
 
@@ -1697,7 +1844,7 @@ fn renew_refreshes_all_held_locks() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
 
@@ -1728,10 +1875,13 @@ fn renew_refreshes_all_held_locks() {
         Command {
             request_id: None,
             now_ms: now + 6_000,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -1749,12 +1899,12 @@ fn inspect_path_returns_correct_state() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 1);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
     assert!(info.read_owners.is_empty());
     assert!(info.fence.is_some());
@@ -1778,7 +1928,7 @@ fn list_owner_locks_returns_all_held() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
 
@@ -1812,10 +1962,13 @@ fn empty_acquire_request_returns_ok() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(args),
+            op: acquire_op(args),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 #[test]
@@ -1829,7 +1982,7 @@ fn empty_release_requests_are_noop() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
@@ -1840,6 +1993,7 @@ fn empty_release_requests_are_noop() {
             request_id: None,
             now_ms: now + 1,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![],
                 del_wait: false,
@@ -1849,7 +2003,7 @@ fn empty_release_requests_are_noop() {
 
     // Alice still holds
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/a").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/a").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("alice"));
 }
 
@@ -1892,16 +2046,16 @@ fn stale_write_lock_of_dead_owner_is_grantable_in_one_command() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 30_000, 2, vec![wr("h:/stale")])),
+            op: acquire_op(acquire_args("bob", 30_000, 2, vec![wr("h:/stale")])),
         },
     );
     assert!(
-        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)),
+        matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok { .. })),
         "dead owner's lock must be granted in one command, got {resp:?}"
     );
 
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 2);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/stale").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/stale").unwrap();
     assert_eq!(info.write_owner.as_deref(), Some("bob"));
 }
 
@@ -1922,36 +2076,46 @@ fn lost_acquire_commits_no_partial_state() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 1, vec![wr("h:/a")])),
         },
     );
 
     // Simulate external loss of the lock record (the owner set still lists it).
     {
         let mut txn = WriteTxn::new(db.clone(), G, now + 1);
-        txn.delete_raw(store_keys::CF_WRITE_LOCKS, b"h:/a").unwrap();
+        txn.delete_raw(
+            store_keys::CF_WRITE_LOCKS,
+            &store_keys::wr_key(&pathlockd::engine::scoped_path("h", "h:/a")),
+        )
+        .unwrap();
         assert!(txn.commit().unwrap());
     }
 
-    // Acquiring a new path now fails in the lease-refresh step (missing_write).
+    // Revalidating the lost hold in the same command fails without granting the
+    // new path in that command.
     let resp = apply(
         &db,
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("bob", 60_000, 1, vec![wr("h:/c")])),
+            op: acquire_op(acquire_args(
+                "bob",
+                60_000,
+                1,
+                vec![wr("h:/c"), wr_held("h:/a")],
+            )),
         },
     );
     match resp {
         ApplyResponse::Acquire(AcquireOutcome::Lost { reason, .. }) => {
-            assert_eq!(reason, "missing_write");
+            assert_eq!(reason, Reason::MissingWrite);
         }
         other => panic!("expected Lost, got {other:?}"),
     }
 
     // Nothing from the failed command may be visible: h:/c is free for others.
     let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
-    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h:/c").unwrap();
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, "h", "h:/c").unwrap();
     assert_eq!(info.write_owner, None, "lost acquire must not grant h:/c");
     let (_, locks) = pathlockd::engine::list_owner_locks_inner(&mut txn, "bob").unwrap();
     assert!(
@@ -1964,10 +2128,13 @@ fn lost_acquire_commits_no_partial_state() {
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("carol", 30_000, 2, vec![wr("h:/c")])),
+            op: acquire_op(acquire_args("carol", 30_000, 2, vec![wr("h:/c")])),
         },
     );
-    assert!(matches!(resp, ApplyResponse::Acquire(AcquireOutcome::Ok)));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
 }
 
 /// The GC sweep must drain an arbitrary backlog across batched passes,
@@ -2027,12 +2194,9 @@ fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
     );
 }
 
-/// An owner whose hold set exceeds the one-shot enumeration limit (legacy
-/// state, or residue accumulated faster than GC drained it) must still be
-/// recoverable: renew is *rejected* with the scan-limit kind (bounded work,
-/// and — critically — an ApplyResponse, not an error: an apply error on a
-/// committed entry would shut the raft core down on every replica), while
-/// force_release pages through the set and fully cleans it up.
+/// An owner whose hold set is very large must still be recoverable: renew is
+/// O(1) because it refreshes the owner lease, while force_release pages through
+/// the set and fully cleans it up.
 #[test]
 fn force_release_recovers_owner_beyond_enumeration_limit() {
     use pathlockd::store_rocksdb::{StoreTxn, WriteTxn};
@@ -2055,7 +2219,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
             txn.sadd(
                 store_keys::CF_OWNER_HOLDS,
                 &own_key,
-                &format!("write:h:/p{i:05}"),
+                &format!("write\0h\0h:/p{i:05}"),
                 600_000,
             )
             .unwrap();
@@ -2063,8 +2227,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
         assert!(txn.commit().unwrap());
     }
 
-    // One-shot enumeration (renew) is rejected deterministically — never a
-    // storage error, which would be a poison-pill log entry.
+    // Renew no longer enumerates the portfolio.
     let resp = apply(
         &db,
         Command {
@@ -2079,12 +2242,9 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
     assert!(
         matches!(
             resp,
-            ApplyResponse::Rejected {
-                kind: pathlockd::raft::command::RejectKind::ScanLimit,
-                ..
-            }
+            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok)
         ),
-        "renew should be rejected with the scan-limit kind, got {resp:?}"
+        "renew should refresh the owner lease without scanning, got {resp:?}"
     );
 
     // Paged cleanup succeeds where it previously errored. One command's work
@@ -2146,7 +2306,7 @@ fn fence_refreshes_reuse_one_quantized_expiry_slot() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 30_000, 1, vec![wr("h:/f")])),
+            op: acquire_op(acquire_args("alice", 30_000, 1, vec![wr("h:/f")])),
         },
     );
     for i in 1..=3u64 {
@@ -2200,10 +2360,10 @@ fn queued_acquire_is_granted_in_place_on_release() {
             Command {
                 request_id: None,
                 now_ms: now,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
             }
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Bob's conflicting acquire is QUEUED, not refused.
@@ -2212,12 +2372,12 @@ fn queued_acquire_is_granted_in_place_on_release() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { owner, reason, .. }) => {
             assert_eq!(owner, "alice");
-            assert_eq!(reason, "write_locked");
+            assert_eq!(reason, Reason::WriteLocked);
         }
         other => panic!("expected Queued, got {:?}", other),
     }
@@ -2229,6 +2389,7 @@ fn queued_acquire_is_granted_in_place_on_release() {
             request_id: None,
             now_ms: now + 2,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a", Mode::Write)],
                 del_wait: false,
@@ -2244,10 +2405,10 @@ fn queued_acquire_is_granted_in_place_on_release() {
                 Command {
                     request_id: None,
                     now_ms: now + 3,
-                    op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr_held("h:/a")])),
+                    op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr_held("h:/a")])),
                 }
             ),
-            ApplyResponse::Acquire(AcquireOutcome::Ok)
+            ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
         ),
         "Bob should hold h:/a after grant-in-place"
     );
@@ -2257,12 +2418,12 @@ fn queued_acquire_is_granted_in_place_on_release() {
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { owner, reason, .. }) => {
             assert_eq!(owner, "bob");
-            assert_eq!(reason, "write_locked");
+            assert_eq!(reason, Reason::WriteLocked);
         }
         other => panic!("expected Queued blocked by Bob, got {:?}", other),
     }
@@ -2279,7 +2440,7 @@ fn newcomer_yields_to_an_earlier_waiter_then_fifo_grants() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
         },
     );
     // Bob queues for an ancestor write on h:/a (blocked by Alice).
@@ -2289,7 +2450,7 @@ fn newcomer_yields_to_an_earlier_waiter_then_fifo_grants() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
             }
         ),
         ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
@@ -2302,7 +2463,7 @@ fn newcomer_yields_to_an_earlier_waiter_then_fifo_grants() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/a/x")])),
+            op: acquire_op(acquire_args("carol", 60_000, 3, vec![wr("h:/a/x")])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { owner, .. }) => {
@@ -2322,6 +2483,7 @@ fn newcomer_yields_to_an_earlier_waiter_then_fifo_grants() {
             request_id: None,
             now_ms: now + 3,
             op: Op::Release {
+                namespace: "h".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("h:/a", Mode::Write)],
                 del_wait: false,
@@ -2335,10 +2497,10 @@ fn newcomer_yields_to_an_earlier_waiter_then_fifo_grants() {
                 Command {
                     request_id: None,
                     now_ms: now + 4,
-                    op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr_held("h:/a")])),
+                    op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr_held("h:/a")])),
                 }
             ),
-            ApplyResponse::Acquire(AcquireOutcome::Ok)
+            ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
         ),
         "Bob (FIFO head) should hold h:/a"
     );
@@ -2355,7 +2517,7 @@ fn expired_queue_entries_are_gc_swept() {
         Command {
             request_id: None,
             now_ms: now,
-            op: Op::Acquire(acquire_args("alice", 600_000, 1, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("alice", 600_000, 1, vec![wr("h:/a")])),
         },
     );
     assert!(matches!(
@@ -2364,7 +2526,7 @@ fn expired_queue_entries_are_gc_swept() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
             }
         ),
         ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
@@ -2403,7 +2565,7 @@ fn expired_queue_entries_are_gc_swept() {
         Command {
             request_id: None,
             now_ms: later + 1,
-            op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
+            op: acquire_op(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { owner, .. }) => assert_eq!(owner, "alice"),
@@ -2415,7 +2577,7 @@ fn expired_queue_entries_are_gc_swept() {
 fn point_rw_policy_is_nonrecursive_but_same_path_rw() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
-    set_policy(&db, now, "h", LockAlgorithm::PointRw);
+    set_policy(&db, now, "prw", LockAlgorithm::PointRw);
 
     assert!(matches!(
         apply(
@@ -2423,23 +2585,23 @@ fn point_rw_policy_is_nonrecursive_but_same_path_rw() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+                op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("prw:/a")])),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
-    // Nonrecursive: a point write at h:/a does not cover h:/a/b.
+    // Nonrecursive: a point write at prw:/a does not cover prw:/a/b.
     assert!(matches!(
         apply(
             &db,
             Command {
                 request_id: None,
                 now_ms: now + 2,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+                op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("prw:/a/b")])),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Still an RWLock on the exact path.
@@ -2449,10 +2611,10 @@ fn point_rw_policy_is_nonrecursive_but_same_path_rw() {
             Command {
                 request_id: None,
                 now_ms: now + 3,
-                op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![rd("h:/a")])),
+                op: acquire_op(acquire_args("carol", 60_000, 0, vec![rd("prw:/a")])),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == "write_locked"
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == Reason::WriteLocked
     ));
 }
 
@@ -2461,26 +2623,29 @@ fn write_only_policies_reject_new_reads() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
 
-    for (i, algorithm) in [LockAlgorithm::RecursiveWrite, LockAlgorithm::PointWrite]
-        .into_iter()
-        .enumerate()
+    for (i, (namespace, algorithm)) in [
+        ("rec", LockAlgorithm::RecursiveWrite),
+        ("pt", LockAlgorithm::PointWrite),
+    ]
+    .into_iter()
+    .enumerate()
     {
-        set_policy(&db, now + (i as u64 * 2), "h", algorithm);
+        set_policy(&db, now + (i as u64 * 2), namespace, algorithm);
         match apply(
             &db,
             Command {
                 request_id: None,
                 now_ms: now + (i as u64 * 2) + 1,
-                op: Op::Acquire(acquire_args(
+                op: acquire_op(acquire_args(
                     &format!("reader-{i}"),
                     60_000,
                     0,
-                    vec![rd(&format!("h:/read-{i}"))],
+                    vec![rd(&format!("{namespace}:/read-{i}"))],
                 )),
             },
         ) {
             ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
-                assert_eq!(reason, "read_locks_disabled");
+                assert_eq!(reason, Reason::ReadLocksDisabled);
             }
             other => panic!("expected read_locks_disabled conflict, got {other:?}"),
         }
@@ -2503,7 +2668,7 @@ fn recursive_write_and_point_write_scope_differ() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("rec:/recursive")])),
+            op: acquire_op(acquire_args("alice", 60_000, 1, vec![wr("rec:/recursive")])),
         },
     );
     match apply(
@@ -2511,7 +2676,7 @@ fn recursive_write_and_point_write_scope_differ() {
         Command {
             request_id: None,
             now_ms: now + 2,
-            op: Op::Acquire(acquire_args(
+            op: acquire_op(acquire_args(
                 "bob",
                 60_000,
                 2,
@@ -2520,7 +2685,7 @@ fn recursive_write_and_point_write_scope_differ() {
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
-            assert_eq!(reason, "ancestor_locked");
+            assert_eq!(reason, Reason::AncestorLocked);
         }
         other => panic!("expected recursive ancestor conflict, got {other:?}"),
     }
@@ -2532,10 +2697,10 @@ fn recursive_write_and_point_write_scope_differ() {
             Command {
                 request_id: None,
                 now_ms: now + 3,
-                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("pt:/point")])),
+                op: acquire_op(acquire_args("carol", 60_000, 3, vec![wr("pt:/point")])),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     assert!(matches!(
@@ -2544,10 +2709,10 @@ fn recursive_write_and_point_write_scope_differ() {
             Command {
                 request_id: None,
                 now_ms: now + 4,
-                op: Op::Acquire(acquire_args("dave", 60_000, 4, vec![wr("pt:/point/child")],)),
+                op: acquire_op(acquire_args("dave", 60_000, 4, vec![wr("pt:/point/child")],)),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 }
 
@@ -2564,10 +2729,13 @@ fn algorithm_change_clears_held_locks_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a/b")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("alice", 60_000, 1, vec![wr("h:/a/b")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
     assert!(matches!(
         apply(
@@ -2575,10 +2743,13 @@ fn algorithm_change_clears_held_locks_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 2,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("bob", 60_000, 2, vec![wr("h:/a")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Switching the algorithm force-clears every held lock under "h".
@@ -2606,10 +2777,13 @@ fn algorithm_change_clears_held_locks_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 4,
-                op: Op::Acquire(acquire_args("carol", 60_000, 3, vec![wr("h:/a")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("carol", 60_000, 3, vec![wr("h:/a")]),
+                    LockAlgorithm::RecursiveWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 }
 
@@ -2626,10 +2800,13 @@ fn algorithm_change_clears_queued_waiters_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/a")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("alice", 60_000, 1, vec![wr("h:/a")]),
+                    LockAlgorithm::RecursiveWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
     assert!(matches!(
         apply(
@@ -2637,7 +2814,10 @@ fn algorithm_change_clears_queued_waiters_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 2,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")]),
+                    LockAlgorithm::RecursiveWrite,
+                ),
             },
         ),
         ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
@@ -2668,10 +2848,13 @@ fn algorithm_change_clears_queued_waiters_under_namespace() {
             Command {
                 request_id: None,
                 now_ms: now + 4,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("bob", 60_000, 2, vec![wr("h:/a/b")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 }
 
@@ -2686,10 +2869,13 @@ fn policy_reset_to_same_algorithm_keeps_locks() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/x")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("alice", 60_000, 1, vec![wr("h:/x")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Re-setting the same algorithm is not a change: nothing is cleared.
@@ -2715,10 +2901,13 @@ fn policy_reset_to_same_algorithm_keeps_locks() {
             Command {
                 request_id: None,
                 now_ms: now + 3,
-                op: Op::Acquire(acquire_args("bob", 60_000, 2, vec![wr("h:/x")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("bob", 60_000, 2, vec![wr("h:/x")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == "write_locked"
+        ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) if reason == Reason::WriteLocked
     ));
 }
 
@@ -2733,10 +2922,13 @@ fn delete_policy_reverts_to_default_and_clears() {
             Command {
                 request_id: None,
                 now_ms: now + 1,
-                op: Op::Acquire(acquire_args("alice", 60_000, 1, vec![wr("h:/p/q")])),
+                op: acquire_op_with_algorithm(
+                    acquire_args("alice", 60_000, 1, vec![wr("h:/p/q")]),
+                    LockAlgorithm::PointWrite,
+                ),
             },
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 
     // Deleting the explicit (non-default) policy reverts "h" to the default
@@ -2776,6 +2968,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadResult::NamespacePolicy {
             algorithm,
             explicit,
+            ..
         } => {
             assert_eq!(algorithm, LockAlgorithm::RecursiveRw);
             assert!(!explicit);
@@ -2813,6 +3006,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadResult::NamespacePolicy {
             algorithm,
             explicit,
+            ..
         } => {
             assert_eq!(algorithm, LockAlgorithm::PointWrite);
             assert!(explicit);
@@ -2850,6 +3044,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadResult::NamespacePolicy {
             algorithm,
             explicit,
+            ..
         } => {
             assert_eq!(algorithm, LockAlgorithm::PointWrite);
             assert!(explicit);
@@ -2865,7 +3060,15 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
     )
     .unwrap()
     {
-        ReadResult::NamespaceList(namespaces) => assert_eq!(namespaces, vec!["h".to_string()]),
+        ReadResult::NamespaceList(namespaces) => {
+            assert_eq!(
+                namespaces
+                    .into_iter()
+                    .map(|entry| entry.namespace)
+                    .collect::<Vec<_>>(),
+                vec!["h".to_string()]
+            )
+        }
         other => panic!("expected namespace list result, got {other:?}"),
     }
 
@@ -2898,6 +3101,7 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
         ReadResult::NamespacePolicy {
             algorithm,
             explicit,
+            ..
         } => {
             assert_eq!(algorithm, LockAlgorithm::RecursiveRw);
             assert!(!explicit);
@@ -2907,10 +3111,9 @@ fn namespace_policy_defaults_and_persists_in_sys_group() {
 }
 
 // ---------------------------------------------------------------------------
-// Semaphore algorithm (point, write-only, per-acquire permit count)
+// Semaphore algorithm (point, write-only, per-path permit count)
 // ---------------------------------------------------------------------------
 
-/// A new semaphore acquire on `path` requesting `permits` concurrent holders.
 fn sem(path: &str, permits: u32) -> LockReq {
     LockReq {
         path: path.to_string(),
@@ -2920,13 +3123,12 @@ fn sem(path: &str, permits: u32) -> LockReq {
     }
 }
 
-/// A held-state re-validation of a semaphore lock.
-fn sem_held(path: &str, permits: u32) -> LockReq {
+fn sem_held(path: &str) -> LockReq {
     LockReq {
         path: path.to_string(),
         mode: Mode::Write,
         state: State::Held,
-        permits,
+        permits: 0,
     }
 }
 
@@ -2934,7 +3136,10 @@ fn inspect(db: &Arc<rocksdb::DB>, path: &str) -> pathlockd::engine::PathInfo {
     match pathlockd::raft::server::execute_read_blocking(
         db,
         G,
-        ReadOp::InspectPath { path: path.into() },
+        ReadOp::InspectPath {
+            namespace: store_keys::handler_of(path).into(),
+            path: path.into(),
+        },
         LockAlgorithm::default(),
     )
     .unwrap()
@@ -2945,12 +3150,12 @@ fn inspect(db: &Arc<rocksdb::DB>, path: &str) -> pathlockd::engine::PathInfo {
 }
 
 #[test]
-fn semaphore_admits_up_to_permits_then_queues() {
+fn semaphore_admits_up_to_path_permits_then_queues() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
     set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
 
-    // Two holders fit under permits=2.
+    // Two holders fit under this path's capacity of 2.
     for (i, owner) in ["alice", "bob"].into_iter().enumerate() {
         assert!(
             matches!(
@@ -2959,33 +3164,36 @@ fn semaphore_admits_up_to_permits_then_queues() {
                     Command {
                         request_id: None,
                         now_ms: now + 1 + i as u64,
-                        op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
+                        op: acquire_op(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
                     }
                 ),
-                ApplyResponse::Acquire(AcquireOutcome::Ok)
+                ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
             ),
             "{owner} should be admitted"
         );
     }
 
-    // The third request exceeds its own permit count and is queued (not refused):
+    // The third request exceeds the path capacity and is queued (not refused):
     // semaphore_full is a contention conflict, granted in place once a permit frees.
     match apply(
         &db,
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+            op: acquire_op(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
-            assert_eq!(reason, "semaphore_full");
+            assert_eq!(reason, Reason::SemaphoreFull);
         }
         other => panic!("expected Queued(semaphore_full), got {other:?}"),
     }
 
     let info = inspect(&db, "sem:/a");
-    assert!(info.write_owner.is_none(), "semaphore has no exclusive owner");
+    assert!(
+        info.write_owner.is_none(),
+        "semaphore has no exclusive owner"
+    );
     assert_eq!(info.semaphore_owners.len(), 2);
 }
 
@@ -3001,7 +3209,7 @@ fn semaphore_release_frees_a_permit_and_grants_waiter() {
             Command {
                 request_id: None,
                 now_ms: now + 1 + i as u64,
-                op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
+                op: acquire_op(acquire_args(owner, 60_000, 0, vec![sem("sem:/a", 2)])),
             },
         );
     }
@@ -3011,7 +3219,7 @@ fn semaphore_release_frees_a_permit_and_grants_waiter() {
         Command {
             request_id: None,
             now_ms: now + 4,
-            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+            op: acquire_op(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
         },
     );
 
@@ -3022,6 +3230,7 @@ fn semaphore_release_frees_a_permit_and_grants_waiter() {
             request_id: None,
             now_ms: now + 5,
             op: Op::Release {
+                namespace: "sem".into(),
                 owner: "alice".into(),
                 reqs: vec![rel("sem:/a", Mode::Write)],
                 del_wait: false,
@@ -3041,10 +3250,10 @@ fn semaphore_release_frees_a_permit_and_grants_waiter() {
             Command {
                 request_id: None,
                 now_ms: now + 6,
-                op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem_held("sem:/a", 2)])),
+                op: acquire_op(acquire_args("carol", 60_000, 0, vec![sem_held("sem:/a")])),
             }
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 }
 
@@ -3061,7 +3270,7 @@ fn semaphore_reacquire_by_holder_does_not_consume_a_second_permit() {
             Command {
                 request_id: None,
                 now_ms: now + 1 + i,
-                op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
+                op: acquire_op(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
             },
         );
     }
@@ -3074,68 +3283,64 @@ fn semaphore_reacquire_by_holder_does_not_consume_a_second_permit() {
             Command {
                 request_id: None,
                 now_ms: now + 3,
-                op: Op::Acquire(acquire_args("bob", 60_000, 0, vec![sem("sem:/a", 2)])),
+                op: acquire_op(acquire_args("bob", 60_000, 0, vec![sem("sem:/a", 2)])),
             }
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
     assert_eq!(inspect(&db, "sem:/a").semaphore_owners.len(), 2);
 }
 
 #[test]
-fn semaphore_gates_on_the_requesters_own_permit_count() {
+fn semaphore_uses_per_path_capacity() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
     set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
 
-    // Two independent paths, each pre-loaded with exactly two holders and an
-    // empty wait queue. Holding the count fixed at 2 across both paths isolates
-    // the per-request gate from FIFO ordering (a queued waiter on a path would
-    // otherwise make later arrivals on that same path yield to it).
+    // Two independent paths in the same semaphore namespace: capacity 2 queues
+    // the next waiter on /a, while capacity 3 admits the third holder on /b.
     for (i, owner) in ["alice", "bob"].into_iter().enumerate() {
-        for path in ["sem:/a", "sem:/b"] {
+        for (path, permits) in [("sem:/a", 2), ("sem:/b", 3)] {
             apply(
                 &db,
                 Command {
                     request_id: None,
                     now_ms: now + 1 + i as u64,
-                    op: Op::Acquire(acquire_args(owner, 60_000, 0, vec![sem(path, 3)])),
+                    op: acquire_op(acquire_args(owner, 60_000, 0, vec![sem(path, permits)])),
                 },
             );
         }
     }
 
-    // permits=2 sees 2 >= 2 → refused (queued).
     match apply(
         &db,
         Command {
             request_id: None,
             now_ms: now + 3,
-            op: Op::Acquire(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
+            op: acquire_op(acquire_args("carol", 60_000, 0, vec![sem("sem:/a", 2)])),
         },
     ) {
         ApplyResponse::Acquire(AcquireOutcome::Queued { reason, .. }) => {
-            assert_eq!(reason, "semaphore_full");
+            assert_eq!(reason, Reason::SemaphoreFull);
         }
-        other => panic!("expected Queued(semaphore_full) for permits=2, got {other:?}"),
+        other => panic!("expected Queued(semaphore_full) for capacity 2, got {other:?}"),
     }
 
-    // permits=3 sees 2 < 3 → admitted (distinct path, so unaffected by carol).
     assert!(matches!(
         apply(
             &db,
             Command {
                 request_id: None,
                 now_ms: now + 4,
-                op: Op::Acquire(acquire_args("dave", 60_000, 0, vec![sem("sem:/b", 3)])),
+                op: acquire_op(acquire_args("dave", 60_000, 0, vec![sem("sem:/b", 3)])),
             }
         ),
-        ApplyResponse::Acquire(AcquireOutcome::Ok)
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
     ));
 }
 
 #[test]
-fn semaphore_zero_permits_is_invalid_and_not_queued() {
+fn semaphore_acquire_rejects_zero_capacity() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
     set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
@@ -3145,35 +3350,13 @@ fn semaphore_zero_permits_is_invalid_and_not_queued() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 0)])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 0)])),
         },
     ) {
-        // A client error, not contention: refused outright rather than queued.
         ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
-            assert_eq!(reason, "invalid_permits");
+            assert_eq!(reason, Reason::InvalidPermits);
         }
         other => panic!("expected Conflict(invalid_permits), got {other:?}"),
-    }
-}
-
-#[test]
-fn semaphore_namespace_rejects_reads() {
-    let (db, _dir) = open_temp_db();
-    let now = store_keys::now_ms();
-    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
-
-    match apply(
-        &db,
-        Command {
-            request_id: None,
-            now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![rd("sem:/a")])),
-        },
-    ) {
-        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
-            assert_eq!(reason, "read_locks_disabled");
-        }
-        other => panic!("expected Conflict(read_locks_disabled), got {other:?}"),
     }
 }
 
@@ -3188,7 +3371,7 @@ fn semaphore_release_all_clears_a_holder() {
         Command {
             request_id: None,
             now_ms: now + 1,
-            op: Op::Acquire(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![sem("sem:/a", 2)])),
         },
     );
     assert_eq!(inspect(&db, "sem:/a").semaphore_owners.len(), 1);
@@ -3205,4 +3388,25 @@ fn semaphore_release_all_clears_a_holder() {
         },
     );
     assert!(inspect(&db, "sem:/a").semaphore_owners.is_empty());
+}
+
+#[test]
+fn semaphore_namespace_rejects_reads() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "sem", LockAlgorithm::Semaphore);
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: acquire_op(acquire_args("alice", 60_000, 0, vec![rd("sem:/a")])),
+        },
+    ) {
+        ApplyResponse::Acquire(AcquireOutcome::Conflict { reason, .. }) => {
+            assert_eq!(reason, Reason::ReadLocksDisabled);
+        }
+        other => panic!("expected Conflict(read_locks_disabled), got {other:?}"),
+    }
 }

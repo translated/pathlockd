@@ -65,10 +65,10 @@ pathlockd enforces this containment directly, with O(subtree) conflict checks
 | --- | --- |
 | **Owner** | A caller-supplied id that owns a lock and all the paths it holds. |
 | **Read / write modes** | Shared readers, exclusive writer — but hierarchical, not flat: a write covers its whole subtree, a read covers only its node. A tree-shaped RWLock, not the symmetric textbook one. Full rules: [docs/locking-semantics.md](docs/locking-semantics.md). |
-| **Lock algorithm** | Per-namespace policy picking the conflict rules: `recursive_rw` (default — tree-shaped RWLock), `point_rw` (flat RWLock on the path), `recursive_write` (subtree mutex, no reads), `point_write` (point mutex, no reads) and `semaphore` (point, write-only **counting semaphore** — admits up to N concurrent holders per path, where N is the per-acquire `LockRequest.permits`; no fencing). Changing a namespace's effective algorithm **force-clears that namespace's locks** (held and queued) so nothing lingers under stale conflict semantics — affected owners get a `KILLED` event and must re-acquire. Set / read with `SetNamespacePolicy` / `GetNamespacePolicy`; full matrix and examples in [llmwiki/08-lock-algorithms.md](llmwiki/08-lock-algorithms.md). |
+| **Lock algorithm** | Per-namespace policy picking the conflict rules: `recursive_rw` (default — tree-shaped RWLock), `point_rw` (flat RWLock on the path), `recursive_write` (subtree mutex, no reads), `point_write` (point mutex, no reads) and `semaphore` (point, write-only **counting semaphore** — each semaphore path admits up to its own `LockRequest.permits` capacity; no fencing). Changing a namespace's effective policy **force-clears that namespace's locks** (held and queued) so nothing lingers under stale conflict semantics — affected owners get a `KILLED` event and must re-acquire. Set / read with `SetNamespacePolicy` / `GetNamespacePolicy`; full matrix and examples in [llmwiki/08-lock-algorithms.md](llmwiki/08-lock-algorithms.md). |
 | **Namespace policy** | Each routing namespace defaults to `default_lock_algorithm` (built-in `recursive_rw`, overridable in config) and may be changed with `SetNamespacePolicy`; `GetNamespacePolicy` reports whether the namespace has an explicit persisted setting. Path-root keys also define an explicit routing namespace (a Raft-shard and conflict-domain boundary). |
-| **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
-| **TTL lease + renewal** | Every lock is a lease. The holder renews it; if the holder dies, the lease expires and the subtree frees itself — no orphaned locks. |
+| **Fencing token** | A monotonic token stamped on every write-locked path. `Acquire` mints one server-side when a write request passes `fencing_token = 0`, and returns it in `AcquireResponse.fencing_token`; `AssertFencing` proves the holder still owns a path at that token. A stale token is rejected with `current_fencing_token`, so a paused-then-resumed writer can't corrupt newer state. |
+| **TTL lease + renewal** | Every owner has one TTL lease. Held lock records reference owner liveness; renewing the owner extends the whole portfolio, and stale holders are pruned on the next touch when the owner lease expires. |
 | **Liveness & pruning** | Read sets self-heal: members whose owner lease has lapsed are pruned on the next touch. |
 | **Deadlock detection** | Wait edges (`owner → blocker`, plus the path/reason being waited on) form a wait-for graph. `DetectCycle` walks it and drops stale edges; a client that finds a cycle resolves it with a cooperative revoke, then a forced release if the victim doesn't yield. |
 | **Per-owner event stream** | A `Subscribe` stream bound to one owner delivers only that owner's lifecycle events (`released` / `killed` / `revoke`). A lock's channel carries only that lock's information. |
@@ -326,7 +326,7 @@ A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
 | `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
 | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip addresses of existing members (required unless bootstrapping) |
 | `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a brand-new cluster (exactly one node; guarded against re-init on empty disks) |
-| `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups (fixed at cluster birth) |
+| `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of virtual Raft groups (fixed at cluster birth) |
 | `routing_prefix_segments` | `PATHLOCKD_ROUTING_PREFIX_SEGMENTS` | `1` | Fallback path depth when no explicit namespace root exists (`1` = handler plus first segment; `0` = legacy handler only) |
 | `default_lock_algorithm` | `PATHLOCKD_DEFAULT_LOCK_ALGORITHM` | `recursive_rw` | Algorithm for namespaces with no explicit policy (`recursive_rw` \| `point_rw` \| `recursive_write` \| `point_write` \| `semaphore`). Must match cluster-wide (deterministic state machine input) |
 | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (odd; auto-degrades/upgrades with node count) |
@@ -386,6 +386,10 @@ The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
 `AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
 `ClearWaitEdge`, `IsOwnerAlive`, `RequestRevoke`, `Subscribe` (server stream),
 `Health`.
+
+Conflict and loss reasons are returned as `ReasonCode` enum values, not free
+strings. `AcquireResponse.fencing_token` carries the server-minted or
+caller-supplied token for `OK`/`QUEUED` write acquires.
 
 ### Wait queue & grant-in-place
 

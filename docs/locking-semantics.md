@@ -39,10 +39,12 @@ is the first policy:
 | `point_rw` | Shared point reads | Exact path only |
 | `recursive_write` | Reads disabled | Path plus descendants |
 | `point_write` | Reads disabled | Exact path only |
+| `semaphore` | Reads disabled | Exact path, up to that path's `LockRequest.permits` capacity |
 
-An existing lock keeps the policy it was acquired with until it is released or
-expires. A namespace policy change therefore affects future acquisitions without
-retroactively shrinking or expanding live leases.
+An existing lock keeps the policy it was acquired with until it is released,
+force-cleared, or its owner lease expires. A namespace policy change that alters
+algorithm or semaphore capacity force-clears held and queued locks under that
+namespace so no stale conflict semantics linger.
 
 Recursive lock guarantees are scoped to the selected routing namespace. A
 nested explicit namespace such as `google_drive:/team/archive` intentionally
@@ -126,8 +128,8 @@ wait queue and returns `QUEUED`; the daemon grants it in place and sends a
 `GRANT` event when the path frees (FIFO admission also means a newcomer yields to
 earlier waiters, so no one is starved). `CONFLICT` is reserved for non-waitable
 request faults: `read_locks_disabled` in write-only namespaces, and
-`stale_fencing_token`, where `owner` carries the *persisted fence value* rather
-than an owner id and the caller should refresh its token and retry.
+`stale_fencing_token`, where `current_fencing_token` carries the persisted fence
+value and the caller should retry with a fresh server-minted token.
 
 ## Same-owner re-entrancy
 
@@ -146,15 +148,16 @@ still excluded from the whole subtree.
 
 ## Fencing tokens
 
-Every write-locked path stores a **fencing token** — a value from a strictly
-monotonic counter (`IncrFencingToken`). The token gives the backing store a way
-to reject a stale writer:
+Every write-locked path stores a **fencing token** — a value minted by the
+daemon from a strictly monotonic per-group counter unless the caller supplies a
+positive token explicitly. The token gives the backing store a way to reject a
+stale writer:
 
 - An acquire whose token is **older** than the path's persisted fence is rejected
   with `stale_fencing_token` (whether the request is `New` or `Held`). The holder
   is expected to fetch a fresh token and retry.
-- Write acquires and non-empty `AssertFencing` calls require a positive token;
-  read-only acquires may pass `0`.
+- Write acquires may pass `0` to let the server mint the token. Non-empty
+  `AssertFencing` calls require the concrete positive token being asserted.
 - `AssertFencing(owner, token, paths)` re-verifies, just before an external side
   effect, that for each path the owner **still** holds the write lock
   (`stale_owner` otherwise) **and** the persisted fence **still** equals the token
@@ -168,14 +171,16 @@ briefly outlives its lease is still rejected.
 
 Every lock is a **TTL lease**, not a permanent grant:
 
-- Acquiring or renewing stamps an expiry `now + ttl_ms` on the owner's keys.
-- The holder must **renew** before expiry to keep the lock. Renewal re-validates
-  and refreshes every held path.
+- Acquiring or renewing stamps an expiry `now + ttl_ms` on the owner's liveness
+  key.
+- The holder must **renew** before expiry to keep the lock. Renewal refreshes
+  owner liveness; held lock records are valid only while that owner is alive.
 - If the holder stops renewing (crash, partition, GC pause past the TTL), the
   lease lapses and the subtree frees itself — there are no orphaned locks.
 
-Renewal — and any acquire that re-validates a `Held` path — reports **`LOST`**
-(with a reason: `missing_alive`, `missing_write`, `missing_fence`, `missing_read`,
+Renewal reports **`LOST`** when the owner lease or portfolio is gone; any acquire
+that re-validates a `Held` path reports **`LOST`** (with a reason:
+`missing_alive`, `missing_write`, `missing_fence`, `missing_read`,
 `missing_owner_set`, `empty_owner_set`) when a key the owner believed it held has
 vanished. `LOST` is how a holder learns its lock is gone instead of silently
 re-acquiring it; the caller must treat any work done under that lock as unsafe. A

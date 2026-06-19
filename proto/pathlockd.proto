@@ -42,11 +42,32 @@ enum LockAlgorithm {
   LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
   // Write locks only; writes are exclusive only on the exact path.
   LOCK_ALGORITHM_POINT_WRITE = 3;
-  // Counting semaphore: point-scoped, write-only. A path admits up to the
-  // acquirer's requested permit count (LockRequest.permits) concurrent holders;
-  // no read mode, no descendant exclusion, no fencing. Each acquire is admitted
-  // iff the path currently has fewer than its own `permits` live holders.
+  // Counting semaphore: point-scoped, write-only. Each semaphore path has its
+  // own permit capacity supplied by LockRequest.permits on first acquire; no
+  // read mode, no descendant exclusion, no fencing.
   LOCK_ALGORITHM_SEMAPHORE = 4;
+}
+
+enum ReasonCode {
+  REASON_CODE_UNSPECIFIED = 0;
+  REASON_CODE_ANCESTOR_LOCKED = 1;
+  REASON_CODE_WRITE_LOCKED = 2;
+  REASON_CODE_READ_LOCKED = 3;
+  REASON_CODE_DESCENDANT_WRITE_LOCKED = 4;
+  REASON_CODE_DESCENDANT_READ_LOCKED = 5;
+  REASON_CODE_READ_LOCKS_DISABLED = 6;
+  REASON_CODE_STALE_FENCING_TOKEN = 7;
+  REASON_CODE_INVALID_PERMITS = 8;
+  REASON_CODE_SEMAPHORE_FULL = 9;
+  REASON_CODE_MISSING_SEMAPHORE = 10;
+  REASON_CODE_MISSING_WRITE = 11;
+  REASON_CODE_MISSING_READ = 12;
+  REASON_CODE_MISSING_FENCE = 13;
+  REASON_CODE_MISSING_ALIVE = 14;
+  REASON_CODE_MISSING_OWNER_SET = 15;
+  REASON_CODE_EMPTY_OWNER_SET = 16;
+  REASON_CODE_QUEUED = 17;
+  REASON_CODE_STALE_OWNER = 18;
 }
 
 message LockRequest {
@@ -54,9 +75,9 @@ message LockRequest {
   string path = 1;
   Mode mode = 2;
   LockState state = 3;
-  // Concurrent-holder cap for a LOCK_ALGORITHM_SEMAPHORE namespace: the acquire
-  // succeeds iff the path currently has fewer than `permits` live holders.
-  // Required >= 1 in a semaphore namespace; ignored by all other algorithms.
+  // Required > 0 for LOCK_ALGORITHM_SEMAPHORE write acquires. The first acquire
+  // for a semaphore path establishes that path's capacity; later acquires for
+  // the same path must use the same value. Ignored by other algorithms.
   uint32 permits = 4;
 }
 
@@ -121,18 +142,18 @@ message AcquireRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
   repeated LockRequest requests = 3;
-  // Required to be > 0 when any request is MODE_WRITE. Reads ignore it.
+  // Optional caller-supplied fence. 0 lets the server mint the next token for
+  // write acquires. Reads and semaphore namespaces ignore it.
   int64 fencing_token = 4;
   // Releases folded into the same atomic transaction (shadowing transitions).
   repeated ReleaseRequest release_requests = 5;
   // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 7;
+  string idempotency_key = 6;
   // If this acquire is queued (contended), how long its wait-queue entry lives
   // without being granted — the caller's own acquire deadline. 0 selects a
   // server default. Lets an abandoned waiter self-evict at the client's
   // threshold rather than a fixed server TTL.
-  uint64 queue_ttl_ms = 8;
-  reserved 6; // was emit_release (RELEASED events removed)
+  uint64 queue_ttl_ms = 7;
 }
 
 enum AcquireStatus {
@@ -150,14 +171,14 @@ message AcquireResponse {
   AcquireStatus status = 1;
   // CONFLICT: the conflicting path. LOST: the path whose key/fence went missing.
   string path = 2;
-  // CONFLICT: the conflicting owner id (or, for stale_fencing_token, the
-  // persisted fence value as a string). Empty for LOST/OK.
+  // CONFLICT: the conflicting owner id. Empty for LOST/OK.
   string owner = 3;
-  // CONFLICT/LOST: machine-readable reason
-  // (ancestor_locked | write_locked | read_locked | descendant_write_locked |
-  //  descendant_read_locked | read_locks_disabled | stale_fencing_token |
-  //  missing_write | missing_read | missing_fence | missing_alive).
-  string reason = 4;
+  // CONFLICT/LOST/QUEUED: machine-readable reason.
+  ReasonCode reason = 4;
+  // OK/QUEUED: server-minted or caller-supplied fencing token for this acquire.
+  int64 fencing_token = 5;
+  // STALE_FENCING_TOKEN: persisted current token for the path.
+  int64 current_fencing_token = 6;
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +228,7 @@ enum RenewStatus {
 message RenewResponse {
   RenewStatus status = 1;
   string path = 2;
-  string reason = 3;
+  ReasonCode reason = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +262,7 @@ enum AssertStatus {
 message AssertFencingResponse {
   AssertStatus status = 1;
   string path = 2;
-  string reason = 3; // stale_owner | stale_fencing_token
+  ReasonCode reason = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +297,7 @@ message DetectCycleResponse {
 message IsBlockingRequest {
   string conflict_path = 1;
   string conflict_owner = 2;
-  string reason = 3;
+  ReasonCode reason = 3;
 }
 
 message IsBlockingResponse {
@@ -306,10 +327,8 @@ message SetWaitEdgeRequest {
   uint64 ttl_ms = 3;
   // Optional metadata for the blocking edge. New clients populate these so
   // DetectCycle can discard stale live-owner edges before reporting a cycle.
-  // Older clients may leave them empty; the daemon keeps legacy best-effort
-  // behaviour for those edges.
   string conflict_path = 4;
-  string reason = 5;
+  ReasonCode reason = 5;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 6;
 }
@@ -342,10 +361,6 @@ message IsOwnerAliveResponse {
 
 message RequestRevokeRequest {
   string owner_id = 1;
-  // 2,3,4 were a preemption claim (claim_path / claimant_owner_id /
-  // claim_ttl_ms), removed: the wait queue's FIFO admission keeps the revoked
-  // victim queued behind the winner, so no reservation is needed.
-  reserved 2, 3, 4;
 }
 
 message RequestRevokeResponse {}
@@ -415,12 +430,10 @@ message InspectPathResponse {
   bool has_fence = 3;
   // The persisted fencing token. Meaningful only when has_fence is true.
   int64 fence = 4;
-  // Retained for wire compatibility; always empty (path claims were removed in
-  // favour of the wait queue).
+  // Always empty; path claims were removed in favour of the wait queue.
   string claim_owner = 5;
   // Live semaphore holders of this exact path (LOCK_ALGORITHM_SEMAPHORE
-  // namespaces). Empty for non-semaphore paths. The path is at capacity for a
-  // given acquire when this list's length reaches that acquire's `permits`.
+  // namespaces). Empty for non-semaphore paths.
   repeated string semaphore_owners = 6;
 }
 

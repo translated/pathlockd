@@ -27,7 +27,7 @@ Configuration is loaded from lowest to highest precedence:
 
 | Field | Default | Description |
 |---|---|---|
-| `group_count` | `32` | Number of Raft groups (shards; fixed at cluster birth) |
+| `group_count` | `256` | Number of virtual Raft groups (fixed at cluster birth) |
 | `routing_prefix_segments` | `1` | Fallback path depth when no explicit namespace root exists (`1` = handler plus first segment; `0` = legacy handler only) |
 | `replication_factor` | `3` | Voters per Raft group (odd; auto-degrades to the node count and upgrades as nodes join) |
 | `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
@@ -69,7 +69,7 @@ gossip_cluster_size = 32
 gossip_max_packet_size = 1400
 gossip_seed_announce_interval_ms = 5000
 seed_nodes = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946", "pathlockd-2.pathlockd:7946"]
-group_count = 32
+group_count = 256
 replication_factor = 3
 group_gc_interval_secs = 1
 group_gc_batch = 1024

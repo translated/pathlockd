@@ -10,8 +10,8 @@ use tonic::{Request, Response, Status};
 
 use crate::cluster::router::Router;
 use crate::engine::{
-    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockReq, RelReq,
-    RenewOutcome, WaitEdgeMetadata,
+    self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockReq, Reason,
+    RelReq, RenewOutcome, WaitEdgeMetadata,
 };
 use crate::events::Broadcaster;
 use crate::proto::{
@@ -24,9 +24,10 @@ use crate::proto::{
     IncrFencingTokenResponse, InspectPathRequest, InspectPathResponse, IsBlockingRequest,
     IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse, ListOwnerLocksRequest,
     ListOwnerLocksResponse, LockEntry, OwnedLock, PublishEventRequest, PublishEventResponse,
-    ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest, RenewResponse,
-    RenewStatus, RequestRevokeRequest, RequestRevokeResponse, SetNamespacePolicyRequest,
-    SetNamespacePolicyResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
+    ReasonCode, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
+    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse,
+    SetNamespacePolicyRequest, SetNamespacePolicyResponse, SetWaitEdgeRequest, SetWaitEdgeResponse,
+    SubscribeRequest,
 };
 
 fn engine_err(e: anyhow::Error) -> Status {
@@ -43,6 +44,9 @@ fn engine_err(e: anyhow::Error) -> Status {
             }
             crate::raft::command::RejectKind::IdempotencyMismatch => {
                 Status::invalid_argument(err.detail.clone())
+            }
+            crate::raft::command::RejectKind::PolicyEpochStale => {
+                Status::aborted(err.detail.clone())
             }
         }
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
@@ -189,21 +193,13 @@ fn check_namespace(namespace: &str) -> Result<(), Status> {
     Ok(())
 }
 
-const BLOCKING_REASONS: [&str; 5] = [
-    "ancestor_locked",
-    "write_locked",
-    "read_locked",
-    "descendant_write_locked",
-    "descendant_read_locked",
-];
-
 #[allow(clippy::result_large_err)]
-fn check_blocking_reason(reason: &str) -> Result<(), Status> {
-    if BLOCKING_REASONS.contains(&reason) {
+fn check_blocking_reason(reason: Reason) -> Result<(), Status> {
+    if reason.is_blocking_reason() {
         Ok(())
     } else {
         Err(Status::invalid_argument(format!(
-            "unknown is_blocking reason {reason:?}"
+            "reason {reason} is not a blocking reason"
         )))
     }
 }
@@ -211,9 +207,7 @@ fn check_blocking_reason(reason: &str) -> Result<(), Status> {
 #[allow(clippy::result_large_err)]
 fn check_write_fencing_token(fencing_token: i64) -> Result<(), Status> {
     if fencing_token <= 0 {
-        return Err(Status::invalid_argument(
-            "fencing_token must be > 0 for write locks",
-        ));
+        return Err(Status::invalid_argument("fencing_token must be > 0"));
     }
     Ok(())
 }
@@ -270,6 +264,57 @@ fn algorithm_to_proto(algorithm: LockAlgorithm) -> i32 {
         LockAlgorithm::RecursiveWrite => proto::LockAlgorithm::RecursiveWrite as i32,
         LockAlgorithm::PointWrite => proto::LockAlgorithm::PointWrite as i32,
         LockAlgorithm::Semaphore => proto::LockAlgorithm::Semaphore as i32,
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn to_reason(i: i32) -> Result<Reason, Status> {
+    match ReasonCode::try_from(i) {
+        Ok(ReasonCode::AncestorLocked) => Ok(Reason::AncestorLocked),
+        Ok(ReasonCode::WriteLocked) => Ok(Reason::WriteLocked),
+        Ok(ReasonCode::ReadLocked) => Ok(Reason::ReadLocked),
+        Ok(ReasonCode::DescendantWriteLocked) => Ok(Reason::DescendantWriteLocked),
+        Ok(ReasonCode::DescendantReadLocked) => Ok(Reason::DescendantReadLocked),
+        Ok(ReasonCode::ReadLocksDisabled) => Ok(Reason::ReadLocksDisabled),
+        Ok(ReasonCode::StaleFencingToken) => Ok(Reason::StaleFencingToken),
+        Ok(ReasonCode::InvalidPermits) => Ok(Reason::InvalidPermits),
+        Ok(ReasonCode::SemaphoreFull) => Ok(Reason::SemaphoreFull),
+        Ok(ReasonCode::MissingSemaphore) => Ok(Reason::MissingSemaphore),
+        Ok(ReasonCode::MissingWrite) => Ok(Reason::MissingWrite),
+        Ok(ReasonCode::MissingRead) => Ok(Reason::MissingRead),
+        Ok(ReasonCode::MissingFence) => Ok(Reason::MissingFence),
+        Ok(ReasonCode::MissingAlive) => Ok(Reason::MissingAlive),
+        Ok(ReasonCode::MissingOwnerSet) => Ok(Reason::MissingOwnerSet),
+        Ok(ReasonCode::EmptyOwnerSet) => Ok(Reason::EmptyOwnerSet),
+        Ok(ReasonCode::Queued) => Ok(Reason::Queued),
+        Ok(ReasonCode::StaleOwner) => Ok(Reason::StaleOwner),
+        Ok(ReasonCode::Unspecified) => Err(Status::invalid_argument("reason unspecified")),
+        Err(_) => Err(Status::invalid_argument(format!(
+            "invalid reason value {i}"
+        ))),
+    }
+}
+
+fn reason_to_proto(reason: Reason) -> i32 {
+    match reason {
+        Reason::AncestorLocked => ReasonCode::AncestorLocked as i32,
+        Reason::WriteLocked => ReasonCode::WriteLocked as i32,
+        Reason::ReadLocked => ReasonCode::ReadLocked as i32,
+        Reason::DescendantWriteLocked => ReasonCode::DescendantWriteLocked as i32,
+        Reason::DescendantReadLocked => ReasonCode::DescendantReadLocked as i32,
+        Reason::ReadLocksDisabled => ReasonCode::ReadLocksDisabled as i32,
+        Reason::StaleFencingToken => ReasonCode::StaleFencingToken as i32,
+        Reason::InvalidPermits => ReasonCode::InvalidPermits as i32,
+        Reason::SemaphoreFull => ReasonCode::SemaphoreFull as i32,
+        Reason::MissingSemaphore => ReasonCode::MissingSemaphore as i32,
+        Reason::MissingWrite => ReasonCode::MissingWrite as i32,
+        Reason::MissingRead => ReasonCode::MissingRead as i32,
+        Reason::MissingFence => ReasonCode::MissingFence as i32,
+        Reason::MissingAlive => ReasonCode::MissingAlive as i32,
+        Reason::MissingOwnerSet => ReasonCode::MissingOwnerSet as i32,
+        Reason::EmptyOwnerSet => ReasonCode::EmptyOwnerSet as i32,
+        Reason::Queued => ReasonCode::Queued as i32,
+        Reason::StaleOwner => ReasonCode::StaleOwner as i32,
     }
 }
 
@@ -366,13 +411,6 @@ impl PathLockService {
         for r in &req.release_requests {
             check_path(&r.path)?;
         }
-        if req
-            .requests
-            .iter()
-            .any(|r| to_mode(r.mode).is_ok_and(|mode| mode == engine::Mode::Write))
-        {
-            check_write_fencing_token(req.fencing_token)?;
-        }
         let requests: Vec<LockReq> = req
             .requests
             .iter()
@@ -415,19 +453,28 @@ impl PathLockService {
             self.broadcaster.grant(owner);
         }
         let resp = match outcome {
-            AcquireOutcome::Ok => AcquireResponse {
+            AcquireOutcome::Ok { fencing_token } => AcquireResponse {
                 status: AcquireStatus::Ok as i32,
+                fencing_token,
                 ..Default::default()
             },
             AcquireOutcome::Conflict {
                 path,
-                owner,
+                mut owner,
                 reason,
             } => AcquireResponse {
                 status: AcquireStatus::Conflict as i32,
                 path,
+                current_fencing_token: if reason == Reason::StaleFencingToken {
+                    let current = owner.parse::<i64>().unwrap_or_default();
+                    owner.clear();
+                    current
+                } else {
+                    0
+                },
                 owner,
-                reason,
+                reason: reason_to_proto(reason),
+                ..Default::default()
             },
             // Enqueued: the client waits for a GRANT event. Clients that don't
             // recognize QUEUED treat it as a conflict and keep converging via
@@ -436,17 +483,21 @@ impl PathLockService {
                 path,
                 owner,
                 reason,
+                fencing_token,
             } => AcquireResponse {
                 status: AcquireStatus::Queued as i32,
                 path,
                 owner,
-                reason,
+                reason: reason_to_proto(reason),
+                fencing_token,
+                ..Default::default()
             },
             AcquireOutcome::Lost { path, reason } => AcquireResponse {
                 status: AcquireStatus::Lost as i32,
                 path,
                 owner: String::new(),
-                reason,
+                reason: reason_to_proto(reason),
+                ..Default::default()
             },
         };
         Ok(resp)
@@ -549,13 +600,13 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_namespace(&req.namespace)?;
-                let (algorithm, explicit) = self
+                let (policy, explicit) = self
                     .router
-                    .namespace_policy(&req.namespace)
+                    .namespace_policy_detail(&req.namespace)
                     .await
                     .map_err(engine_err)?;
                 Ok(Response::new(GetNamespacePolicyResponse {
-                    algorithm: algorithm_to_proto(algorithm),
+                    algorithm: algorithm_to_proto(policy.algorithm),
                     explicit,
                 }))
             },
@@ -698,7 +749,7 @@ impl PathLock for PathLockService {
                 RenewOutcome::Lost { path, reason } => RenewResponse {
                     status: RenewStatus::Lost as i32,
                     path,
-                    reason,
+                    reason: reason_to_proto(reason),
                 },
             };
             Ok(Response::new(resp))
@@ -769,7 +820,7 @@ impl PathLock for PathLockService {
                     AssertOutcome::Fail { path, reason } => AssertFencingResponse {
                         status: AssertStatus::Fail as i32,
                         path,
-                        reason,
+                        reason: reason_to_proto(reason),
                     },
                 };
                 Ok(Response::new(resp))
@@ -827,10 +878,11 @@ impl PathLock for PathLockService {
                 let req = request.into_inner();
                 check_path(&req.conflict_path)?;
                 check_id("conflict_owner", &req.conflict_owner)?;
-                check_blocking_reason(&req.reason)?;
+                let reason = to_reason(req.reason)?;
+                check_blocking_reason(reason)?;
                 let router = self.router.clone();
                 let blocking = router
-                    .is_blocking(&req.conflict_path, &req.conflict_owner, &req.reason)
+                    .is_blocking(&req.conflict_path, &req.conflict_owner, reason)
                     .await
                     .map_err(engine_err)?;
                 Ok(Response::new(IsBlockingResponse { blocking }))
@@ -875,18 +927,23 @@ impl PathLock for PathLockService {
                 check_id("conflict_owner", &req.conflict_owner)?;
                 check_ttl(req.ttl_ms)?;
                 let idempotency_key = idempotency_key(&req.idempotency_key)?;
-                let metadata = if req.conflict_path.is_empty() && req.reason.is_empty() {
+                let metadata = if req.conflict_path.is_empty()
+                    && req.reason == ReasonCode::Unspecified as i32
+                {
                     None
-                } else if req.conflict_path.is_empty() || req.reason.is_empty() {
+                } else if req.conflict_path.is_empty()
+                    || req.reason == ReasonCode::Unspecified as i32
+                {
                     return Err(Status::invalid_argument(
                         "conflict_path and reason must be provided together",
                     ));
                 } else {
                     check_path(&req.conflict_path)?;
-                    check_blocking_reason(&req.reason)?;
+                    let reason = to_reason(req.reason)?;
+                    check_blocking_reason(reason)?;
                     Some(WaitEdgeMetadata {
                         conflict_path: req.conflict_path,
-                        reason: req.reason,
+                        reason,
                     })
                 };
                 let router = self.router.clone();

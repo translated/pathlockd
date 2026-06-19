@@ -395,6 +395,7 @@ impl Ord for PendingTimer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gossip_loop(
     mut foca: FocaInstance,
     socket: Arc<UdpSocket>,

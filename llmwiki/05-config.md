@@ -23,7 +23,7 @@ Resolution order, lowest to highest precedence:
 | Gossip periodic | `gossip_foca_periodic` | `PATHLOCKD_GOSSIP_FOCA_PERIODIC` | `true` | Use Foca's built-in periodic announce/gossip timers |
 | Gossip send queue | `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
 | Seed nodes | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
-| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups |
+| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of virtual Raft groups |
 | Replication factor | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
 | GC interval | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 = off) |
 | GC batch | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |

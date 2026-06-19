@@ -10,18 +10,18 @@ All lock metadata lives across these RocksDB column families:
 
 | CF constant | Purpose |
 |---|---|
-| `CF_WRITE_LOCKS` | Active write lock: path → owner |
-| `CF_READ_LOCKS` | Active read locks: path\0owner → presence (set) |
-| `CF_FENCES` | Write-lock fencing tokens: path → token (min 24h TTL) |
+| `CF_WRITE_LOCKS` | Active write lock: scoped_path → owner |
+| `CF_READ_LOCKS` | Active read locks: scoped_path\0owner → presence (set) |
+| `CF_FENCES` | Write-lock fencing tokens: scoped_path → token (min 24h TTL) |
 | `CF_DESC_WRITE` | Descendant write index: ancestor\0path (reverse index) |
 | `CF_DESC_READ` | Descendant read index: ancestor\0path |
-| `CF_OWNER_ALIVE` | Liveness marker: owner → "1" |
-| `CF_OWNER_HOLDS` | Owner's held locks set: owner\0mode\0path → member |
+| `CF_OWNER_ALIVE` | Owner lease marker: owner → "1" (the only lease TTL for a held portfolio) |
+| `CF_OWNER_HOLDS` | Owner's held locks set: owner\0mode\0namespace\0path → member (non-expiring; liveness gates validity) |
 | `CF_WAIT_EDGES` | Deadlock-graph edges: owner → encoded WaitEdge |
-| `CF_NAMESPACE_SETTINGS` | Namespace settings: namespace → lock algorithm policy / explicit route root |
-| `CF_QUEUE` | Wait queue: entry keys (`'e'`+be_u64(seq) → owner+AcquireArgs) iterate FIFO; owner keys (`'o'`+owner → seq) for O(1) dequeue |
+| `CF_NAMESPACE_SETTINGS` | Namespace settings: namespace → `<epoch>:<algorithm>` / explicit route root |
+| `CF_QUEUE` | Wait queue: entry keys (`'e'`+be_u64(seq) → owner+namespace+AcquireArgs) iterate FIFO; owner keys (`'o'`+owner → seq) for O(1) dequeue; path index keys (`'p'`+scoped_path+\0+seq) power admission |
 | `CF_EXPIRY` | TTL index: expires_at\0cf\0primary_key (shadow records) |
-| `CF_META` | Global metadata: fence_counter (monotonic), per-group queue sequence |
+| `CF_META` | Per-group metadata: fence_counter (monotonic), per-group queue sequence |
 | `CF_RAFT_LOG` | Raft log entries (managed by openraft) |
 | `CF_DEFAULT` | Catch-all safety net |
 
@@ -47,10 +47,12 @@ extend-only — re-adding a member can never shorten it.
 
 ## Emulated TTL
 
-- **Write** stamps `exp = now_ms + ttl` (fence keys use `max(ttl, 1 day)` so a
-  stale token outlives the lock).
-- **Lazy expiry (correctness):** a read of an entry with `now_ms >= exp` returns
-  *absent*. This is what makes an expired lock disappear without any sweeper.
+- **Owner leases** stamp `CF_OWNER_ALIVE` with `exp = now_ms + ttl`; held lock
+  records, owner-hold members, and descendant indexes are non-expiring and are
+  valid only while their owner is alive. Fence keys use `max(ttl, 1 day)` so a
+  stale token outlives the lock.
+- **Lazy expiry (correctness):** a read of an expired owner lease returns
+  *absent*, and the next lock touch prunes that owner's stale held records.
 - **Active expiry (housekeeping):** the GC sweep task periodically scans the
   `CF_EXPIRY` column family for shadow records whose `expires_at <= now_ms`,
   verifies the shadowed data record is still expired, and deletes both.

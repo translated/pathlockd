@@ -36,6 +36,7 @@ pub struct RaftGroups {
 }
 
 impl RaftGroups {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db: Arc<DB>,
         node_id: u64,

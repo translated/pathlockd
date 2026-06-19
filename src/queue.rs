@@ -19,11 +19,15 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{locks_conflict, AcquireArgs, AcquireOutcome, LockAlgorithm, Mode, State};
+use crate::engine::{
+    get_ancestors, locks_conflict, public_path, scoped_path, AcquireArgs, AcquireOutcome,
+    LockAlgorithm, LockPolicy, Mode, Reason, State,
+};
 use crate::store_keys::{
-    decode_queue_entry_seq, expired, queue_entry_key, queue_entry_lower, queue_entry_upper,
-    queue_owner_key, rd_prefix, sem_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS,
-    CF_SEMAPHORE, CF_WRITE_LOCKS, META_QUEUE_SEQ_KEY,
+    decode_queue_entry_seq, decode_queue_path_seq, expired, queue_entry_key, queue_entry_lower,
+    queue_entry_upper, queue_owner_key, queue_path_key, queue_path_prefix, queue_path_upper,
+    rd_prefix, sem_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS, CF_SEMAPHORE, CF_WRITE_LOCKS,
+    META_QUEUE_SEQ_KEY,
 };
 use crate::store_rocksdb::{decode_record, encode_record, StoreTxn, StoredRecord, WriteTxn};
 
@@ -44,15 +48,9 @@ pub const QUEUE_SCAN_LIMIT: usize = 65_536;
 pub struct QueueEntry {
     pub seq: u64,
     pub owner: String,
+    pub namespace: String,
     pub args: AcquireArgs,
-    pub algorithm: LockAlgorithm,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyQueueEntry {
-    pub seq: u64,
-    pub owner: String,
-    pub args: AcquireArgs,
+    pub policy: LockPolicy,
 }
 
 /// The NEW (state == New) requested paths of an acquire — the paths actually
@@ -62,6 +60,12 @@ fn new_paths(args: &AcquireArgs) -> impl Iterator<Item = (&str, Mode)> {
         .iter()
         .filter(|r| r.state == State::New)
         .map(|r| (r.path.as_str(), r.mode))
+}
+
+fn new_scoped_paths(args: &AcquireArgs, namespace: &str) -> Vec<(String, Mode)> {
+    new_paths(args)
+        .map(|(path, mode)| (scoped_path(namespace, path), mode))
+        .collect()
 }
 
 /// Whether two acquire requests cannot be held simultaneously: a write covers
@@ -80,13 +84,14 @@ pub fn requests_conflict(
 /// Whether any NEW path of `args` conflicts with any of `paths`.
 fn args_conflicts_with(
     args: &AcquireArgs,
-    algorithm: LockAlgorithm,
+    namespace: &str,
+    policy: LockPolicy,
     paths: &[(String, Mode, LockAlgorithm)],
 ) -> Option<String> {
-    for (ap, am) in new_paths(args) {
+    for (ap, am) in new_scoped_paths(args, namespace) {
         for (bp, bm, ba) in paths {
-            if requests_conflict(algorithm, ap, am, *ba, bp, *bm) {
-                return Some(ap.to_string());
+            if requests_conflict(policy.algorithm, &ap, am, *ba, bp, *bm) {
+                return Some(ap);
             }
         }
     }
@@ -127,14 +132,21 @@ fn owner_seq(tx: &mut WriteTxn, owner: &str) -> anyhow::Result<Option<u64>> {
 /// Enqueue `args` (or re-arm an existing entry's TTL). Returns the waiter's
 /// FIFO seq. Idempotent per owner: a re-issued acquire updates in place rather
 /// than duplicating, preserving the original ordering.
-pub fn enqueue(
+pub fn enqueue<P: Into<LockPolicy>>(
     tx: &mut WriteTxn,
+    namespace: &str,
     args: &AcquireArgs,
-    algorithm: LockAlgorithm,
+    policy: P,
 ) -> anyhow::Result<u64> {
+    let policy = policy.into();
     let owner = args.owner_id.clone();
     let seq = match owner_seq(tx, &owner)? {
-        Some(existing) => existing,
+        Some(existing) => {
+            if let Some(entry) = read_entry(tx, existing)? {
+                delete_path_indexes(tx, &entry)?;
+            }
+            existing
+        }
         None => next_seq(tx)?,
     };
     // The client sends its wait deadline as the entry TTL; 0 → server default.
@@ -146,12 +158,14 @@ pub fn enqueue(
     let entry = QueueEntry {
         seq,
         owner: owner.clone(),
+        namespace: namespace.to_string(),
         args: args.clone(),
-        algorithm,
+        policy,
     };
     let encoded = bincode::serde::encode_to_vec(&entry, bincode::config::standard())?;
     tx.set_bytes(CF_QUEUE, &queue_entry_key(seq), encoded, ttl)?;
     tx.set_str(CF_QUEUE, &queue_owner_key(&owner), &seq.to_string(), ttl)?;
+    write_path_indexes(tx, &entry, ttl)?;
     Ok(seq)
 }
 
@@ -159,6 +173,9 @@ pub fn enqueue(
 /// the owner is not queued.
 pub fn dequeue(tx: &mut WriteTxn, owner: &str) -> anyhow::Result<()> {
     if let Some(seq) = owner_seq(tx, owner)? {
+        if let Some(entry) = read_entry(tx, seq)? {
+            delete_path_indexes(tx, &entry)?;
+        }
         tx.del(CF_QUEUE, &queue_entry_key(seq))?;
     }
     tx.del(CF_QUEUE, &queue_owner_key(owner))?;
@@ -196,9 +213,11 @@ pub fn clear_namespace(tx: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec
     let entries = scan(tx)?;
     let mut cleared = Vec::new();
     for entry in entries {
-        let targets = entry.args.requests.iter().any(|r| {
-            crate::cluster::placement::namespace_contains_path(namespace, &r.path)
-        });
+        let targets = entry
+            .args
+            .requests
+            .iter()
+            .any(|r| crate::cluster::placement::namespace_contains_path(namespace, &r.path));
         if targets {
             dequeue(tx, &entry.owner)?;
             cleared.push(entry.owner);
@@ -211,27 +230,32 @@ fn decode_queue_entry(bytes: &[u8]) -> Option<QueueEntry> {
     bincode::serde::decode_from_slice::<QueueEntry, _>(bytes, bincode::config::standard())
         .ok()
         .map(|(entry, _)| entry)
-        .or_else(|| {
-            bincode::serde::decode_from_slice::<LegacyQueueEntry, _>(
-                bytes,
-                bincode::config::standard(),
-            )
-            .ok()
-            .map(|(entry, _)| QueueEntry {
-                seq: entry.seq,
-                owner: entry.owner,
-                args: entry.args,
-                algorithm: LockAlgorithm::default(),
-            })
-        })
+}
+
+fn read_entry(tx: &WriteTxn, seq: u64) -> anyhow::Result<Option<QueueEntry>> {
+    let Some(bytes) = tx.get_bytes(CF_QUEUE, &queue_entry_key(seq))? else {
+        return Ok(None);
+    };
+    Ok(decode_queue_entry(&bytes))
+}
+
+fn write_path_indexes(tx: &mut WriteTxn, entry: &QueueEntry, ttl: u64) -> anyhow::Result<()> {
+    for (path, _) in new_scoped_paths(&entry.args, &entry.namespace) {
+        tx.set_str(CF_QUEUE, &queue_path_key(&path, entry.seq), "1", ttl)?;
+    }
+    Ok(())
+}
+
+fn delete_path_indexes(tx: &mut WriteTxn, entry: &QueueEntry) -> anyhow::Result<()> {
+    for (path, _) in new_scoped_paths(&entry.args, &entry.namespace) {
+        tx.del(CF_QUEUE, &queue_path_key(&path, entry.seq))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Admission (newcomer yields to existing waiters → FIFO / anti-starvation)
 // ---------------------------------------------------------------------------
-
-/// Machine-readable reason a request was parked behind an earlier waiter.
-pub const REASON_QUEUED: &str = "queued";
 
 /// Whether `owner` already holds or covers `path` in `mode` (so acquiring it is
 /// a re-validation, not a fresh contended acquire). Used to exclude such paths
@@ -265,6 +289,75 @@ fn owner_holds_or_covers(
     Ok(false)
 }
 
+fn queue_index_prefix_range(path_prefix: &str) -> (Vec<u8>, Option<Vec<u8>>) {
+    let mut lower = Vec::with_capacity(1 + path_prefix.len());
+    lower.push(b'p');
+    lower.extend_from_slice(path_prefix.as_bytes());
+    let upper = prefix_successor(&lower);
+    (lower, upper)
+}
+
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let mut out = prefix.to_vec();
+    for i in (0..out.len()).rev() {
+        if out[i] != u8::MAX {
+            out[i] += 1;
+            out.truncate(i + 1);
+            return Some(out);
+        }
+    }
+    None
+}
+
+fn collect_exact_path_seqs(
+    tx: &WriteTxn,
+    path: &str,
+    out: &mut std::collections::BTreeSet<u64>,
+) -> anyhow::Result<()> {
+    let now = tx.now_ms();
+    let lower = queue_path_prefix(path);
+    let upper = queue_path_upper(path);
+    tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        if let Some(seq) = decode_queue_path_seq(key) {
+            if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
+                if !expired(exp, now) {
+                    out.insert(seq);
+                }
+            }
+        }
+        Ok(out.len() < QUEUE_SCAN_LIMIT)
+    })?;
+    Ok(())
+}
+
+fn collect_prefixed_path_seqs(
+    tx: &WriteTxn,
+    path_prefix: &str,
+    out: &mut std::collections::BTreeSet<u64>,
+) -> anyhow::Result<()> {
+    let now = tx.now_ms();
+    let (lower, upper) = queue_index_prefix_range(path_prefix);
+    tx.scan_merged(CF_QUEUE, Some(&lower), upper.as_deref(), |key, value| {
+        if let Some(seq) = decode_queue_path_seq(key) {
+            if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
+                if !expired(exp, now) {
+                    out.insert(seq);
+                }
+            }
+        }
+        Ok(out.len() < QUEUE_SCAN_LIMIT)
+    })?;
+    Ok(())
+}
+
+fn descendant_index_prefix(path: &str) -> String {
+    if path.ends_with('/') {
+        path.to_string()
+    } else {
+        format!("{path}/")
+    }
+}
+
 /// If a *strictly-earlier* (lower-seq) live waiter's request conflicts with a
 /// NEW path of `args` that the owner does not already hold, returns
 /// `(blocker_owner, conflict_path, reason)`: the request must enqueue behind
@@ -277,33 +370,45 @@ fn owner_holds_or_covers(
 ///   - **already-held**: paths the owner already holds/covers are excluded, so
 ///     an owner re-acquiring a grant-in-place lock is never blocked by a later
 ///     waiter for that same path.
-pub fn blocked_by_earlier(
+pub fn blocked_by_earlier<P: Into<LockPolicy>>(
     tx: &mut WriteTxn,
+    namespace: &str,
     args: &AcquireArgs,
-    algorithm: LockAlgorithm,
-) -> anyhow::Result<Option<(String, String, String)>> {
-    // Fast path: an empty queue is the overwhelmingly common case (no
-    // contention), so scan once up front and skip all per-path holds checks
-    // when there are no waiters to yield to. Keeps an uncontended acquire's
-    // queue overhead to a single range seek.
-    let entries = scan(tx)?;
-    if entries.is_empty() {
-        return Ok(None);
-    }
+    policy: P,
+) -> anyhow::Result<Option<(String, String, Reason)>> {
+    let policy = policy.into();
     let owner = &args.owner_id;
     let mut mine: Vec<(String, Mode, LockAlgorithm)> = Vec::new();
-    for (p, m) in new_paths(args) {
-        if !owner_holds_or_covers(tx, owner, p, m, algorithm)? {
-            mine.push((p.to_string(), m, algorithm));
+    let mut candidate_seqs = std::collections::BTreeSet::new();
+    for (path, mode) in new_scoped_paths(args, namespace) {
+        if !owner_holds_or_covers(tx, owner, &path, mode, policy.algorithm)? {
+            collect_exact_path_seqs(tx, &path, &mut candidate_seqs)?;
+            for ancestor in get_ancestors(&path) {
+                collect_exact_path_seqs(tx, &ancestor, &mut candidate_seqs)?;
+            }
+            if mode == Mode::Write && policy.algorithm.recursive() {
+                collect_prefixed_path_seqs(
+                    tx,
+                    &descendant_index_prefix(&path),
+                    &mut candidate_seqs,
+                )?;
+            }
+            mine.push((path, mode, policy.algorithm));
         }
     }
     if mine.is_empty() {
         return Ok(None);
     }
+    if candidate_seqs.is_empty() {
+        return Ok(None);
+    }
     // A request already queued yields only to earlier waiters; a newcomer (no
     // seq) yields to all.
     let my_seq = owner_seq(tx, owner)?;
-    for entry in entries {
+    for seq in candidate_seqs {
+        let Some(entry) = read_entry(tx, seq)? else {
+            continue;
+        };
         if entry.owner == *owner {
             continue;
         }
@@ -312,8 +417,10 @@ pub fn blocked_by_earlier(
                 continue;
             }
         }
-        if let Some(path) = args_conflicts_with(&entry.args, entry.algorithm, &mine) {
-            return Ok(Some((entry.owner, path, REASON_QUEUED.to_string())));
+        if let Some(path) = args_conflicts_with(&entry.args, &entry.namespace, entry.policy, &mine)
+        {
+            let conflict_path = public_path(&entry.namespace, &path);
+            return Ok(Some((entry.owner, conflict_path, Reason::Queued)));
         }
     }
     Ok(None)
@@ -342,29 +449,47 @@ pub fn blocked_by_earlier(
 /// fence past a still-queued waiter's stored token.
 pub fn grant_sweep<F>(tx: &mut WriteTxn, mut try_acquire: F) -> anyhow::Result<Vec<String>>
 where
-    F: FnMut(&mut WriteTxn, &AcquireArgs, LockAlgorithm) -> anyhow::Result<AcquireOutcome>,
+    F: FnMut(&mut WriteTxn, &str, &AcquireArgs, LockPolicy) -> anyhow::Result<AcquireOutcome>,
 {
     let entries = scan(tx)?;
     let mut notify = Vec::new();
     let mut reserved: Vec<(String, Mode, LockAlgorithm)> = Vec::new();
     for entry in entries {
-        if args_conflicts_with(&entry.args, entry.algorithm, &reserved).is_some() {
-            reserve(&mut reserved, &entry.args, entry.algorithm);
+        if args_conflicts_with(&entry.args, &entry.namespace, entry.policy, &reserved).is_some() {
+            reserve(
+                &mut reserved,
+                &entry.namespace,
+                &entry.args,
+                entry.policy.algorithm,
+            );
             continue;
         }
-        match try_acquire(tx, &entry.args, entry.algorithm)? {
-            AcquireOutcome::Ok => {
+        match try_acquire(tx, &entry.namespace, &entry.args, entry.policy)? {
+            AcquireOutcome::Ok { .. } => {
                 dequeue(tx, &entry.owner)?;
                 notify.push(entry.owner);
             }
-            AcquireOutcome::Conflict { reason, .. } if reason == "stale_fencing_token" => {
+            AcquireOutcome::Conflict {
+                reason: Reason::StaleFencingToken,
+                ..
+            } => {
                 // Wake to refresh-and-retry; stays queued and reserved so later
                 // waiters keep their place behind it.
-                reserve(&mut reserved, &entry.args, entry.algorithm);
+                reserve(
+                    &mut reserved,
+                    &entry.namespace,
+                    &entry.args,
+                    entry.policy.algorithm,
+                );
                 notify.push(entry.owner);
             }
             _ => {
-                reserve(&mut reserved, &entry.args, entry.algorithm);
+                reserve(
+                    &mut reserved,
+                    &entry.namespace,
+                    &entry.args,
+                    entry.policy.algorithm,
+                );
             }
         }
     }
@@ -373,11 +498,12 @@ where
 
 fn reserve(
     reserved: &mut Vec<(String, Mode, LockAlgorithm)>,
+    namespace: &str,
     args: &AcquireArgs,
     algorithm: LockAlgorithm,
 ) {
-    for (p, m) in new_paths(args) {
-        reserved.push((p.to_string(), m, algorithm));
+    for (p, m) in new_scoped_paths(args, namespace) {
+        reserved.push((p, m, algorithm));
     }
 }
 
@@ -524,12 +650,14 @@ mod tests {
         let mut tx = txn(&db, 1_000);
         let s1 = enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         let s2 = enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/b", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -538,6 +666,7 @@ mod tests {
         // re-enqueue same owner keeps its seq (re-arm, no duplicate)
         let s1b = enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -555,12 +684,14 @@ mod tests {
         let mut tx = txn(&db, 1_000);
         enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/b", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -580,6 +711,7 @@ mod tests {
             let mut tx = txn(&db, 1_000);
             enqueue(
                 &mut tx,
+                "h",
                 &args("o1", vec![req("h:/a", Mode::Write)]),
                 LockAlgorithm::default(),
             )
@@ -598,6 +730,7 @@ mod tests {
         // o1 queued for an ancestor write
         enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -605,6 +738,7 @@ mod tests {
         // newcomer wants a descendant → must yield to o1
         let blocked = blocked_by_earlier(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/a/b", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -612,15 +746,12 @@ mod tests {
         // Reports the blocker's contended path (what o2 is queued behind).
         assert_eq!(
             blocked,
-            Some((
-                "o1".to_string(),
-                "h:/a".to_string(),
-                REASON_QUEUED.to_string()
-            ))
+            Some(("o1".to_string(), "h:/a".to_string(), Reason::Queued))
         );
         // disjoint newcomer is admitted
         let free = blocked_by_earlier(
             &mut tx,
+            "h",
             &args("o3", vec![req("h:/z", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -629,6 +760,7 @@ mod tests {
         // the waiter itself is not blocked by its own entry
         let me = blocked_by_earlier(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -642,18 +774,21 @@ mod tests {
         let mut tx = txn(&db, 1_000);
         enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap(); // conflicts with o1
         enqueue(
             &mut tx,
+            "h",
             &args("o3", vec![req("h:/b", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -661,17 +796,17 @@ mod tests {
 
         // try_acquire: Ok unless the path was already taken this sweep.
         let mut taken: Vec<String> = Vec::new();
-        let granted = grant_sweep(&mut tx, |_tx, a, _algorithm| {
+        let granted = grant_sweep(&mut tx, |_tx, _namespace, a, _algorithm| {
             let p = a.requests[0].path.clone();
             if taken.iter().any(|t| t == &p) {
                 Ok(AcquireOutcome::Conflict {
                     path: p,
                     owner: "x".into(),
-                    reason: "write_locked".into(),
+                    reason: Reason::WriteLocked,
                 })
             } else {
                 taken.push(p);
-                Ok(AcquireOutcome::Ok)
+                Ok(AcquireOutcome::Ok { fencing_token: 0 })
             }
         })
         .unwrap();
@@ -689,27 +824,29 @@ mod tests {
         let mut tx = txn(&db, 1_000);
         enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
 
         // o1 (head) is stale; o2 conflicts with o1 and stays reserved/quiet.
-        let notify = grant_sweep(&mut tx, |_tx, a, _algorithm| {
+        let notify = grant_sweep(&mut tx, |_tx, _namespace, a, _algorithm| {
             if a.owner_id == "o1" {
                 Ok(AcquireOutcome::Conflict {
                     path: a.requests[0].path.clone(),
                     owner: "fence".into(),
-                    reason: "stale_fencing_token".into(),
+                    reason: Reason::StaleFencingToken,
                 })
             } else {
-                Ok(AcquireOutcome::Ok)
+                Ok(AcquireOutcome::Ok { fencing_token: 0 })
             }
         })
         .unwrap();
@@ -727,18 +864,21 @@ mod tests {
         // Three contenders for h:/a, enqueued in order o1, o2, o3.
         enqueue(
             &mut tx,
+            "h",
             &args("o1", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
         .unwrap();
         enqueue(
             &mut tx,
+            "h",
             &args("o3", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -749,6 +889,7 @@ mod tests {
         assert_eq!(
             blocked_by_earlier(
                 &mut tx,
+                "h",
                 &args("o1", vec![req("h:/a", Mode::Write)]),
                 LockAlgorithm::default()
             )
@@ -760,6 +901,7 @@ mod tests {
         assert_eq!(
             blocked_by_earlier(
                 &mut tx,
+                "h",
                 &args("o2", vec![req("h:/a", Mode::Write)]),
                 LockAlgorithm::default()
             )
@@ -771,6 +913,7 @@ mod tests {
         assert_eq!(
             blocked_by_earlier(
                 &mut tx,
+                "h",
                 &args("o9", vec![req("h:/a", Mode::Write)]),
                 LockAlgorithm::default()
             )
@@ -785,11 +928,17 @@ mod tests {
         let (db, _d) = open_temp_db();
         let mut tx = txn(&db, 1_000);
         // o1 actually holds the write lock on h:/a (grant-in-place wrote it)...
-        tx.set_str(CF_WRITE_LOCKS, &wr_key("h:/a"), "o1", 10_000)
-            .unwrap();
+        tx.set_str(
+            CF_WRITE_LOCKS,
+            &wr_key(&scoped_path("h", "h:/a")),
+            "o1",
+            10_000,
+        )
+        .unwrap();
         // ...while o2 is queued behind for the same path.
         enqueue(
             &mut tx,
+            "h",
             &args("o2", vec![req("h:/a", Mode::Write)]),
             LockAlgorithm::default(),
         )
@@ -799,6 +948,7 @@ mod tests {
         assert_eq!(
             blocked_by_earlier(
                 &mut tx,
+                "h",
                 &args("o1", vec![req("h:/a", Mode::Write)]),
                 LockAlgorithm::default()
             )

@@ -40,7 +40,8 @@ use crate::cluster::placement::{
 };
 use crate::engine::{
     AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockDumpPage,
-    OwnedLock, PathInfo, RelReq, RenewOutcome, WaitEdgeMetadata,
+    LockPolicy, NamespacePolicyEntry, OwnedLock, PathInfo, Reason, RelReq, RenewOutcome,
+    WaitEdgeMetadata,
 };
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::raft::manager::RaftGroups;
@@ -131,7 +132,7 @@ pub struct RoutingOptions {
 impl Default for RoutingOptions {
     fn default() -> Self {
         Self {
-            group_count: 32,
+            group_count: 256,
             routing_prefix_segments: 1,
             max_inflight_per_group: 1024,
         }
@@ -142,6 +143,7 @@ impl Default for RoutingOptions {
 struct NamespaceRoute {
     namespace: String,
     explicit: bool,
+    policy: LockPolicy,
 }
 
 pub struct Router {
@@ -160,6 +162,7 @@ pub struct Router {
     /// Explicit namespace roots from the sys-group namespace settings table,
     /// sorted longest-first for longest-prefix routing.
     namespace_roots: RwLock<Vec<String>>,
+    namespace_policies: RwLock<HashMap<String, NamespacePolicyEntry>>,
     namespace_cache_loaded_ms: AtomicU64,
     inflight: HashMap<GroupId, Arc<tokio::sync::Semaphore>>,
     inflight_total: Arc<AtomicUsize>,
@@ -200,6 +203,7 @@ impl Router {
             leader_hints: RwLock::new(HashMap::new()),
             domain_groups: RwLock::new(HashMap::new()),
             namespace_roots: RwLock::new(Vec::new()),
+            namespace_policies: RwLock::new(HashMap::new()),
             namespace_cache_loaded_ms: AtomicU64::new(0),
             inflight,
             inflight_total: Arc::new(AtomicUsize::new(0)),
@@ -228,18 +232,28 @@ impl Router {
             .namespace_roots
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let policies = self
+            .namespace_policies
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(namespace) = roots
             .iter()
             .find(|namespace| namespace_contains_path(namespace, path))
         {
+            let policy = policies
+                .get(namespace)
+                .map(NamespacePolicyEntry::policy)
+                .unwrap_or_else(|| LockPolicy::from_algorithm(self.groups.default_algorithm()));
             return NamespaceRoute {
                 namespace: namespace.clone(),
                 explicit: true,
+                policy,
             };
         }
         NamespaceRoute {
             namespace: self.fallback_namespace(path),
             explicit: false,
+            policy: LockPolicy::from_algorithm(self.groups.default_algorithm()),
         }
     }
 
@@ -252,12 +266,26 @@ impl Router {
         Self::sort_namespace_roots(&mut roots);
     }
 
+    fn cache_namespace_entry(&self, entry: NamespacePolicyEntry) {
+        self.cache_namespace_root(&entry.namespace);
+        let mut policies = self
+            .namespace_policies
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        policies.insert(entry.namespace.clone(), entry);
+    }
+
     fn uncache_namespace_root(&self, namespace: &str) {
         let mut roots = self
             .namespace_roots
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         roots.retain(|root| root != namespace);
+        let mut policies = self
+            .namespace_policies
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        policies.remove(namespace);
     }
 
     async fn refresh_namespace_cache_if_stale(&self) -> anyhow::Result<()> {
@@ -267,13 +295,23 @@ impl Router {
             return Ok(());
         }
         match self.read_on(SYS_GROUP, ReadOp::ListNamespaces).await {
-            Ok(ReadResult::NamespaceList(mut roots)) => {
+            Ok(ReadResult::NamespaceList(entries)) => {
+                let policies: HashMap<String, NamespacePolicyEntry> = entries
+                    .into_iter()
+                    .map(|entry| (entry.namespace.clone(), entry))
+                    .collect();
+                let mut roots: Vec<String> = policies.keys().cloned().collect();
                 Self::sort_namespace_roots(&mut roots);
                 let mut cache = self
                     .namespace_roots
                     .write()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 *cache = roots;
+                let mut policy_cache = self
+                    .namespace_policies
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *policy_cache = policies;
                 self.namespace_cache_loaded_ms
                     .store(now_ms, Ordering::Relaxed);
                 Ok(())
@@ -312,9 +350,7 @@ impl Router {
         if explicit {
             return false;
         }
-        let probe = if namespace.contains(':') {
-            namespace.to_string()
-        } else if self.routing.routing_prefix_segments == 0 {
+        let probe = if namespace.contains(':') || self.routing.routing_prefix_segments == 0 {
             namespace.to_string()
         } else {
             format!("{namespace}:/")
@@ -860,44 +896,61 @@ impl Router {
         args: AcquireArgs,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
-        self.refresh_namespace_cache_if_stale().await?;
-        let mut domains: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for req in &args.requests {
-            let route = self.resolve_namespace_cached(&req.path);
-            if req.state == crate::engine::State::New {
-                self.ensure_lockable_route(&req.path, &route)?;
+        for attempt in 0..2 {
+            self.refresh_namespace_cache_if_stale().await?;
+            let mut routes: HashMap<String, NamespaceRoute> = HashMap::new();
+            for req in &args.requests {
+                let route = self.resolve_namespace_cached(&req.path);
+                if req.state == crate::engine::State::New {
+                    self.ensure_lockable_route(&req.path, &route)?;
+                }
+                routes.entry(route.namespace.clone()).or_insert(route);
             }
-            domains.insert(route.namespace);
-        }
-        for req in &args.release_requests {
-            domains.insert(self.resolve_namespace_cached(&req.path).namespace);
-        }
+            for req in &args.release_requests {
+                let route = self.resolve_namespace_cached(&req.path);
+                routes.entry(route.namespace.clone()).or_insert(route);
+            }
 
-        if domains.len() > 1 {
-            return Err(MultiDomainUnsupported.into());
+            if routes.len() > 1 {
+                return Err(MultiDomainUnsupported.into());
+            }
+            let Some(route) = routes.into_values().next() else {
+                return Ok((AcquireOutcome::Ok { fencing_token: 0 }, Vec::new()));
+            };
+            let group = self.group_of_domain(&route.namespace);
+            let response = self
+                .apply_to(
+                    group,
+                    self.command_with_idempotency(
+                        Op::AcquireInNamespace {
+                            namespace: route.namespace,
+                            policy: route.policy,
+                            args: args.clone(),
+                        },
+                        idempotency_key,
+                    ),
+                )
+                .await;
+            match response {
+                Ok(ApplyResponse::Acquire(outcome)) => return Ok((outcome, Vec::new())),
+                Ok(ApplyResponse::AcquireGranted { outcome, granted }) => {
+                    return Ok((outcome, granted));
+                }
+                Ok(_) => anyhow::bail!("unexpected response type"),
+                Err(e) => {
+                    if attempt == 0
+                        && e.downcast_ref::<CommandRejected>()
+                            .is_some_and(|err| err.kind == RejectKind::PolicyEpochStale)
+                    {
+                        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+                        self.refresh_namespace_cache_if_stale().await?;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
         }
-        let Some(domain) = domains.into_iter().next() else {
-            return Ok((AcquireOutcome::Ok, Vec::new()));
-        };
-        let group = self.group_of_domain(&domain);
-
-        match self
-            .apply_to(
-                group,
-                self.command_with_idempotency(
-                    Op::AcquireInNamespace {
-                        namespace: domain,
-                        args,
-                    },
-                    idempotency_key,
-                ),
-            )
-            .await?
-        {
-            ApplyResponse::Acquire(outcome) => Ok((outcome, Vec::new())),
-            ApplyResponse::AcquireGranted { outcome, granted } => Ok((outcome, granted)),
-            _ => anyhow::bail!("unexpected response type"),
-        }
+        unreachable!("acquire policy retry loop has a fixed non-empty range")
     }
 
     /// Release explicit paths, grouped by routing namespace (a release may
@@ -934,20 +987,24 @@ impl Router {
             return Ok(Vec::new());
         }
         self.refresh_namespace_cache_if_stale().await?;
-        let mut by_group: HashMap<GroupId, Vec<RelReq>> = HashMap::new();
+        let mut by_namespace: HashMap<String, (GroupId, Vec<RelReq>)> = HashMap::new();
         for req in reqs {
-            by_group
-                .entry(self.group_of(&req.path))
-                .or_default()
+            let route = self.resolve_namespace_cached(&req.path);
+            let group = self.group_of_domain(&route.namespace);
+            by_namespace
+                .entry(route.namespace)
+                .or_insert_with(|| (group, Vec::new()))
+                .1
                 .push(req.clone());
         }
-        let cmds: Vec<(GroupId, Command)> = by_group
+        let cmds: Vec<(GroupId, Command)> = by_namespace
             .into_iter()
-            .map(|(group, group_reqs)| {
+            .map(|(namespace, (group, group_reqs))| {
                 (
                     group,
                     self.command_with_idempotency(
                         Op::Release {
+                            namespace,
                             owner: owner.to_string(),
                             reqs: group_reqs,
                             del_wait,
@@ -1081,7 +1138,7 @@ impl Router {
         } else {
             Ok(RenewOutcome::Lost {
                 path: String::new(),
-                reason: "missing_alive".into(),
+                reason: Reason::MissingAlive,
             })
         }
     }
@@ -1208,7 +1265,7 @@ impl Router {
     ) -> anyhow::Result<Vec<String>> {
         self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
         self.refresh_namespace_cache_if_stale().await?;
-        let (_, explicit) = self.namespace_policy(namespace).await?;
+        let (_, explicit) = self.namespace_policy_record(namespace).await?;
         let route_changes = self.namespace_route_would_change(namespace, explicit);
         if route_changes {
             self.ensure_namespace_drained_if_route_changes(namespace, explicit)
@@ -1248,7 +1305,12 @@ impl Router {
             .await?,
             &mut cleared,
         )?;
-        self.cache_namespace_root(namespace);
+        let (policy, _) = self.namespace_policy_record(namespace).await?;
+        self.cache_namespace_entry(NamespacePolicyEntry {
+            namespace: namespace.to_string(),
+            algorithm: policy.algorithm,
+            epoch: policy.epoch,
+        });
         if route_changes {
             tokio::time::sleep(Duration::from_millis(NAMESPACE_CACHE_REFRESH_MS)).await;
         }
@@ -1266,7 +1328,7 @@ impl Router {
     ) -> anyhow::Result<Vec<String>> {
         self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
         self.refresh_namespace_cache_if_stale().await?;
-        let (_, explicit) = self.namespace_policy(namespace).await?;
+        let (_, explicit) = self.namespace_policy_record(namespace).await?;
         if explicit {
             self.ensure_namespace_drained_before_delete(namespace, explicit)
                 .await?;
@@ -1310,7 +1372,10 @@ impl Router {
         Ok(cleared.into_iter().collect())
     }
 
-    pub async fn namespace_policy(&self, namespace: &str) -> anyhow::Result<(LockAlgorithm, bool)> {
+    pub async fn namespace_policy_record(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<(LockPolicy, bool)> {
         let op = ReadOp::GetNamespacePolicy {
             namespace: namespace.to_string(),
         };
@@ -1318,9 +1383,23 @@ impl Router {
             ReadResult::NamespacePolicy {
                 algorithm,
                 explicit,
-            } => Ok((algorithm, explicit)),
+                epoch,
+            } => Ok((LockPolicy::new(algorithm, epoch), explicit)),
             _ => anyhow::bail!("unexpected read result"),
         }
+    }
+
+    pub async fn namespace_policy(&self, namespace: &str) -> anyhow::Result<(LockAlgorithm, bool)> {
+        self.namespace_policy_record(namespace)
+            .await
+            .map(|(policy, explicit)| (policy.algorithm, explicit))
+    }
+
+    pub async fn namespace_policy_detail(
+        &self,
+        namespace: &str,
+    ) -> anyhow::Result<(LockPolicy, bool)> {
+        self.namespace_policy_record(namespace).await
     }
 
     // -----------------------------------------------------------------------
@@ -1336,15 +1415,19 @@ impl Router {
         paths: &[String],
     ) -> anyhow::Result<AssertOutcome> {
         self.refresh_namespace_cache_if_stale().await?;
-        let mut by_group: HashMap<GroupId, Vec<String>> = HashMap::new();
+        let mut by_namespace: HashMap<String, (GroupId, Vec<String>)> = HashMap::new();
         for path in paths {
-            by_group
-                .entry(self.group_of(path))
-                .or_default()
+            let route = self.resolve_namespace_cached(path);
+            let group = self.group_of_domain(&route.namespace);
+            by_namespace
+                .entry(route.namespace)
+                .or_insert_with(|| (group, Vec::new()))
+                .1
                 .push(path.clone());
         }
-        for (group, group_paths) in by_group {
+        for (namespace, (group, group_paths)) in by_namespace {
             let op = ReadOp::AssertFencing {
+                namespace,
                 owner: owner.to_string(),
                 token,
                 paths: group_paths,
@@ -1415,7 +1498,7 @@ impl Router {
                 // claim-involved cycles.
                 Some(meta) => {
                     if !self
-                        .is_blocking(&meta.conflict_path, &next, &meta.reason)
+                        .is_blocking(&meta.conflict_path, &next, meta.reason)
                         .await?
                     {
                         let _ = self.clear_wait_edge(&current).await;
@@ -1443,13 +1526,20 @@ impl Router {
 
     /// Check whether `owner` still blocks at `path` — the lock state lives in
     /// the path's group.
-    pub async fn is_blocking(&self, path: &str, owner: &str, reason: &str) -> anyhow::Result<bool> {
+    pub async fn is_blocking(
+        &self,
+        path: &str,
+        owner: &str,
+        reason: Reason,
+    ) -> anyhow::Result<bool> {
         self.refresh_namespace_cache_if_stale().await?;
-        let group = self.group_of(path);
+        let route = self.resolve_namespace_cached(path);
+        let group = self.group_of_domain(&route.namespace);
         let op = ReadOp::IsBlocking {
+            namespace: route.namespace,
             path: path.to_string(),
             owner: owner.to_string(),
-            reason: reason.to_string(),
+            reason,
         };
         match self.read_on(group, op).await? {
             ReadResult::Bool(blocking) => Ok(blocking),
@@ -1481,8 +1571,10 @@ impl Router {
 
     pub async fn inspect_path(&self, path: &str) -> anyhow::Result<PathInfo> {
         self.refresh_namespace_cache_if_stale().await?;
-        let group = self.group_of(path);
+        let route = self.resolve_namespace_cached(path);
+        let group = self.group_of_domain(&route.namespace);
         let op = ReadOp::InspectPath {
+            namespace: route.namespace,
             path: path.to_string(),
         };
         match self.read_on(group, op).await? {
@@ -1695,22 +1787,22 @@ mod tests {
             release_requests: vec![],
             queue_ttl_ms: 0,
         };
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire_with_idempotency(args.clone(), Some("acquire-retry-1"))
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
-        assert_eq!(
+            AcquireOutcome::Ok { .. }
+        ));
+        assert!(matches!(
             router
                 .acquire_with_idempotency(args, Some("acquire-retry-1"))
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
 
         router
             .release_with_idempotency(
@@ -1736,7 +1828,7 @@ mod tests {
         );
 
         for path in ["h:/force-a", "h:/force-b"] {
-            assert_eq!(
+            assert!(matches!(
                 router
                     .acquire(AcquireArgs {
                         owner_id: "victim".into(),
@@ -1749,8 +1841,8 @@ mod tests {
                     .await
                     .unwrap()
                     .0,
-                AcquireOutcome::Ok
-            );
+                AcquireOutcome::Ok { .. }
+            ));
         }
         router
             .force_release_with_idempotency("victim", Some("force-retry-1"))
@@ -1783,7 +1875,7 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(outcome, AcquireOutcome::Ok);
+        assert!(matches!(outcome, AcquireOutcome::Ok { .. }));
 
         let info = router.inspect_path("h:/r").await.unwrap();
         assert_eq!(info.write_owner.as_deref(), Some("owner-1"));
@@ -1814,7 +1906,7 @@ mod tests {
             .set_namespace_policy("h:/", LockAlgorithm::RecursiveRw, None)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(AcquireArgs {
                     owner_id: "root-owner".into(),
@@ -1827,8 +1919,8 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
         assert!(matches!(
             router
                 .acquire(AcquireArgs {
@@ -1842,7 +1934,7 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Queued { reason, .. } if reason == "ancestor_locked"
+            AcquireOutcome::Queued { reason, .. } if reason == Reason::AncestorLocked
         ));
     }
 
@@ -1872,7 +1964,7 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Conflict { reason, .. } if reason == "read_locks_disabled"
+            AcquireOutcome::Conflict { reason, .. } if reason == Reason::ReadLocksDisabled
         ));
 
         let err = router
@@ -1896,7 +1988,7 @@ mod tests {
             router.namespace_policy("h:/a/b").await.unwrap(),
             (LockAlgorithm::RecursiveRw, false)
         );
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(AcquireArgs {
                     owner_id: "reader".into(),
@@ -1909,15 +2001,15 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
     }
 
     #[tokio::test]
     async fn namespace_route_changes_require_drained_subtree() {
         let (router, _dir) = test_router_with_segments(1).await;
 
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(AcquireArgs {
                     owner_id: "holder".into(),
@@ -1930,8 +2022,8 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
 
         let err = router
             .set_namespace_policy("h:/guard/deep", LockAlgorithm::PointWrite, None)
@@ -1948,7 +2040,7 @@ mod tests {
             .set_namespace_policy("h:/delete-me", LockAlgorithm::RecursiveRw, None)
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(AcquireArgs {
                     owner_id: "delete-holder".into(),
@@ -1961,8 +2053,8 @@ mod tests {
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
         let err = router
             .delete_namespace_policy("h:/delete-me", None)
             .await
@@ -2004,7 +2096,7 @@ mod tests {
         }
         let mut winners = 0;
         for handle in handles {
-            if matches!(handle.await.unwrap(), AcquireOutcome::Ok) {
+            if matches!(handle.await.unwrap(), AcquireOutcome::Ok { .. }) {
                 winners += 1;
             }
         }
@@ -2028,7 +2120,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            assert_eq!(outcome, AcquireOutcome::Ok);
+            assert!(matches!(outcome, AcquireOutcome::Ok { .. }));
         }
         assert_ne!(
             router.group_of("alpha:/a"),
@@ -2057,7 +2149,7 @@ mod tests {
 
         // Renewing a nonexistent owner is Lost(missing_alive) in aggregate.
         match router.renew("ghost", 1_000, &[]).await.unwrap() {
-            RenewOutcome::Lost { reason, .. } => assert_eq!(reason, "missing_alive"),
+            RenewOutcome::Lost { reason, .. } => assert_eq!(reason, Reason::MissingAlive),
             other => panic!("expected Lost, got {other:?}"),
         }
 
@@ -2147,14 +2239,14 @@ mod tests {
         };
 
         // Owner A holds the ancestor write (covers the subtree).
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(acq("a", 1, anc, State::New))
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok
-        );
+            AcquireOutcome::Ok { .. }
+        ));
         // A descendant write by B is enqueued in the same group (covered by A).
         assert!(
             matches!(
@@ -2180,14 +2272,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             router
                 .acquire(acq("b", 2, desc, State::Held))
                 .await
                 .unwrap()
                 .0,
-            AcquireOutcome::Ok,
-            "B must hold the descendant after the ancestor releases"
-        );
+            AcquireOutcome::Ok { .. }
+        ));
     }
 }
