@@ -237,6 +237,12 @@ message RenewResponse {
   RenewStatus status = 1;
   string path = 2;
   ReasonCode reason = 3;
+  // OK only: a cooperative revoke is pending for this owner (set by
+  // RequestRevoke). The holder should finish its current unit of work and
+  // release. Carried on the renew heartbeat so a poll-only client — one that
+  // cannot hold a Subscribe/SSE stream — still learns it has been asked to
+  // yield, with no separate event channel.
+  bool revoke_requested = 4;
 }
 
 // ---------------------------------------------------------------------------

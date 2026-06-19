@@ -106,6 +106,11 @@ fn collect_cleared(resp: ApplyResponse, into: &mut BTreeSet<String>) -> anyhow::
 const MAX_FORWARD_HOPS: usize = 4;
 /// Per-hop deadline for forwarded commands and reads.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a pending cooperative-revoke marker lives if neither honored
+/// (the owner releases) nor refreshed. Generous relative to renew heartbeats
+/// so a holder cannot renew straight past it, but short enough that a stale
+/// marker self-heals; a requester re-issues `RequestRevoke` to extend it.
+const REVOKE_MARKER_TTL_MS: u64 = 300_000;
 /// Concurrency budget for operations that fan out across many groups
 /// (owner-wide writes, cross-group reads).
 const FANOUT_CONCURRENCY: usize = 16;
@@ -1126,9 +1131,15 @@ impl Router {
             .collect();
 
         let mut renewed_any = false;
+        let mut revoke_requested = false;
         for resp in self.fanout_apply(cmds).await? {
             match resp {
-                ApplyResponse::Renew(RenewOutcome::Ok) => renewed_any = true,
+                ApplyResponse::Renew(RenewOutcome::Ok { revoke_requested: r }) => {
+                    renewed_any = true;
+                    // The marker is fanned to every lock group, so any group
+                    // where the owner is alive reports it; OR across groups.
+                    revoke_requested |= r;
+                }
                 ApplyResponse::Renew(RenewOutcome::Lost { path, reason }) => {
                     // An empty path means the owner holds nothing in that
                     // group. In a broadcast renew that is mere absence; in a
@@ -1143,7 +1154,7 @@ impl Router {
             }
         }
         if renewed_any {
-            Ok(RenewOutcome::Ok)
+            Ok(RenewOutcome::Ok { revoke_requested })
         } else {
             Ok(RenewOutcome::Lost {
                 path: String::new(),
@@ -1180,6 +1191,28 @@ impl Router {
         self.clear_wait_edge_with_idempotency(victim, idempotency_key)
             .await?;
         Ok(granted)
+    }
+
+    /// Record a pending cooperative-revoke marker for `owner` in every lock
+    /// group (mirrors `force_release`'s fan-out). Only groups where the owner
+    /// is alive keep it; the rest no-op. The owner sees `revoke_requested` on
+    /// its next `Renew`, so a poll-only client needs no event stream to learn
+    /// it was asked to yield. Idempotent and safe to repeat (escalation loop).
+    pub async fn request_revoke(&self, owner: &str) -> anyhow::Result<()> {
+        let cmds: Vec<(GroupId, Command)> = self
+            .lock_groups()
+            .map(|group| {
+                (
+                    group,
+                    self.command(Op::RequestRevoke {
+                        owner: owner.to_string(),
+                        ttl_ms: REVOKE_MARKER_TTL_MS,
+                    }),
+                )
+            })
+            .collect();
+        self.fanout_apply(cmds).await?;
+        Ok(())
     }
 
     /// Propose an arbitrary command on the system group (controller use).
@@ -1897,7 +1930,7 @@ mod tests {
         // wholesale Lost.)
         assert_eq!(
             router.renew("ns-owner", 30_000, &[namespace]).await.unwrap(),
-            RenewOutcome::Ok
+            RenewOutcome::Ok { revoke_requested: false }
         );
     }
 
@@ -2180,12 +2213,12 @@ mod tests {
                 .renew("spanner", 30_000, &["alpha".into(), "beta".into()])
                 .await
                 .unwrap(),
-            RenewOutcome::Ok
+            RenewOutcome::Ok { revoke_requested: false }
         );
         // Broadcast renew also works.
         assert_eq!(
             router.renew("spanner", 30_000, &[]).await.unwrap(),
-            RenewOutcome::Ok
+            RenewOutcome::Ok { revoke_requested: false }
         );
         // Liveness and lock listing aggregate across groups.
         assert!(router.is_owner_alive("spanner").await.unwrap());

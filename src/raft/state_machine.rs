@@ -337,11 +337,8 @@ fn mint_fence_if_needed(
     if args.fencing_token > 0 || algorithm.is_semaphore() {
         return Ok(args.clone());
     }
-    if !args
-        .requests
-        .iter()
-        .any(|req| req.mode == Mode::Write && !algorithm.is_semaphore())
-    {
+    // Semaphores returned above, so any write request here needs a fence token.
+    if !args.requests.iter().any(|req| req.mode == Mode::Write) {
         return Ok(args.clone());
     }
 
@@ -470,6 +467,10 @@ fn execute_op(
         }
         Op::ClearWaitEdge { owner } => {
             engine::clear_wait_edge_inner(txn, owner)?;
+            ApplyResponse::Unit
+        }
+        Op::RequestRevoke { owner, ttl_ms } => {
+            engine::request_revoke_inner(txn, owner, *ttl_ms)?;
             ApplyResponse::Unit
         }
         Op::GcSweep { now_ms: _, batch } => {

@@ -17,7 +17,7 @@ use tracing::warn;
 
 use crate::store_keys::{
     alive_key, fence_key, hold_algorithm_key, namespace_policy_key, own_prefix, rd_prefix,
-    rddesc_prefix, sem_prefix, semaphore_permits_key, wait_key, wr_key, wrdesc_key,
+    rddesc_prefix, revoke_key, sem_prefix, semaphore_permits_key, wait_key, wr_key, wrdesc_key,
     FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
@@ -488,8 +488,17 @@ pub enum AcquireOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenewOutcome {
-    Ok,
-    Lost { path: String, reason: Reason },
+    /// The lease was extended. `revoke_requested` is true when a cooperative
+    /// revoke is pending for this owner — the holder should finish its current
+    /// work and release. It rides the existing heartbeat so a poll-only client
+    /// (no event stream) still learns it has been asked to yield.
+    Ok {
+        revoke_requested: bool,
+    },
+    Lost {
+        path: String,
+        reason: Reason,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1424,6 +1433,7 @@ fn apply_releases<T: StoreTxn>(
     }
     if !tx.has_live_member(OWN_CF, own_pfx)? {
         tx.del(ALIVE_CF, alive_k)?;
+        tx.del(ALIVE_CF, &revoke_key(owner))?;
     }
     Ok(())
 }
@@ -1521,6 +1531,7 @@ pub fn release_inner_in_namespace<T: StoreTxn>(
 
     if !tx.has_live_member(OWN_CF, &own_pfx)? {
         tx.del(ALIVE_CF, &alive_k)?;
+        tx.del(ALIVE_CF, &revoke_key(owner))?;
     }
 
     // In the multi-group deployment wait edges live only in the sys group,
@@ -1609,6 +1620,7 @@ fn release_owner_wide<T: StoreTxn>(
     }
 
     tx.del(ALIVE_CF, &alive_key(owner))?;
+    tx.del(ALIVE_CF, &revoke_key(owner))?;
     if del_wait_key {
         tx.del(WAIT_CF, &wait_key(owner))?;
     }
@@ -1642,7 +1654,30 @@ pub fn renew_inner<T: StoreTxn>(
         return Ok(renew_lost("", Reason::MissingOwnerSet));
     }
     tx.pexpire_str(ALIVE_CF, &alive_k, ttl_ms)?;
-    Ok(RenewOutcome::Ok)
+    // Piggyback the cooperative-revoke signal on the heartbeat the holder is
+    // already sending. Read-only; the marker is cleared on release, not here.
+    let revoke_requested = tx.get_str(ALIVE_CF, &revoke_key(owner))?.is_some();
+    Ok(RenewOutcome::Ok { revoke_requested })
+}
+
+// ---------------------------------------------------------------------------
+// REQUEST_REVOKE (cooperative)
+// ---------------------------------------------------------------------------
+
+/// Record a pending cooperative-revoke marker for `owner`, but only where the
+/// owner actually holds a lease — a marker for an absent owner would be litter
+/// that only its TTL reaps. The marker is read back on the owner's next
+/// [`renew_inner`] and cleared when its liveness record is deleted.
+pub fn request_revoke_inner<T: StoreTxn>(
+    tx: &mut T,
+    owner: &str,
+    ttl_ms: u64,
+) -> anyhow::Result<()> {
+    if tx.get_str(ALIVE_CF, &alive_key(owner))?.is_none() {
+        return Ok(());
+    }
+    tx.set_str(ALIVE_CF, &revoke_key(owner), "1", ttl_ms)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

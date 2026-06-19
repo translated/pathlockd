@@ -745,14 +745,16 @@ impl PathLock for PathLockService {
                 .await
                 .map_err(engine_err)?;
             let resp = match outcome {
-                RenewOutcome::Ok => RenewResponse {
+                RenewOutcome::Ok { revoke_requested } => RenewResponse {
                     status: RenewStatus::Ok as i32,
+                    revoke_requested,
                     ..Default::default()
                 },
                 RenewOutcome::Lost { path, reason } => RenewResponse {
                     status: RenewStatus::Lost as i32,
                     path,
                     reason: reason_to_proto(reason),
+                    ..Default::default()
                 },
             };
             Ok(Response::new(resp))
@@ -1022,6 +1024,14 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
+                // Persist a durable marker the holder observes on its next
+                // Renew (works for poll-only clients), then push a REVOKE event
+                // for clients that do hold a Subscribe/SSE stream (lower
+                // latency). The two are complementary, not redundant.
+                self.router
+                    .request_revoke(&req.owner_id)
+                    .await
+                    .map_err(engine_err)?;
                 self.broadcaster.revoke(&req.owner_id);
                 Ok(Response::new(RequestRevokeResponse {}))
             },

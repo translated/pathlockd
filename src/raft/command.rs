@@ -53,6 +53,14 @@ pub enum Op {
     ClearWaitEdge {
         owner: String,
     },
+    /// Record a pending cooperative-revoke marker for an owner (TTL-bounded).
+    /// The owner observes it on its next `Renew` and yields voluntarily — a
+    /// poll-only client thus needs no event stream to learn it was asked to
+    /// release.
+    RequestRevoke {
+        owner: String,
+        ttl_ms: u64,
+    },
     GcSweep {
         /// Unused by apply; retained as an explicit command payload timestamp
         /// for callers that want to include the requested sweep time.

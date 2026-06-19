@@ -1,7 +1,6 @@
 //! Shared state for the HTTP facade handlers.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::service::PathLockService;
 
@@ -14,6 +13,4 @@ use super::eventlog::EventLog;
 pub struct AppState {
     pub svc: PathLockService,
     pub log: Arc<EventLog>,
-    /// Maximum block for a long-poll with no events.
-    pub poll_wait: Duration,
 }

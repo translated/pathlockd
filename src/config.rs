@@ -188,12 +188,9 @@ pub struct Config {
     /// early data are rejected and must be retried on the 1-RTT connection.
     pub web_zero_rtt: bool,
     /// Per-owner retained event ring depth backing SSE replay (`Last-Event-ID`)
-    /// and the long-poll fallback. Larger = more history for reconnecting or
-    /// legacy pollers, at a bounded per-owner memory cost.
+    /// across brief reconnects. Larger = more history, at a bounded per-owner
+    /// memory cost.
     pub web_event_log_capacity: usize,
-    /// Maximum time a long-poll request blocks waiting for new events before
-    /// returning an empty batch (legacy clients without SSE).
-    pub web_poll_wait_ms: u64,
 }
 
 impl Default for Config {
@@ -250,7 +247,6 @@ impl Default for Config {
             tls_key_path: None,
             web_zero_rtt: true,
             web_event_log_capacity: 1024,
-            web_poll_wait_ms: 25_000,
         }
     }
 }
@@ -310,7 +306,6 @@ struct FileConfig {
     tls_key_path: Option<PathBuf>,
     web_zero_rtt: Option<bool>,
     web_event_log_capacity: Option<usize>,
-    web_poll_wait_ms: Option<u64>,
 }
 
 #[derive(Parser, Debug)]
@@ -580,7 +575,6 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     }
     apply!(web_zero_rtt);
     apply!(web_event_log_capacity);
-    apply!(web_poll_wait_ms);
 }
 
 fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
@@ -727,9 +721,6 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     }
     if let Some(v) = env_parse::<usize>("PATHLOCKD_WEB_EVENT_LOG_CAPACITY")? {
         cfg.web_event_log_capacity = v;
-    }
-    if let Some(v) = env_parse::<u64>("PATHLOCKD_WEB_POLL_WAIT_MS")? {
-        cfg.web_poll_wait_ms = v;
     }
     Ok(())
 }

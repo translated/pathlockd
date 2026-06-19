@@ -1,28 +1,27 @@
-//! Per-owner retained event log backing the HTTP event APIs.
+//! Per-owner retained event log backing the HTTP SSE endpoint.
 //!
 //! The gRPC `Subscribe` stream is live-only: it delivers events while a
 //! subscription is attached and forgets them otherwise. That is fine for a
-//! persistent stream, but the HTTP facade needs two things gRPC does not:
+//! persistent stream, but the SSE facade needs one thing gRPC does not:
+//! **resume** — a reconnecting `EventSource` replays from its `Last-Event-ID`,
+//! so we keep a short, monotonically-numbered history.
 //!
-//!   * **SSE resume** — a reconnecting `EventSource` replays from its
-//!     `Last-Event-ID`, so we must keep a short, monotonically-numbered history.
-//!   * **Long-poll** — a legacy client disconnects *between* polls, so events
-//!     raised in the gap must survive until the next poll.
-//!
-//! Both are served by a bounded per-owner ring of `(id, Event)`, fed by a
-//! single background drain task that subscribes to the [`Broadcaster`] once per
-//! owner and fans out to every attached HTTP client. The ring is reference
-//! counted: it stays alive (and keeps draining) while any client is attached,
-//! and for a short retention window afterwards so poll gaps and quick
-//! reconnects do not lose events. History is still best-effort — an owner with
-//! no attached client and an expired window starts fresh, exactly like gRPC.
+//! It is served by a bounded per-owner ring of `(id, Event)`, fed by a single
+//! background drain task that subscribes to the [`Broadcaster`] once per owner
+//! and fans out to every attached HTTP client. The ring is reference counted:
+//! it stays alive (and keeps draining) while any client is attached, and for a
+//! short retention window afterwards so quick reconnects do not lose events.
+//! History is still best-effort — an owner with no attached client and an
+//! expired window starts fresh, exactly like gRPC.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::sync::futures::Notified;
 use tokio::sync::Notify;
 
 use crate::events::Broadcaster;
@@ -152,12 +151,36 @@ impl OwnerLog {
         ring.iter().filter(|e| e.id > after).cloned().collect()
     }
 
+    /// Register interest in the next event or teardown, returning a guard the
+    /// caller awaits *after* draining via [`since`](Self::since). The waiter must
+    /// be enabled *before* the drain: [`push`](Self::push) wakes via
+    /// `Notify::notify_waiters`, which stores no permit, so an event appended in
+    /// the window between a drain and the wait would otherwise be missed until
+    /// the guard's `timeout`. Enabling up front closes that window — such a
+    /// wakeup lands on the already-registered guard.
+    pub fn prepare_wait(&self) -> WaitGuard<'_> {
+        let mut notified = Box::pin(self.notify.notified());
+        let mut shutdown = Box::pin(self.shutdown.notified());
+        notified.as_mut().enable();
+        shutdown.as_mut().enable();
+        WaitGuard { notified, shutdown }
+    }
+}
+
+/// A pre-registered wakeup from [`OwnerLog::prepare_wait`], created before the
+/// caller drains so no `notify_waiters` wakeup is lost in the check-then-wait
+/// gap; awaited afterwards.
+pub struct WaitGuard<'a> {
+    notified: Pin<Box<Notified<'a>>>,
+    shutdown: Pin<Box<Notified<'a>>>,
+}
+
+impl WaitGuard<'_> {
     /// Wait until a new event is appended, the log is torn down, or `timeout`
     /// elapses. Returns `true` if woken by an event/teardown, `false` on
-    /// timeout. The caller must re-read via [`since`] after waking.
-    pub async fn wait(&self, timeout: Duration) -> bool {
-        let notified = self.notify.notified();
-        let shutdown = self.shutdown.notified();
+    /// timeout. The caller must re-read via [`OwnerLog::since`] after waking.
+    pub async fn wait(self, timeout: Duration) -> bool {
+        let Self { notified, shutdown } = self;
         tokio::select! {
             _ = notified => true,
             _ = shutdown => true,

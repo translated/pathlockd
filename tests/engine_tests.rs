@@ -593,7 +593,7 @@ fn renew_extends_lease() {
             },
         },
     );
-    assert!(matches!(resp, ApplyResponse::Renew(RenewOutcome::Ok)));
+    assert!(matches!(resp, ApplyResponse::Renew(RenewOutcome::Ok { .. })));
 
     // Alice still holds after original lease would have expired
     let args = AcquireArgs {
@@ -2242,7 +2242,7 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
     assert!(
         matches!(
             resp,
-            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok)
+            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok { .. })
         ),
         "renew should refresh the owner lease without scanning, got {resp:?}"
     );
@@ -2323,7 +2323,7 @@ fn fence_refreshes_reuse_one_quantized_expiry_slot() {
         );
         assert!(matches!(
             resp,
-            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok)
+            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok { .. })
         ));
     }
 

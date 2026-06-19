@@ -194,6 +194,19 @@ pub fn alive_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
+/// Pending cooperative-revoke marker for an owner: `owner ++ NUL ++ "revoke"`.
+/// Stored in `CF_OWNER_ALIVE` as a sibling of [`alive_key`] (a distinct suffix,
+/// so a point get on the bare-owner liveness key never matches it, and that CF
+/// is only ever point-accessed). It carries its own TTL and is deleted whenever
+/// the owner's liveness record is, so the marker shares the lease's lifecycle.
+pub fn revoke_key(owner: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(owner.len() + 7);
+    buf.extend_from_slice(owner.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(b"revoke");
+    buf
+}
+
 /// Set key under which an owner's held lock members are stored.
 pub fn own_prefix(owner: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(owner.len() + 1);

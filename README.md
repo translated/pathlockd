@@ -46,38 +46,41 @@ next sweep, never wedges a path.
 
 ## Where it fits
 
-`pathlockd` coordinates *who may touch what* across processes and machines; it
-never stores your data. Anywhere a tree of resources is mutated concurrently and
-a stale actor must be fenced out, the path-lock model fits.
+`pathlockd` coordinates *who may touch what* across processes and machines — it
+never stores your data. Use it when concurrent actors mutate a tree of resources
+and a stale one must be fenced out.
 
-- **User-space virtual filesystems.** A path is a file/folder; a write lock owns
-  the whole subtree, a read lock pins one node. The handler prefix (`s3:`,
-  `google_drive:`, `local:`) selects the backend; fencing tokens let the backing
-  store reject a writer that paused too long. End-to-end walkthrough in
-  [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md).
-- **Object-store / blob mutations.** Read-modify-write on an S3 key or a DB row
-  is safe when the key is a locked path and you `AssertFencing` immediately
-  before the `PUT`. The store enforces monotonicity even across leader
-  failovers, so a delayed write from a wedged client is rejected, not applied.
-- **Hierarchical multi-tenant resources.** Lock `tenant:/acme/projects/42` and
-  you own that project's whole subtree without enumerating its children; a
-  reader on `tenant:/acme` doesn't block writers deeper in the tree. Natural fit
-  for collaborative-doc backends, CMS folder trees, and config hierarchies.
-- **Data-pipeline / ETL partition ownership.** Each worker takes a write lock on
-  its partition path (`etl:/2026/06/19/shard-7`); the subtree rule guarantees no
-  two workers claim overlapping ranges, and a crashed worker's lease lapses so
-  the partition reprocesses instead of wedging.
+- **Multi-tenant SaaS & collaborative docs.** Lock `tenant:/acme/projects/42`
+  to own the whole subtree without enumerating children; readers on parents
+  don't block writers deeper down. Fits CMS trees, config hierarchies, doc
+  backends.
+- **Coordinated operations across services.** When N services must sequence
+  their work — saga steps, multi-stage workflows, ordered processing across
+  workers. Acquire the path, run the step, release; a crashed service's lease
+  lapses so the workflow unsticks itself.
+- **Object-store / DB row read-modify-write.** Lock the key, `AssertFencing`
+  right before the `PUT` — a paused-then-resumed writer is rejected, not
+  applied, even across leader failovers.
 - **Singleton jobs & leader election.** A write lock on `cron:/nightly-rollup`
-  with a TTL is an only-one-runner gate. The holder renews to keep running; if
-  it dies the lease frees on the next sweep and a standby is granted in place
-  via its `Subscribe` stream — no retry-loop thundering herd.
-- **Bounded concurrency / resource pools.** The `semaphore` primitive is a
-  counting lock: cap a path at N concurrent acquires to throttle a rate-limited
-  upstream, a license pool, or a fixed worker fleet, without a separate
-  rate-limiter service.
-- **Migrations & deploy locks.** A short-lived write lock on
-  `deploy:/region/us-east` serializes schema migrations or rollouts; the
-  mandatory TTL means a forgotten lock can never strand the pipeline.
+  with a TTL is an only-one-runner gate; if the holder dies, a standby is
+  granted in place via its event stream — no thundering herd. *Feasibility:*
+  lock-based election, not consensus — the holder is the leader, `Renew` is the
+  heartbeat, the fence protects the backing store from a stale leader. No quorum
+  or terms, so pair with fencing-token checks at the store for split-brain
+  safety; don't use it where you need majority voting.
+- **Bounded concurrency / resource pools.** The `semaphore` primitive caps a
+  path at N concurrent acquires — throttle a rate-limited upstream, a license
+  pool, or a fixed worker fleet without a separate rate-limiter.
+- **Migrations & deploy locks.** A write lock on `deploy:/region/us-east`
+  serializes schema migrations or rollouts; the mandatory TTL means a forgotten
+  lock can never strand the pipeline.
+- **Data-pipeline / ETL partition ownership.** Each worker locks its partition
+  path (`etl:/2026/06/19/shard-7`); overlapping ranges are impossible, and a
+  crashed worker's lease lapses so the partition reprocesses.
+- **User-space virtual filesystems.** A path is a file/folder; write owns the
+  subtree, read pins one node. Fencing tokens let the backing store reject a
+  writer that paused too long. Walkthrough:
+  [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md).
 
 ## Quick start
 
@@ -150,11 +153,9 @@ generated at boot.
   status codes map to HTTP status codes.
 - **Events over SSE.** `GET /v1/events/sse?owner_id=…` is a `text/event-stream`
   of that owner's lifecycle events; each frame carries a monotonic `id`, so a
-  reconnecting `EventSource` resumes from `Last-Event-ID`.
-- **Long-poll fallback.** `GET /v1/events/poll?owner_id=…&after=<id>` for clients
-  without SSE: returns events newer than `after`, or blocks up to
-  `web_poll_wait_ms` and returns an empty batch. A per-owner retained ring
-  bridges the gaps between polls.
+  reconnecting `EventSource` resumes from `Last-Event-ID`. SSE is the only event
+  *stream* — clients that can't hold one don't need it (see the polling loop
+  below); the cooperative-revoke signal is also delivered on `renew`.
 - **HTTP/3 0-RTT, reads-only.** QUIC early data is replayable, so the facade
   dispatches **only read-only RPCs** received before the handshake completes;
   mutating RPCs in early data get `425 Too Early` and must retry on the 1-RTT
@@ -170,6 +171,91 @@ curl -kN "https://localhost:8443/v1/events/sse?owner_id=op-7"
 Config keys (and `PATHLOCKD_WEB_*` env equivalents) are in
 [`pathlockd.example.toml`](pathlockd.example.toml). The facade is unauthenticated
 like gRPC — front it with an mTLS/auth proxy or restrict reachability.
+
+## Polling-based client loop (no event stream required)
+
+A client never has to open a `Subscribe`/SSE stream. Every signal maps to a
+poll-friendly read, so environments that can't hold a long-lived stream
+(browsers without SSE, restricted networks, request/response-only clients) lose
+nothing:
+
+| Event | Poll-only equivalent |
+| --- | --- |
+| `GRANT` (queued acquire became held) | `listOwnerLocks` / `inspectPath` — level-triggered, can't be missed |
+| `KILLED` (lease force-released) | `isOwnerAlive`, or `assertFencing` returns `stale_fencing_token` before your next write |
+| `REVOKE` (asked to yield) | `renew` returns `revokeRequested: true` — the request is persisted and rides your heartbeat |
+
+So the whole loop is just the request/response RPCs:
+
+```
+acquire → if OK proceed; if QUEUED, poll listOwnerLocks until the path is yours
+          (or queue_ttl_ms lapses and you abandon).
+renew on a timer → if revokeRequested, finish current work and releaseAll.
+assertFencing right before each backing-store write.
+release when done.
+```
+
+Correctness never depends on events either way: `assertFencing` (fencing) and
+the TTL lease are the safety mechanisms. `RequestRevoke` is advisory graceful
+preemption — pair it with a deadline and escalate to `ForceRelease` if a holder
+won't yield.
+
+`GET /v1/events/poll` still gives you a long-poll fallback for any
+cross-owner notifications (e.g. a `killed` you didn't trigger).
+
+## SSE-based client loop
+
+The streaming equivalent — preferred when you can hold a long-lived
+connection (gRPC `Subscribe` or `GET /v1/events/sse`):
+
+```
+acquire → if OK proceed; if QUEUED, wait for a GRANT event on your owner's
+          event stream (or queue_ttl_ms lapses and you abandon).
+renew on a timer.
+assertFencing right before each backing-store write.
+release when done.
+```
+
+The same stream also delivers `REVOKE` (cooperative yield request) and
+`KILLED` (you were force-released — stop all backing-store I/O at once).
+
+## Examples
+
+Runnable examples in [`examples/`](examples/) — HTTP/1.1, gRPC, and HTTP/3
+against a local daemon. Each is a self-contained demo:
+
+| Example | Transport | What it shows |
+| --- | --- | --- |
+| [`python/mutex.py`](examples/python/mutex.py) | HTTP/1.1 + SSE | Mutual exclusion: two workers contend on one path; the second is enqueued and waits for a `GRANT` event. |
+| [`python/hierarchical_rwlock.py`](examples/python/hierarchical_rwlock.py) | HTTP/1.1 + SSE | Tree-shaped RWLock: a subtree write queues a descendant read (`ancestor_locked`), a sibling read succeeds, and the queued read is granted when the writer releases. |
+| [`python/semaphore.py`](examples/python/semaphore.py) | HTTP/1.1 + SSE | Counting semaphore: sets `LOCK_ALGORITHM_SEMAPHORE`, caps at N permits, queues the N+1th acquire. |
+| [`python/lock_lifecycle.py`](examples/python/lock_lifecycle.py) | HTTP/1.1 + SSE | A high-level `Lock` object: add/remove paths mid-lease, fencing checks, renewals, preemption via `KILLED`, deadlock detection with `DetectCycle`. |
+| [`python/grpc_client.py`](examples/python/grpc_client.py) | gRPC | Native gRPC wire with `Subscribe` stream for `GRANT` events; async with `grpcio`. |
+| [`python/http3_zero_rtt.py`](examples/python/http3_zero_rtt.py) | HTTP/3 + 0-RTT | QUIC early data: read-only RPCs succeed, mutations get `425 Too Early` and retry on the 1-RTT connection. Uses `aioquic`. |
+| [`php/polling_client.php`](examples/php/polling_client.php) | HTTP/1.1 polling | No SSE: `acquire` → poll `listOwnerLocks` until granted → `renew` → `assertFencing` → `release`. Preemption via `isOwnerAlive`. |
+
+```bash
+# Python (HTTP/1.1 + SSE) — stdlib only, no extra deps
+python3 examples/python/mutex.py
+python3 examples/python/hierarchical_rwlock.py
+python3 examples/python/semaphore.py
+python3 examples/python/lock_lifecycle.py
+
+# Python gRPC — needs grpcio + grpcio-tools (see file header for stub generation)
+python3 examples/python/grpc_client.py
+
+# Python HTTP/3 + 0-RTT — needs aioquic
+python3 examples/python/http3_zero_rtt.py
+
+# PHP — cURL only, no SSE
+php examples/php/polling_client.php
+```
+
+The shared helper [`examples/python/pathlockd_client.py`](examples/python/pathlockd_client.py)
+wraps the JSON RPCs and the SSE stream in a small client class — use it as a
+starting point for your own integration. Third-party deps for the gRPC and
+HTTP/3 examples are listed in
+[`examples/python/requirements.txt`](examples/python/requirements.txt).
 
 ## Documentation
 

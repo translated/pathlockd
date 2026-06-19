@@ -1,7 +1,6 @@
-//! Event delivery over HTTP: Server-Sent Events (modern clients) and a
-//! long-poll fallback (legacy clients without `EventSource`). Both read from the
-//! per-owner [`EventLog`](super::eventlog::EventLog) so they share one
-//! broadcaster subscription and identical, resumable event ids.
+//! Event delivery over HTTP via Server-Sent Events. The stream reads from the
+//! per-owner [`EventLog`](super::eventlog::EventLog), so it shares the gRPC
+//! broadcaster subscription and exposes resumable, monotonically-numbered ids.
 
 use std::convert::Infallible;
 use std::time::Duration;
@@ -11,7 +10,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::Router;
 use serde::{Deserialize, Serialize};
 
 use super::eventlog::StoredEvent;
@@ -22,9 +21,7 @@ use super::state::AppState;
 const SSE_TICK: Duration = Duration::from_secs(15);
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/v1/events/sse", get(sse))
-        .route("/v1/events/poll", get(poll))
+    Router::new().route("/v1/events/sse", get(sse))
 }
 
 #[derive(Deserialize)]
@@ -56,15 +53,20 @@ async fn sse(
         .unwrap_or_else(|| attach.log().last_id());
 
     let stream = async_stream::stream! {
+        let log = attach.log();
         let mut cursor = start;
         loop {
-            for ev in attach.log().since(cursor) {
+            // Register the wakeup *before* draining: `push` wakes via
+            // notify_waiters (no stored permit), so an event appended between
+            // the drain and the wait would otherwise stall until the tick.
+            let wakeup = log.prepare_wait();
+            for ev in log.since(cursor) {
                 cursor = ev.id;
                 yield Ok::<_, Infallible>(sse_frame(&ev));
             }
             // Block until a new event arrives (or the tick elapses so the
             // keep-alive can flush and we notice client disconnects).
-            attach.log().wait(SSE_TICK).await;
+            wakeup.wait(SSE_TICK).await;
         }
     };
 
@@ -79,46 +81,6 @@ fn sse_frame(ev: &StoredEvent) -> SseEvent {
         .id(ev.id.to_string())
         .json_data(EventView::from(ev))
         .unwrap_or_else(|_| SseEvent::default().comment("serialize error"))
-}
-
-#[derive(Deserialize)]
-struct PollQuery {
-    #[serde(default)]
-    owner_id: String,
-    /// Return events with id greater than this. Clients persist `last_id` from
-    /// the previous response and pass it back here.
-    #[serde(default)]
-    after: u64,
-}
-
-#[derive(Serialize)]
-struct PollResponse {
-    events: Vec<EventView>,
-    /// Highest id in this batch (or the request `after` when empty); the cursor
-    /// for the next poll.
-    last_id: u64,
-}
-
-/// `GET /v1/events/poll?owner_id=…&after=…` — long-poll fallback. Returns any
-/// events newer than `after`; if none, blocks up to `web_poll_wait_ms` for one
-/// to arrive, then returns (possibly empty) so the client can immediately poll
-/// again.
-async fn poll(State(st): State<AppState>, Query(q): Query<PollQuery>) -> Response {
-    if q.owner_id.is_empty() {
-        return (StatusCode::BAD_REQUEST, "owner_id is required").into_response();
-    }
-    let attach = st.log.attach(&q.owner_id);
-    let mut events = attach.log().since(q.after);
-    if events.is_empty() {
-        attach.log().wait(st.poll_wait).await;
-        events = attach.log().since(q.after);
-    }
-    let last_id = events.last().map(|e| e.id).unwrap_or(q.after);
-    let body = PollResponse {
-        events: events.iter().map(EventView::from).collect(),
-        last_id,
-    };
-    Json(body).into_response()
 }
 
 /// A retained event rendered for JSON/SSE: the resumable id plus the event type

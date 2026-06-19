@@ -44,18 +44,15 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
     tls::install_crypto_provider();
     let web_tls = tls::build(cfg).context("building web TLS")?;
 
-    let retention =
-        Duration::from_millis(cfg.web_poll_wait_ms.saturating_mul(2)).max(Duration::from_secs(30));
+    // Retain a short window after the last SSE client detaches so a reconnecting
+    // EventSource can replay from its Last-Event-ID across a brief drop.
+    let retention = Duration::from_secs(30);
     let log = EventLog::new(
         svc.broadcaster.clone(),
         cfg.web_event_log_capacity,
         retention,
     );
-    let state = AppState {
-        svc,
-        log,
-        poll_wait: Duration::from_millis(cfg.web_poll_wait_ms),
-    };
+    let state = AppState { svc, log };
     let app: Router = rest::routes().merge(sse::routes()).with_state(state);
 
     // --- TCP: HTTP/1.1 + HTTP/2 over TLS ---

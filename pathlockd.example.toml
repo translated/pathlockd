@@ -117,8 +117,7 @@ log_level = "info"
 # tls_cert_path = "/etc/pathlockd/tls/cert.pem"   # PEM chain; omit both for a
 # tls_key_path  = "/etc/pathlockd/tls/key.pem"    # self-signed dev cert
 # web_zero_rtt = true              # allow HTTP/3 0-RTT (read-only RPCs only)
-# web_event_log_capacity = 1024    # retained events per owner (SSE replay/poll)
-# web_poll_wait_ms = 25000         # max long-poll block before empty return
+# web_event_log_capacity = 1024    # retained events per owner (SSE Last-Event-ID replay)
 
 # OpenTelemetry tracing/metrics export is configured via standard OTEL_* env
 # vars, not TOML. For example:

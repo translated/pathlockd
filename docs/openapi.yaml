@@ -1,0 +1,1464 @@
+openapi: 3.1.0
+info:
+  title: pathlockd HTTP API
+  version: 0.10.0
+  summary: JSON-over-HTTP and SSE facade for the pathlockd distributed lock daemon.
+  description: |
+    HTTP gateway in front of the same `pathlockd.v1.PathLock` gRPC service. Every
+    endpoint is a thin bridge: deserialize the request message from JSON, invoke
+    the shared trait method the gRPC server uses, then serialize the response
+    message back to JSON. gRPC `Status` codes are mapped onto HTTP status codes
+    (see "Error envelope" below).
+
+    The HTTP gateway is best-effort compatible with the proto3-JSON convention
+    for field naming: enum values serialize as their proto name strings
+    (`"MODE_WRITE"`, `"REASON_CODE_WRITE_LOCKED"`, …), and request/response
+    field names are camelCase.
+
+    The streaming variants (`Subscribe`, `AcquireStream`, `PublishEvent`) are
+    gRPC-only and have no HTTP equivalent.
+  contact:
+    name: pathlockd
+    url: https://github.com/translated/pathlockd
+  license:
+    name: See repository LICENSE
+    url: https://github.com/translated/pathlockd/blob/main/LICENSE
+  x-logo:
+    url: https://raw.githubusercontent.com/translated/pathlockd/main/docs/logo.png
+
+servers:
+  - url: http://localhost:50051
+    description: Local default (plaintext)
+  - url: https://localhost:50051
+    description: Local default (TLS)
+
+tags:
+  - name: Locks
+    description: |
+      Hierarchical path locks. One owner = one lease. Every lock is a TTL
+      lease (`ttl_ms > 0`). A write claims its subtree; a read claims only
+      its point. Contended acquires are enqueued, not refused, and get a
+      `GRANT` event when the path frees.
+  - name: Fencing
+    description: |
+      Monotonic per-path fencing tokens. Tokens outlive the lease
+      (TTL `max(ttl, 1 day)`). A stale token is rejected as
+      `stale_fencing_token`; the daemon returns the persisted current token
+      so the client can refresh without re-reading.
+  - name: Deadlock
+    description: |
+      Wait-for graph utilities. `setWaitEdge`/`clearWaitEdge` publish
+      per-owner conflict edges; `detectCycle` walks them; `isBlocking`
+      checks whether a specific conflict is still live.
+  - name: Owner
+    description: Per-owner liveness probes and cooperative revoke.
+  - name: NamespacePolicy
+    description: |
+      Per-namespace `LockAlgorithm` and explicit routing roots. A change
+      that alters the effective algorithm force-clears held and queued
+      locks under the namespace; each affected owner receives a `KILLED`
+      event and must re-acquire.
+  - name: Inspection
+    description: |
+      Read-only point-in-time views. Best-effort; never mutate. Stale
+      dead-owner entries are left for active acquires and background GC.
+  - name: Events
+    description: |
+      Owner-scoped lifecycle event delivery over HTTP. Two surfaces: a
+      Server-Sent Events stream (`/v1/events/sse`) and a long-poll fallback
+      (`/v1/events/poll`) for clients without `EventSource`. Both read
+      from a shared in-memory ring buffer keyed by owner.
+  - name: Health
+    description: Liveness/readiness probe.
+
+paths:
+  /v1/acquire:
+    post:
+      tags: [Locks]
+      summary: Acquire one or more path locks (or enqueue if contended).
+      description: |
+        Apply an atomic transaction over a set of path locks. A single
+        acquire must target one routing namespace (the daemon rejects
+        cross-namespace acquires). A contended request is parked in the
+        per-group FIFO wait queue and answered with `ACQUIRE_STATUS_QUEUED`;
+        the daemon grants in place when the path frees and pushes a `GRANT`
+        event to the waiter's own `/v1/events/sse` stream.
+      operationId: acquire
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcquireRequest'
+            examples:
+              simpleWrite:
+                summary: Single write lock
+                value:
+                  ownerId: worker-1
+                  ttlMs: 30000
+                  requests:
+                    - path: google_drive:/docs/team
+                      mode: MODE_WRITE
+                      state: LOCK_STATE_NEW
+              semaphore:
+                summary: Semaphore acquire with two permits
+                value:
+                  ownerId: pool-consumer-7
+                  ttlMs: 60000
+                  requests:
+                    - path: jobs:db-backup
+                      mode: MODE_WRITE
+                      state: LOCK_STATE_NEW
+                      permits: 2
+      responses:
+        '200':
+          description: Acquire result (OK / QUEUED / CONFLICT / LOST).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcquireResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+        '504': { $ref: '#/components/responses/GatewayTimeout' }
+
+  /v1/release:
+    post:
+      tags: [Locks]
+      summary: Release specific paths held by an owner.
+      operationId: release
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseLocksRequest'
+      responses:
+        '200':
+          description: Released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/releaseAll:
+    post:
+      tags: [Locks]
+      summary: Release every path held by an owner.
+      operationId: releaseAll
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReleaseAllRequest'
+      responses:
+        '200':
+          description: Released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReleaseResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/renew:
+    post:
+      tags: [Locks]
+      summary: Renew an owner's lease on its held paths.
+      description: |
+        Heartbeat. Pass `domains` to target the fan-out at exactly the
+        Raft groups where the owner holds locks (recommended for
+        heartbeat-frequency renewals). When `domains` is empty every
+        group is probed — correct, but amplified.
+      operationId: renew
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RenewRequest'
+      responses:
+        '200':
+          description: Renew result (OK or LOST).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenewResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '412': { $ref: '#/components/responses/PreconditionFailed' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/forceRelease:
+    post:
+      tags: [Locks]
+      summary: Force-release every lock held by a victim owner.
+      description: |
+        Victim preemption. Drops all locks held by `victimId` and pushes
+        a `KILLED` event to the victim's subscription so the client can
+        react.
+      operationId: forceRelease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ForceReleaseRequest'
+      responses:
+        '200':
+          description: Force-released.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ForceReleaseResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/assertFencing:
+    post:
+      tags: [Fencing]
+      summary: Verify that a fencing token still dominates the persisted fence for each path.
+      description: |
+        Read-only. Returns `ASSERT_STATUS_OK` if every path's persisted
+        fence is `<= fencingToken`; otherwise `ASSERT_STATUS_FAIL` with
+        the first failing path. A path with no fence is treated as fence
+        0 (so any `fencingToken > 0` passes it).
+      operationId: assertFencing
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssertFencingRequest'
+      responses:
+        '200':
+          description: Assert result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssertFencingResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/incrFencingToken:
+    post:
+      tags: [Fencing]
+      summary: Bump the global fencing counter and return the new value.
+      description: |
+        Idempotent on `idempotencyKey`. A successful retry returns the
+        same token as the first attempt.
+      operationId: incrFencingToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IncrFencingTokenRequest'
+      responses:
+        '200':
+          description: New fencing token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IncrFencingTokenResponse'
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/detectCycle:
+    post:
+      tags: [Deadlock]
+      summary: Walk the wait-for graph from a starting owner.
+      description: |
+        Read-only. Walks the per-owner wait edges and reports a cycle if
+        one is reachable. `CYCLE_KIND_FOUND` returns the cycle members in
+        wait order — the cycle may not include the starting owner
+        (downstream cycles are still reported because the starting
+        owner is transitively deadlocked behind them). `CYCLE_KIND_TRUNCATED`
+        means `maxDepth` was exhausted; the returned `chain` is the
+        owners visited up to that point.
+      operationId: detectCycle
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DetectCycleRequest'
+      responses:
+        '200':
+          description: Cycle report.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetectCycleResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/isBlocking:
+    post:
+      tags: [Deadlock]
+      summary: Is a conflicting owner still holding the contended lock?
+      description: |
+        Read-only. Returns `true` if the `conflictOwner` is still alive
+        AND the `conflictPath` is still held in a way that matches
+        `reason`. A `false` answer means the conflict is stale: the
+        blocker has died, released, or its lock no longer matches the
+        reason the caller recorded.
+      operationId: isBlocking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IsBlockingRequest'
+      responses:
+        '200':
+          description: Live-conflict result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IsBlockingResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/setWaitEdge:
+    post:
+      tags: [Deadlock]
+      summary: Record a per-owner wait edge for cycle detection.
+      description: |
+        Records that `ownerId` is waiting on `conflictOwner`. `ttlMs` is
+        the edge lifetime. `conflictPath` and `reason` are optional
+        metadata; populating them lets `detectCycle` discard stale
+        live-owner edges before reporting a cycle.
+      operationId: setWaitEdge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetWaitEdgeRequest'
+      responses:
+        '200':
+          description: Edge set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetWaitEdgeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/clearWaitEdge:
+    post:
+      tags: [Deadlock]
+      summary: Remove the wait edge owned by an owner (if any).
+      operationId: clearWaitEdge
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClearWaitEdgeRequest'
+      responses:
+        '200':
+          description: Edge cleared (idempotent — no error if no edge existed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ClearWaitEdgeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/isOwnerAlive:
+    post:
+      tags: [Owner]
+      summary: Is the owner's liveness lease currently present?
+      description: |
+        Read-only. Used by the wait-queue admission path: a queued waiter
+        is only eligible for grant if its owner is still alive.
+      operationId: isOwnerAlive
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IsOwnerAliveRequest'
+      responses:
+        '200':
+          description: Alive result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IsOwnerAliveResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/requestRevoke:
+    post:
+      tags: [Owner]
+      summary: Cooperatively request that an owner release its locks.
+      description: |
+        Publishes a `REVOKE` event on the target owner's subscription.
+        The target decides what to do; the daemon does not preempt
+        anything.
+      operationId: requestRevoke
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RequestRevokeRequest'
+      responses:
+        '200':
+          description: Revoke event published.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RequestRevokeResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/setNamespacePolicy:
+    post:
+      tags: [NamespacePolicy]
+      summary: Set a namespace's lock algorithm (and routing root, if path-shaped).
+      description: |
+        `namespace` is either a handler (`google_drive`) or a normalized
+        path root (`google_drive:/docs/team`); a path namespace also
+        becomes an explicit routing root, with the longest explicit root
+        containing the path winning. If the new policy changes the
+        namespace's effective algorithm, every lock under the namespace
+        (held AND queued) is force-cleared and each affected owner
+        receives a `KILLED` event. Re-setting the same algorithm clears
+        nothing.
+      operationId: setNamespacePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetNamespacePolicyRequest'
+      responses:
+        '200':
+          description: Policy applied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetNamespacePolicyResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/getNamespacePolicy:
+    post:
+      tags: [NamespacePolicy]
+      summary: Read a namespace's effective policy.
+      description: |
+        Read-only. Returns the daemon's actual policy for the namespace;
+        `explicit: false` means no explicit row exists and the daemon is
+        using the default `LOCK_ALGORITHM_RECURSIVE_RW` policy.
+      operationId: getNamespacePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GetNamespacePolicyRequest'
+      responses:
+        '200':
+          description: Effective policy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetNamespacePolicyResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/deleteNamespacePolicy:
+    post:
+      tags: [NamespacePolicy]
+      summary: Remove an explicit policy/routing root, falling back to the default resolver.
+      description: |
+        If reverting to the default changes the namespace's effective
+        algorithm, held and queued locks under the namespace are
+        force-cleared exactly as in `setNamespacePolicy` and each
+        affected owner receives a `KILLED` event.
+      operationId: deleteNamespacePolicy
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteNamespacePolicyRequest'
+      responses:
+        '200':
+          description: Policy deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteNamespacePolicyResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/inspectPath:
+    post:
+      tags: [Inspection]
+      summary: Read the live holders of an exact path.
+      description: |
+        Read-only point-in-time view. Reads are point-only, so
+        `readOwners` does not include readers of ancestors or
+        descendants. `hasFence` may be `true` even when `writeOwner` is
+        empty (fences outlive the lease). `semaphoreOwners` is populated
+        only for `LOCK_ALGORITHM_SEMAPHORE` namespaces.
+      operationId: inspectPath
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InspectPathRequest'
+      responses:
+        '200':
+          description: Path inspection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InspectPathResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/listOwnerLocks:
+    post:
+      tags: [Inspection]
+      summary: List the live locks (and tombstones) held by an owner.
+      description: |
+        Read-only. `alive` reports whether the owner's liveness lease is
+        currently present; when `false` the listed locks are tombstones
+        an acquire/GC has not yet pruned.
+      operationId: listOwnerLocks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListOwnerLocksRequest'
+      responses:
+        '200':
+          description: Owner lock list.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListOwnerLocksResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/dumpLocks:
+    post:
+      tags: [Inspection]
+      summary: Cluster-wide dump of every live lock, paged over the owner index.
+      description: |
+        Read-only, best-effort. Each owner is read in its own snapshot,
+        so this is a near-real-time view, not a single global instant.
+        Pass an empty `cursor` for the first page and the returned
+        `nextCursor` for each subsequent page until `done` is `true`.
+      operationId: dumpLocks
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DumpLocksRequest'
+      responses:
+        '200':
+          description: Dump page.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DumpLocksResponse'
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /v1/events/sse:
+    get:
+      tags: [Events]
+      summary: Subscribe to the owner's lifecycle event stream (SSE).
+      description: |
+        `text/event-stream`. Each frame carries a monotonic `id` in the
+        SSE `id:` field; the browser resends it via `Last-Event-ID` on
+        reconnect. Cursor precedence: `Last-Event-ID` header, then
+        `?after=`, else the owner's last retained id (only future
+        events — a fresh stream is not flooded with history).
+
+        The server sends a `:keep-alive` comment every 15s so
+        intermediaries flush and the daemon notices client disconnects.
+      operationId: subscribeSSE
+      parameters:
+        - in: query
+          name: owner_id
+          required: true
+          schema: { type: string }
+          description: Owner id the subscription is bound to.
+        - in: query
+          name: after
+          required: false
+          schema: { type: integer, format: int64, minimum: 0 }
+          description: Resume after this id (overridden by `Last-Event-ID`).
+        - in: header
+          name: Last-Event-ID
+          required: false
+          schema: { type: integer, format: int64 }
+          description: Set automatically by `EventSource` on reconnect.
+      responses:
+        '200':
+          description: Open SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  A stream of SSE frames. Each event has the shape
+                  `{ "id": <int>, "type": <killed|revoke|grant>, "ownerId": <string> }`
+                  and is delivered as:
+                  ```
+                  id: <id>
+                  data: {"id":<id>,"type":"<type>","ownerId":"<owner>"}
+                  ```
+                  Keep-alive comments are `:keep-alive` (no `data:` line).
+              examples:
+                grantFrame:
+                  summary: A GRANT event frame
+                  value: |
+                    id: 42
+                    data: {"id":42,"type":"grant","ownerId":"worker-1"}
+        '400':
+          description: Missing `owner_id`.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: owner_id is required
+
+  /v1/events/poll:
+    get:
+      tags: [Events]
+      summary: Long-poll fallback for clients without `EventSource`.
+      description: |
+        Returns any events newer than `after`. If none are available
+        the call blocks up to `web_poll_wait_ms` (default 25s) for one
+        to arrive, then returns (possibly empty) so the client can
+        immediately poll again. Client persists `lastId` from the
+        previous response and passes it back as the next `after`.
+      operationId: pollEvents
+      parameters:
+        - in: query
+          name: owner_id
+          required: true
+          schema: { type: string }
+        - in: query
+          name: after
+          required: false
+          schema: { type: integer, format: int64, minimum: 0, default: 0 }
+          description: Return events with id greater than this.
+      responses:
+        '200':
+          description: Polled events.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PollResponse'
+              examples:
+                nonEmpty:
+                  value:
+                    events:
+                      - id: 42
+                        type: grant
+                        ownerId: worker-1
+                    lastId: 42
+                empty:
+                  value:
+                    events: []
+                    lastId: 0
+        '400':
+          description: Missing `owner_id`.
+          content:
+            text/plain:
+              schema: { type: string }
+              example: owner_id is required
+
+  /v1/health:
+    get:
+      tags: [Health]
+      summary: Liveness/readiness probe.
+      description: Convenience GET with no body required.
+      operationId: healthGet
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503': { $ref: '#/components/responses/Unavailable' }
+    post:
+      tags: [Health]
+      summary: Liveness/readiness probe (POST with empty body).
+      operationId: healthPost
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HealthRequest'
+      responses:
+        '200':
+          description: Healthy.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503': { $ref: '#/components/responses/Unavailable' }
+
+components:
+  responses:
+    BadRequest:
+      description: gRPC `InvalidArgument` or `OutOfRange`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unauthorized:
+      description: gRPC `Unauthenticated`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Forbidden:
+      description: gRPC `PermissionDenied`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    NotFound:
+      description: gRPC `NotFound`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Conflict:
+      description: gRPC `AlreadyExists` or `Aborted`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    PreconditionFailed:
+      description: gRPC `FailedPrecondition` (e.g. stale fencing token).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    TooManyRequests:
+      description: gRPC `ResourceExhausted`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Internal:
+      description: gRPC `Internal` or unmapped error.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    Unavailable:
+      description: gRPC `Unavailable` (no healthy replica / not yet ready).
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+    GatewayTimeout:
+      description: gRPC `DeadlineExceeded`.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ApiError' }
+
+  schemas:
+    ApiError:
+      type: object
+      description: |
+        HTTP error envelope. `error.code` is the gRPC code name in
+        SCREAMING_SNAKE_CASE (e.g. `INVALID_ARGUMENT`, `FAILED_PRECONDITION`).
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: gRPC code name.
+              enum:
+                - OK
+                - CANCELLED
+                - UNKNOWN
+                - INVALID_ARGUMENT
+                - DEADLINE_EXCEEDED
+                - NOT_FOUND
+                - ALREADY_EXISTS
+                - PERMISSION_DENIED
+                - RESOURCE_EXHAUSTED
+                - FAILED_PRECONDITION
+                - ABORTED
+                - OUT_OF_RANGE
+                - UNIMPLEMENTED
+                - INTERNAL
+                - UNAVAILABLE
+                - DATA_LOSS
+                - UNAUTHENTICATED
+            message:
+              type: string
+
+    Mode:
+      type: string
+      description: Lock acquisition mode.
+      enum:
+        - MODE_WRITE
+        - MODE_READ
+      default: MODE_WRITE
+
+    LockState:
+      type: string
+      description: |
+        `LOCK_STATE_NEW` — a brand-new acquisition.
+        `LOCK_STATE_HELD` — a path the owner already holds and is
+        re-validating; folded into the acquire transaction so an
+        expired key surfaces as `LOST`.
+      enum:
+        - LOCK_STATE_NEW
+        - LOCK_STATE_HELD
+      default: LOCK_STATE_NEW
+
+    LockAlgorithm:
+      type: string
+      description: |
+        Conflict policy. The algorithm is stamped on the held lock, so a
+        namespace policy change is forward-only — it affects future
+        acquisitions, never shrinks a live lease.
+      enum:
+        - LOCK_ALGORITHM_RECURSIVE_RW
+        - LOCK_ALGORITHM_POINT_RW
+        - LOCK_ALGORITHM_RECURSIVE_WRITE
+        - LOCK_ALGORITHM_POINT_WRITE
+        - LOCK_ALGORITHM_SEMAPHORE
+      default: LOCK_ALGORITHM_RECURSIVE_RW
+      x-enum-descriptions:
+        LOCK_ALGORITHM_RECURSIVE_RW: Default. Shared point reads; writes are exclusive on the path and its descendants.
+        LOCK_ALGORITHM_POINT_RW: Shared point reads; writes are exclusive only on the exact path.
+        LOCK_ALGORITHM_RECURSIVE_WRITE: Write locks only; writes are exclusive on the path and descendants.
+        LOCK_ALGORITHM_POINT_WRITE: Write locks only; writes are exclusive only on the exact path.
+        LOCK_ALGORITHM_SEMAPHORE: Counting semaphore; point-scoped, write-only. `LockRequest.permits` sets the path's capacity on first acquire; no read mode, no descendant exclusion, no fencing.
+
+    ReasonCode:
+      type: string
+      description: |
+        Machine-readable conflict / outcome reason. Precedence is fixed:
+        `REASON_CODE_ANCESTOR_LOCKED` → `REASON_CODE_WRITE_LOCKED` →
+        `REASON_CODE_READ_LOCKED` → `REASON_CODE_DESCENDANT_WRITE_LOCKED` →
+        `REASON_CODE_DESCENDANT_READ_LOCKED` → `REASON_CODE_READ_LOCKS_DISABLED` →
+        `REASON_CODE_STALE_FENCING_TOKEN`.
+      enum:
+        - REASON_CODE_UNSPECIFIED
+        - REASON_CODE_ANCESTOR_LOCKED
+        - REASON_CODE_WRITE_LOCKED
+        - REASON_CODE_READ_LOCKED
+        - REASON_CODE_DESCENDANT_WRITE_LOCKED
+        - REASON_CODE_DESCENDANT_READ_LOCKED
+        - REASON_CODE_READ_LOCKS_DISABLED
+        - REASON_CODE_STALE_FENCING_TOKEN
+        - REASON_CODE_INVALID_PERMITS
+        - REASON_CODE_SEMAPHORE_FULL
+        - REASON_CODE_MISSING_SEMAPHORE
+        - REASON_CODE_MISSING_WRITE
+        - REASON_CODE_MISSING_READ
+        - REASON_CODE_MISSING_FENCE
+        - REASON_CODE_MISSING_ALIVE
+        - REASON_CODE_MISSING_OWNER_SET
+        - REASON_CODE_EMPTY_OWNER_SET
+        - REASON_CODE_QUEUED
+        - REASON_CODE_STALE_OWNER
+
+    AcquireStatus:
+      type: string
+      enum:
+        - ACQUIRE_STATUS_OK
+        - ACQUIRE_STATUS_CONFLICT
+        - ACQUIRE_STATUS_LOST
+        - ACQUIRE_STATUS_QUEUED
+      default: ACQUIRE_STATUS_OK
+
+    RenewStatus:
+      type: string
+      enum:
+        - RENEW_STATUS_OK
+        - RENEW_STATUS_LOST
+      default: RENEW_STATUS_OK
+
+    AssertStatus:
+      type: string
+      enum:
+        - ASSERT_STATUS_OK
+        - ASSERT_STATUS_FAIL
+      default: ASSERT_STATUS_OK
+
+    CycleKind:
+      type: string
+      enum:
+        - CYCLE_KIND_NONE
+        - CYCLE_KIND_FOUND
+        - CYCLE_KIND_TRUNCATED
+      default: CYCLE_KIND_NONE
+
+    EventType:
+      type: string
+      description: |
+        Lifecycle event type. `KILLED` — the owner was force-released
+        (by a `forceRelease` call or a namespace policy change).
+        `REVOKE` — a peer requested this owner release its locks.
+        `GRANT` — the owner's queued acquire was granted in place.
+      enum:
+        - EVENT_TYPE_UNSPECIFIED
+        - EVENT_TYPE_KILLED
+        - EVENT_TYPE_REVOKE
+        - EVENT_TYPE_GRANT
+      default: EVENT_TYPE_UNSPECIFIED
+
+    LockRequest:
+      type: object
+      description: |
+        A single path in an acquire batch. Path form:
+        `<handlerType>:<normalizedPath>` (e.g. `google_drive:/a/b`).
+        Normalised = rooted, no `//`, no `.`/`..`, no trailing slash.
+        The service layer rejects malformed paths.
+      required: [path]
+      properties:
+        path: { type: string, examples: ["google_drive:/docs/team"] }
+        mode: { $ref: '#/components/schemas/Mode' }
+        state: { $ref: '#/components/schemas/LockState' }
+        permits:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Required `> 0` for `LOCK_ALGORITHM_SEMAPHORE` write
+            acquires. The first acquire for a semaphore path
+            establishes that path's capacity; later acquires for the
+            same path must use the same value. Ignored by other
+            algorithms.
+
+    ReleaseRequest:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, examples: ["google_drive:/docs/team"] }
+        mode: { $ref: '#/components/schemas/Mode' }
+
+    AcquireRequest:
+      type: object
+      required: [ownerId, ttlMs]
+      properties:
+        ownerId:
+          type: string
+          description: One owner = one lease. Conflict checks are between different owners; an owner never conflicts with itself (re-entrant).
+        ttlMs:
+          type: integer
+          format: int64
+          minimum: 1
+          description: |
+            Lease lifetime in milliseconds. Required `> 0` — a `0` TTL
+            would never expire. Recommended value is at least 3× the
+            renew cadence.
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/LockRequest' }
+          description: |
+            Path set to acquire. A single acquire must target one
+            routing namespace; the daemon rejects cross-namespace
+            acquires.
+        fencingToken:
+          type: integer
+          format: int64
+          default: 0
+          description: |
+            Optional caller-supplied fence. `0` lets the server mint
+            the next token for write acquires. Reads and semaphore
+            namespaces ignore it.
+        releaseRequests:
+          type: array
+          items: { $ref: '#/components/schemas/ReleaseRequest' }
+          description: Releases folded into the same atomic transaction (shadowing transitions).
+        idempotencyKey:
+          type: string
+          description: Optional apply-once key for safe client retries of this logical request.
+        queueTtlMs:
+          type: integer
+          format: int64
+          default: 0
+          description: |
+            If this acquire is queued (contended), how long its
+            wait-queue entry lives without being granted — the caller's
+            own acquire deadline. `0` selects a server default. Lets an
+            abandoned waiter self-evict at the client's threshold
+            rather than a fixed server TTL.
+
+    AcquireResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/AcquireStatus' }
+        path:
+          type: string
+          description: |
+            `CONFLICT`: the conflicting path. `LOST`: the path whose
+            key/fence went missing. Empty for `OK` and `QUEUED`.
+        owner:
+          type: string
+          description: |
+            `CONFLICT`: the conflicting owner id. Empty for `LOST`,
+            `OK`, `QUEUED`.
+        reason: { $ref: '#/components/schemas/ReasonCode' }
+        fencingToken:
+          type: integer
+          format: int64
+          description: |
+            `OK`/`QUEUED`: server-minted or caller-supplied fencing
+            token for this acquire.
+        currentFencingToken:
+          type: integer
+          format: int64
+          description: |
+            `REASON_CODE_STALE_FENCING_TOKEN`: persisted current
+            token for the path. The client can refresh without
+            re-reading.
+        namespace:
+          type: string
+          description: |
+            `OK`: the routing namespace this acquire resolved to.
+            Every path in a single acquire shares one routing
+            namespace, so this one value covers them all. Record it
+            per held path and replay the distinct set as
+            `RenewRequest.domains` so the renew targets exactly the
+            groups where the owner holds locks, with no client-side
+            routing logic.
+
+    ReleaseLocksRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+        requests:
+          type: array
+          items: { $ref: '#/components/schemas/ReleaseRequest' }
+        delWaitKey:
+          type: boolean
+          default: false
+          description: Fold the owner's wait-edge deletion into the same transaction.
+        idempotencyKey: { type: string }
+
+    ReleaseAllRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+        delWaitKey:
+          type: boolean
+          default: false
+        idempotencyKey: { type: string }
+
+    ReleaseResponse:
+      type: object
+      properties: {}
+
+    RenewRequest:
+      type: object
+      required: [ownerId, ttlMs]
+      properties:
+        ownerId: { type: string }
+        ttlMs:
+          type: integer
+          format: int64
+          minimum: 1
+        domains:
+          type: array
+          items: { type: string }
+          description: |
+            Routing namespaces in which this owner holds locks
+            (e.g. `google_drive:/team` by default or an explicit root
+            such as `google_drive:/team/archive`). Targets the renew
+            fan-out at exactly those Raft groups. When empty, every
+            group is probed — correct, but amplified; strongly
+            discouraged for heartbeat-frequency renews.
+        idempotencyKey: { type: string }
+
+    RenewResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/RenewStatus' }
+        path:
+          type: string
+          description: On `LOST`, the path whose lease is gone.
+        reason: { $ref: '#/components/schemas/ReasonCode' }
+
+    ForceReleaseRequest:
+      type: object
+      required: [victimId]
+      properties:
+        victimId: { type: string }
+        idempotencyKey: { type: string }
+
+    ForceReleaseResponse:
+      type: object
+      properties: {}
+
+    AssertFencingRequest:
+      type: object
+      required: [ownerId, fencingToken]
+      properties:
+        ownerId: { type: string }
+        fencingToken:
+          type: integer
+          format: int64
+          description: Required `> 0` when `paths` is non-empty.
+        paths:
+          type: array
+          items: { type: string }
+          description: Path form `<handlerType>:<normalizedPath>`.
+
+    AssertFencingResponse:
+      type: object
+      required: [status]
+      properties:
+        status: { $ref: '#/components/schemas/AssertStatus' }
+        path:
+          type: string
+          description: On `FAIL`, the first path whose persisted fence dominates.
+        reason: { $ref: '#/components/schemas/ReasonCode' }
+
+    DetectCycleRequest:
+      type: object
+      required: [startOwnerId]
+      properties:
+        startOwnerId: { type: string }
+        maxDepth:
+          type: integer
+          format: int32
+          minimum: 0
+          default: 0
+          description: Cap on graph walk depth. `0` selects a server default.
+
+    DetectCycleResponse:
+      type: object
+      required: [kind]
+      properties:
+        kind: { $ref: '#/components/schemas/CycleKind' }
+        chain:
+          type: array
+          items: { type: string }
+          description: |
+            `CYCLE_KIND_FOUND`: the members of the detected cycle, in
+            wait order. The cycle does not necessarily contain
+            `startOwnerId` — a walk that runs *into* a downstream
+            cycle still reports it. `CYCLE_KIND_TRUNCATED`: the owners
+            visited before `maxDepth` was exhausted.
+
+    IsBlockingRequest:
+      type: object
+      required: [conflictPath, conflictOwner, reason]
+      properties:
+        conflictPath: { type: string }
+        conflictOwner: { type: string }
+        reason: { $ref: '#/components/schemas/ReasonCode' }
+
+    IsBlockingResponse:
+      type: object
+      required: [blocking]
+      properties:
+        blocking: { type: boolean }
+
+    IncrFencingTokenRequest:
+      type: object
+      properties:
+        idempotencyKey: { type: string }
+
+    IncrFencingTokenResponse:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: integer
+          format: int64
+          description: New global fencing counter value.
+
+    SetWaitEdgeRequest:
+      type: object
+      required: [ownerId, conflictOwner, ttlMs]
+      properties:
+        ownerId: { type: string }
+        conflictOwner: { type: string }
+        ttlMs:
+          type: integer
+          format: int64
+          minimum: 1
+        conflictPath:
+          type: string
+          description: |
+            Optional metadata for the blocking edge. New clients
+            populate these so `detectCycle` can discard stale
+            live-owner edges before reporting a cycle.
+        reason: { $ref: '#/components/schemas/ReasonCode' }
+        idempotencyKey: { type: string }
+
+    SetWaitEdgeResponse:
+      type: object
+      properties: {}
+
+    ClearWaitEdgeRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+        idempotencyKey: { type: string }
+
+    ClearWaitEdgeResponse:
+      type: object
+      properties: {}
+
+    IsOwnerAliveRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+
+    IsOwnerAliveResponse:
+      type: object
+      required: [alive]
+      properties:
+        alive: { type: boolean }
+
+    RequestRevokeRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+
+    RequestRevokeResponse:
+      type: object
+      properties: {}
+
+    SetNamespacePolicyRequest:
+      type: object
+      required: [namespace, algorithm]
+      properties:
+        namespace:
+          type: string
+          description: |
+            Either a handler (`google_drive`) or a normalized path
+            root (`google_drive:/docs` or
+            `google_drive:/docs/team`). A path namespace also becomes
+            an explicit routing root; longest explicit root wins.
+        algorithm: { $ref: '#/components/schemas/LockAlgorithm' }
+        idempotencyKey: { type: string }
+
+    SetNamespacePolicyResponse:
+      type: object
+      properties: {}
+
+    GetNamespacePolicyRequest:
+      type: object
+      required: [namespace]
+      properties:
+        namespace:
+          type: string
+          description: Exact namespace key to read. Missing rows default to `LOCK_ALGORITHM_RECURSIVE_RW`.
+
+    GetNamespacePolicyResponse:
+      type: object
+      required: [algorithm, explicit]
+      properties:
+        algorithm: { $ref: '#/components/schemas/LockAlgorithm' }
+        explicit:
+          type: boolean
+          description: |
+            `false` means no explicit row exists and the daemon is
+            using the default `LOCK_ALGORITHM_RECURSIVE_RW` policy.
+
+    DeleteNamespacePolicyRequest:
+      type: object
+      required: [namespace]
+      properties:
+        namespace: { type: string }
+        idempotencyKey: { type: string }
+
+    DeleteNamespacePolicyResponse:
+      type: object
+      properties: {}
+
+    InspectPathRequest:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string, examples: ["google_drive:/a/b"] }
+
+    InspectPathResponse:
+      type: object
+      properties:
+        writeOwner:
+          type: string
+          description: Live write owner of this exact path, or empty if none holds it.
+        readOwners:
+          type: array
+          items: { type: string }
+          description: |
+            Live read owners of this exact path. Reads are
+            point-only, so this does not include readers of
+            ancestors or descendants.
+        hasFence:
+          type: boolean
+          description: |
+            Whether a fencing token is currently persisted for this
+            path. The fence can outlive the lock (its TTL is
+            `max(lease, 1 day)`), so this may be `true` even when
+            `writeOwner` is empty.
+        fence:
+          type: integer
+          format: int64
+          description: The persisted fencing token. Meaningful only when `hasFence` is `true`.
+        claimOwner:
+          type: string
+          description: Always empty; path claims were removed in favour of the wait queue.
+          deprecated: true
+        semaphoreOwners:
+          type: array
+          items: { type: string }
+          description: |
+            Live semaphore holders of this exact path
+            (`LOCK_ALGORITHM_SEMAPHORE` namespaces). Empty for
+            non-semaphore paths.
+
+    ListOwnerLocksRequest:
+      type: object
+      required: [ownerId]
+      properties:
+        ownerId: { type: string }
+
+    OwnedLock:
+      type: object
+      required: [path, mode]
+      properties:
+        path: { type: string }
+        mode: { $ref: '#/components/schemas/Mode' }
+
+    ListOwnerLocksResponse:
+      type: object
+      required: [alive]
+      properties:
+        alive:
+          type: boolean
+          description: |
+            Whether the owner's liveness lease is currently present.
+            When `false` the listed locks are tombstones an
+            acquire/GC has not yet pruned.
+        locks:
+          type: array
+          items: { $ref: '#/components/schemas/OwnedLock' }
+
+    DumpLocksRequest:
+      type: object
+      properties:
+        cursor:
+          type: string
+          format: byte
+          description: Opaque pagination cursor. Empty for the first page; echo back the previous response's `nextCursor` to continue.
+        ownerPage:
+          type: integer
+          format: int32
+          minimum: 0
+          description: |
+            Owners to scan per page. `0` selects the server
+            default; the server clamps to its maximum.
+
+    LockEntry:
+      type: object
+      required: [owner, path, mode]
+      properties:
+        owner: { type: string }
+        path: { type: string }
+        mode: { $ref: '#/components/schemas/Mode' }
+        hasFence:
+          type: boolean
+          description: |
+            Whether a fencing token is recorded for this path. Only
+            ever `true` for write locks.
+        fence:
+          type: integer
+          format: int64
+          description: The fencing token; meaningful only when `hasFence` is `true`.
+
+    DumpLocksResponse:
+      type: object
+      required: [done]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/LockEntry' }
+        nextCursor:
+          type: string
+          format: byte
+          description: Opaque cursor for the next page; empty when `done` is `true`.
+        done:
+          type: boolean
+          description: True once the scan has returned the final page.
+
+    HealthRequest:
+      type: object
+      properties: {}
+
+    HealthResponse:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        detail: { type: string }
+
+    PollResponse:
+      type: object
+      description: |
+        Long-poll event batch. `lastId` is the cursor for the next
+        poll — pass it back as `after`. When `events` is empty,
+        `lastId` echoes the request `after`.
+      required: [events, lastId]
+      properties:
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/PolledEvent' }
+        lastId:
+          type: integer
+          format: int64
+
+    PolledEvent:
+      type: object
+      description: |
+        A retained event rendered for JSON/SSE: the resumable id plus
+        the event type as a stable string and the owner. Field names
+        are camelCase to match the proto3-JSON convention.
+      required: [id, type, ownerId]
+      properties:
+        id: { type: integer, format: int64 }
+        type:
+          type: string
+          description: Stable event kind name.
+          enum:
+            - killed
+            - revoke
+            - grant
+            - unspecified
+        ownerId: { type: string }
+
+  securitySchemes: {}
+
+x-tagGroups:
+  - name: Operations
+    tags: [Locks, Fencing, Deadlock, Owner, NamespacePolicy]
+  - name: Observability
+    tags: [Inspection, Events, Health]
