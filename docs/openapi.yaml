@@ -15,7 +15,7 @@ info:
     (`"MODE_WRITE"`, `"REASON_CODE_WRITE_LOCKED"`, …), and request/response
     field names are camelCase.
 
-    The streaming variants (`Subscribe`, `AcquireStream`, `PublishEvent`) are
+    The streaming variants (`Subscribe`, `AcquireStream`) are
     gRPC-only and have no HTTP equivalent.
   contact:
     name: pathlockd
@@ -41,8 +41,8 @@ tags:
       `GRANT` event when the path frees.
   - name: Fencing
     description: |
-      Monotonic per-path fencing tokens. Tokens outlive the lease
-      (TTL `max(ttl, 1 day)`). A stale token is rejected as
+      Monotonic per-path fencing tokens persist as durable high-water marks.
+      A stale token is rejected as
       `stale_fencing_token`; the daemon returns the persisted current token
       so the client can refresh without re-reading.
   - name: Deadlock
@@ -1317,9 +1317,8 @@ components:
           type: boolean
           description: |
             Whether a fencing token is currently persisted for this
-            path. The fence can outlive the lock (its TTL is
-            `max(lease, 1 day)`), so this may be `true` even when
-            `writeOwner` is empty.
+            path. Fences are durable high-water marks, so this may be
+            `true` even when `writeOwner` is empty.
         fence:
           type: integer
           format: int64

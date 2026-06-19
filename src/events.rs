@@ -22,7 +22,9 @@ use futures::Stream;
 use tokio::sync::mpsc;
 use tonic::transport::{Channel, Endpoint};
 
-use crate::proto::{path_lock_client::PathLockClient, Event, EventType, PublishEventRequest};
+use crate::proto::{Event, EventType};
+use crate::raft_proto::raft_transport_client::RaftTransportClient;
+use crate::raft_proto::PublishEventRequest;
 
 const PEER_QUEUE: usize = 1024;
 const PEER_RPC_TIMEOUT: Duration = Duration::from_secs(5);
@@ -39,6 +41,7 @@ struct Inner {
     registry: Arc<Registry>,
     static_peer_txs: Vec<mpsc::Sender<Event>>,
     dynamic_peer_txs: Mutex<HashMap<String, mpsc::Sender<Event>>>,
+    auth_token: String,
 }
 
 struct Registry {
@@ -128,7 +131,7 @@ impl Drop for Subscription {
     }
 }
 
-fn spawn_peer(endpoint_url: &str) -> anyhow::Result<mpsc::Sender<Event>> {
+fn spawn_peer(endpoint_url: &str, auth_token: &str) -> anyhow::Result<mpsc::Sender<Event>> {
     let channel = Endpoint::from_shared(endpoint_url.to_string())
         .map_err(|e| anyhow::anyhow!("invalid peer endpoint {endpoint_url}: {e}"))?
         .timeout(PEER_RPC_TIMEOUT)
@@ -138,22 +141,27 @@ fn spawn_peer(endpoint_url: &str) -> anyhow::Result<mpsc::Sender<Event>> {
         .keep_alive_while_idle(true)
         .connect_lazy();
     let (ptx, prx) = mpsc::channel(PEER_QUEUE);
-    tokio::spawn(peer_forwarder(channel, prx));
+    tokio::spawn(peer_forwarder(channel, prx, auth_token.to_string()));
     Ok(ptx)
 }
 
 impl Broadcaster {
-    pub fn new(capacity: usize, peer_endpoints: &[String]) -> anyhow::Result<Self> {
+    pub fn new(
+        capacity: usize,
+        peer_endpoints: &[String],
+        auth_token: &str,
+    ) -> anyhow::Result<Self> {
         let registry = Registry::new(capacity)?;
         let mut static_peer_txs = Vec::new();
         for ep in peer_endpoints {
-            static_peer_txs.push(spawn_peer(ep)?);
+            static_peer_txs.push(spawn_peer(ep, auth_token)?);
         }
         Ok(Self {
             inner: Arc::new(Inner {
                 registry,
                 static_peer_txs,
                 dynamic_peer_txs: Mutex::new(HashMap::new()),
+                auth_token: auth_token.to_string(),
             }),
         })
     }
@@ -169,7 +177,7 @@ impl Broadcaster {
             if peers.contains_key(ep) {
                 continue;
             }
-            match spawn_peer(ep) {
+            match spawn_peer(ep, &self.inner.auth_token) {
                 Ok(tx) => {
                     peers.insert(ep.clone(), tx);
                 }
@@ -225,15 +233,21 @@ impl Broadcaster {
     }
 }
 
-async fn peer_forwarder(channel: Channel, mut rx: mpsc::Receiver<Event>) {
-    let mut client = PathLockClient::new(channel);
+async fn peer_forwarder(channel: Channel, mut rx: mpsc::Receiver<Event>, auth_token: String) {
+    let mut client = RaftTransportClient::new(channel);
     while let Some(ev) = rx.recv().await {
         let owner_id = ev.owner_id.clone();
         let event_type = ev.r#type;
-        if let Err(e) = client
-            .publish_event(PublishEventRequest { event: Some(ev) })
-            .await
+        let mut request = tonic::Request::new(PublishEventRequest {
+            r#type: ev.r#type,
+            owner_id: ev.owner_id,
+        });
+        if let Err(e) = crate::raft::network::authorize_internal_request(&mut request, &auth_token)
         {
+            tracing::error!(error = %e, "invalid internal event auth token");
+            return;
+        }
+        if let Err(e) = client.publish_event(request).await {
             tracing::debug!(owner_id = %owner_id, event_type, error = %e, "peer event forward failed");
         }
     }
@@ -245,14 +259,14 @@ mod tests {
 
     #[test]
     fn broadcaster_rejects_invalid_subscriber_queue_sizes() {
-        assert!(Broadcaster::new(0, &[]).is_err());
-        assert!(Broadcaster::new(MAX_SUBSCRIBER_QUEUE + 1, &[]).is_err());
-        assert!(Broadcaster::new(1, &[]).is_ok());
+        assert!(Broadcaster::new(0, &[], "test").is_err());
+        assert!(Broadcaster::new(MAX_SUBSCRIBER_QUEUE + 1, &[], "test").is_err());
+        assert!(Broadcaster::new(1, &[], "test").is_ok());
     }
 
     #[tokio::test]
     async fn reconcile_dynamic_peers_adds_and_removes() {
-        let b = Broadcaster::new(8, &[]).unwrap();
+        let b = Broadcaster::new(8, &[], "test").unwrap();
         b.reconcile_dynamic_peers(&[
             "http://10.0.0.1:50051".into(),
             "http://10.0.0.2:50051".into(),

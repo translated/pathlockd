@@ -1352,17 +1352,13 @@ pub fn namespace_has_live_locks(
     Ok(found)
 }
 
-/// Every LIVE held lock in this group acquired **under** the routing namespace
-/// `namespace` (i.e. the lock's stored namespace equals `namespace`), returned
-/// as `(owner, mode, path)` against the transaction's merged view (committed
-/// state plus the apply's own pending writes).
+/// Every live held lock selected for a namespace transition, returned as
+/// `(owner, stored namespace, mode, path)` against the transaction's merged
+/// view.
 ///
-/// Used to force-clear a namespace when its lock algorithm changes. The match
-/// is on the stored namespace rather than mere path containment for two
-/// reasons: it is the scope the lock keys were actually written under (so the
-/// caller can delete them via `release_inner_in_namespace`), and a lock taken
-/// under a more-specific nested namespace was governed by that namespace's
-/// policy, not this one — changing this namespace must not clear it.
+/// Algorithm changes select the exact stored namespace. Creating a routing root
+/// additionally selects paths acquired through its previous route, excluding
+/// explicitly preserved nested namespaces.
 ///
 /// Like [`namespace_has_live_locks`] the scan is unbounded (administrative):
 /// the clear is all-or-nothing within a group rather than risking a partially
@@ -1370,7 +1366,9 @@ pub fn namespace_has_live_locks(
 pub fn collect_namespace_holds(
     txn: &WriteTxn,
     namespace: &str,
-) -> anyhow::Result<Vec<(String, String, String)>> {
+    include_legacy_routes: bool,
+    preserved_namespaces: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<Vec<(String, String, String, String)>> {
     let now = txn.now_ms();
     let mut out = Vec::new();
     txn.scan_merged(store_keys::CF_OWNER_HOLDS, None, None, |key, value| {
@@ -1386,9 +1384,14 @@ pub fn collect_namespace_holds(
         let Some(held) = crate::engine::parse_hold_member(&member) else {
             return Ok(true);
         };
-        if held.namespace.as_str() == namespace {
+        let held_namespace = held.namespace.as_str();
+        let legacy_match = include_legacy_routes
+            && crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str())
+            && !preserved_namespaces.contains(held_namespace);
+        if held_namespace == namespace || legacy_match {
             out.push((
                 owner.to_string(),
+                held.namespace.to_string(),
                 held.mode.as_str().to_string(),
                 held.path.into_string(),
             ));

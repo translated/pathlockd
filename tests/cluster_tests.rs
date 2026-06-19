@@ -87,6 +87,7 @@ data_dir = "{data}"
 public_addr = "http://127.0.0.1:{public}"
 raft_addr = "http://127.0.0.1:{raft}"
 gossip_addr = "127.0.0.1:{gossip}"
+internal_auth_token = "cluster-test-internal-auth-token"
 group_count = 4
 replication_factor = 3
 bootstrap = {bootstrap}

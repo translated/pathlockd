@@ -12,7 +12,7 @@ pub struct NodeMeta {
     pub name: String,
     /// Internal Raft/forwarding gRPC endpoint (e.g. `http://10.0.0.1:50052`).
     pub raft_addr: String,
-    /// Public client gRPC endpoint (used for event fan-out between nodes).
+    /// Public client gRPC endpoint.
     pub public_addr: String,
     /// SWIM gossip UDP address.
     pub gossip_addr: String,

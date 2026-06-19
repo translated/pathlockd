@@ -389,45 +389,75 @@ fn mint_fence_if_needed(
     Ok(minted)
 }
 
-/// Force-clear every lock — held and queued — acquired **under** the routing
-/// namespace `namespace`, returning the affected owners (deterministic,
-/// sorted). Invoked when a namespace's effective lock algorithm changes: those
-/// locks were taken under the old algorithm's conflict semantics, so they are
-/// dropped and the owners are told (via a KILLED event) to re-establish under
-/// the new policy.
-///
-/// Held locks are released path-by-path (an owner keeps any locks it holds in
-/// other namespaces), and queued waiters targeting the namespace are dropped.
-/// The release is scoped to `namespace` — the same routing namespace the locks
-/// were written under — so the lock keys are addressed correctly even when it
-/// is path-scoped (e.g. `drive:/tenant/deep`) and differs from the handler.
-fn clear_namespace(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
+/// Force-clear held and queued locks selected by a namespace transition,
+/// returning affected owners in deterministic order. A pure algorithm change
+/// selects the exact stored namespace. Creating a new routing root also clears
+/// acquisitions committed through the previous route while preserving existing
+/// explicit namespaces nested below the new root.
+fn clear_namespace(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    include_legacy_routes: bool,
+) -> anyhow::Result<Vec<String>> {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Group the namespace's held locks by owner, then release each owner's set
     // in one call. Collecting the full set up front means the release writes
     // never mutate the scan mid-iteration. Every collected hold was stored
     // under `namespace`, so the release uses it directly as the key scope.
-    let holds = crate::store_rocksdb::collect_namespace_holds(txn, namespace)?;
-    let mut by_owner: BTreeMap<String, Vec<engine::RelReq>> = BTreeMap::new();
-    for (owner, mode, path) in holds {
+    let mut preserved_namespaces = BTreeSet::new();
+    if include_legacy_routes {
+        let now_ms = txn.now_ms();
+        txn.scan_merged(
+            store_keys::CF_NAMESPACE_SETTINGS,
+            None,
+            None,
+            |key, value| {
+                let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) else {
+                    return Ok(true);
+                };
+                if store_keys::expired(exp, now_ms) {
+                    return Ok(true);
+                }
+                let Ok(root) = std::str::from_utf8(key) else {
+                    return Ok(true);
+                };
+                if root != namespace
+                    && crate::cluster::placement::namespace_contains_path(namespace, root)
+                {
+                    preserved_namespaces.insert(root.to_string());
+                }
+                Ok(true)
+            },
+        )?;
+    }
+    let holds = crate::store_rocksdb::collect_namespace_holds(
+        txn,
+        namespace,
+        include_legacy_routes,
+        &preserved_namespaces,
+    )?;
+    let mut by_owner: BTreeMap<(String, String), Vec<engine::RelReq>> = BTreeMap::new();
+    for (owner, held_namespace, mode, path) in holds {
         let mode = match mode.as_str() {
             "read" => engine::Mode::Read,
             _ => engine::Mode::Write,
         };
         by_owner
-            .entry(owner)
+            .entry((held_namespace, owner))
             .or_default()
             .push(engine::RelReq { path, mode });
     }
 
     let mut affected: BTreeSet<String> = BTreeSet::new();
-    for (owner, reqs) in by_owner {
-        engine::release_inner_in_namespace(txn, namespace, &owner, &reqs, false)?;
+    for ((held_namespace, owner), reqs) in by_owner {
+        engine::release_inner_in_namespace(txn, &held_namespace, &owner, &reqs, false)?;
         affected.insert(owner);
     }
 
-    for owner in crate::queue::clear_namespace(txn, namespace)? {
+    for owner in
+        crate::queue::clear_namespace(txn, namespace, include_legacy_routes, &preserved_namespaces)?
+    {
         affected.insert(owner);
     }
 
@@ -549,7 +579,7 @@ fn execute_op(
                 // No effective change (re-set to the same value); locks stay.
                 ApplyResponse::Unit
             } else {
-                namespace_cleared_response(clear_namespace(txn, namespace)?)
+                namespace_cleared_response(clear_namespace(txn, namespace, !explicit)?)
             }
         }
         Op::DeleteNamespacePolicy { namespace } => {
@@ -559,7 +589,7 @@ fn execute_op(
             // Deleting reverts the namespace to the configured default and
             // removes its routing boundary.
             if explicit {
-                namespace_cleared_response(clear_namespace(txn, namespace)?)
+                namespace_cleared_response(clear_namespace(txn, namespace, false)?)
             } else {
                 ApplyResponse::Unit
             }
@@ -706,7 +736,17 @@ fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32,
                         decode_record(&bytes)
                     {
                         if store_keys::expired(exp, now_ms) {
-                            txn.delete_raw(static_cf, primary_key)?;
+                            if static_cf == store_keys::CF_OWNER_ALIVE && !primary_key.contains(&0)
+                            {
+                                if let Ok(owner) = std::str::from_utf8(primary_key) {
+                                    engine::force_release_inner(txn, owner)?;
+                                }
+                            }
+                            if static_cf != store_keys::CF_QUEUE
+                                || !crate::queue::expire_entry(txn, primary_key)?
+                            {
+                                txn.delete_raw(static_cf, primary_key)?;
+                            }
                             reclaimed += 1;
                         }
                     }
@@ -933,35 +973,43 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
         snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
         let image = snapshot.into_inner();
-        let mut batch = rocksdb::WriteBatch::default();
-        crate::raft::snapshot::install_group_image(&self.db, self.group, &image, &mut batch)
-            .map_err(io_err)?;
-        let cf = self.meta_cf()?;
-        if let Some(last) = &meta.last_log_id {
+        let db = self.db.clone();
+        let group = self.group;
+        let meta = meta.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            let mut batch = rocksdb::WriteBatch::default();
+            crate::raft::snapshot::install_group_image(&db, group, &image, &mut batch)
+                .map_err(io_err)?;
+            let cf = db
+                .cf_handle(store_keys::CF_META)
+                .ok_or_else(|| io_err("missing meta column family"))?;
+            if let Some(last) = &meta.last_log_id {
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(group, store_keys::META_LAST_APPLIED_KEY),
+                    encode_meta(last)?,
+                );
+            }
             batch.put_cf(
                 &cf,
-                store_keys::group_key(self.group, store_keys::META_LAST_APPLIED_KEY),
-                encode_meta(last)?,
+                store_keys::group_key(group, store_keys::META_MEMBERSHIP_KEY),
+                encode_meta(&meta.last_membership)?,
             );
-        }
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_MEMBERSHIP_KEY),
-            encode_meta(&meta.last_membership)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_SNAPSHOT_META_KEY),
-            encode_meta(meta)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_SNAPSHOT_DATA_KEY),
-            &image,
-        );
-        self.db
-            .write_opt(batch, &rocksdb::WriteOptions::default())
-            .map_err(io_err)?;
+            batch.put_cf(
+                &cf,
+                store_keys::group_key(group, store_keys::META_SNAPSHOT_META_KEY),
+                encode_meta(&meta)?,
+            );
+            batch.put_cf(
+                &cf,
+                store_keys::group_key(group, store_keys::META_SNAPSHOT_DATA_KEY),
+                &image,
+            );
+            db.write_opt(batch, &rocksdb::WriteOptions::default())
+                .map_err(io_err)
+        })
+        .await
+        .map_err(io_err)??;
         // An installed snapshot replaces purged log history: it must survive
         // power loss before openraft purges the log on its account.
         self.batcher.barrier().await
@@ -1010,51 +1058,51 @@ impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
         static SNAPSHOT_BUILD_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
         let _permit = SNAPSHOT_BUILD_LIMIT.acquire().await.map_err(io_err)?;
-        let db_snapshot = self.sm.db.snapshot();
-        let (last_applied, membership) = self.sm.applied_state_from_snapshot(&db_snapshot)?;
-        let image = crate::raft::snapshot::build_group_image_from_snapshot_limited(
-            &self.sm.db,
-            &db_snapshot,
-            self.sm.group,
-            usize::try_from(self.sm.snapshot_max_bytes).unwrap_or(usize::MAX),
-        )
-        .map_err(io_err)?;
-
-        let snapshot_id = format!(
-            "g{}-{}-{}",
-            self.sm.group,
-            last_applied
-                .as_ref()
-                .map(|l| l.index.to_string())
-                .unwrap_or_else(|| "0".into()),
-            store_keys::now_ms()
-        );
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-            snapshot_id,
-        };
-
-        // Meta and data must land atomically: written separately, a crash
-        // between them (point-in-time WAL recovery keeps a prefix) could pair
-        // fresh meta with an older image, and `get_current_snapshot` would
-        // serve followers old state labeled with a newer last_log_id.
-        let cf = self.sm.meta_cf()?;
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_META_KEY),
-            encode_meta(&meta)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_DATA_KEY),
-            &image,
-        );
-        self.sm
-            .db
-            .write_opt(batch, &rocksdb::WriteOptions::default())
-            .map_err(io_err)?;
+        let sm = self.sm.clone();
+        let (meta, image) =
+            tokio::task::spawn_blocking(move || -> Result<(SnapshotMeta, Vec<u8>), io::Error> {
+                let db_snapshot = sm.db.snapshot();
+                let (last_applied, membership) = sm.applied_state_from_snapshot(&db_snapshot)?;
+                let image = crate::raft::snapshot::build_group_image_from_snapshot_limited(
+                    &sm.db,
+                    &db_snapshot,
+                    sm.group,
+                    usize::try_from(sm.snapshot_max_bytes).unwrap_or(usize::MAX),
+                )
+                .map_err(io_err)?;
+                let snapshot_id = format!(
+                    "g{}-{}-{}",
+                    sm.group,
+                    last_applied
+                        .as_ref()
+                        .map(|log_id| log_id.index.to_string())
+                        .unwrap_or_else(|| "0".into()),
+                    store_keys::now_ms()
+                );
+                let meta = SnapshotMeta {
+                    last_log_id: last_applied,
+                    last_membership: membership,
+                    snapshot_id,
+                };
+                let cf = sm.meta_cf()?;
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(sm.group, store_keys::META_SNAPSHOT_META_KEY),
+                    encode_meta(&meta)?,
+                );
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(sm.group, store_keys::META_SNAPSHOT_DATA_KEY),
+                    &image,
+                );
+                sm.db
+                    .write_opt(batch, &rocksdb::WriteOptions::default())
+                    .map_err(io_err)?;
+                Ok((meta, image))
+            })
+            .await
+            .map_err(io_err)??;
         // Durable before openraft purges logs covered by this snapshot.
         self.sm.batcher.barrier().await?;
 

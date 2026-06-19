@@ -19,8 +19,8 @@ use crate::raft::manager::RaftGroups;
 use crate::raft::types::{ForwardError, ReadOp, ReadResult, TypeConfig};
 use crate::raft_proto::raft_transport_server::RaftTransport;
 use crate::raft_proto::{
-    ForwardReadRequest, ForwardReadResponse, ForwardRequest, ForwardResponse, RaftFrame,
-    SetDrainingRequest, SetDrainingResponse, SnapshotChunk,
+    ForwardReadRequest, ForwardReadResponse, ForwardRequest, ForwardResponse, PublishEventRequest,
+    PublishEventResponse, RaftFrame, SetDrainingRequest, SetDrainingResponse, SnapshotChunk,
 };
 
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Status> {
@@ -37,13 +37,19 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Status> {
 pub struct RaftTransportService {
     groups: Arc<RaftGroups>,
     group_count: u32,
+    broadcaster: crate::events::Broadcaster,
 }
 
 impl RaftTransportService {
-    pub fn new(groups: Arc<RaftGroups>, group_count: u32) -> Self {
+    pub fn new(
+        groups: Arc<RaftGroups>,
+        group_count: u32,
+        broadcaster: crate::events::Broadcaster,
+    ) -> Self {
         Self {
             groups,
             group_count,
+            broadcaster,
         }
     }
 
@@ -232,6 +238,20 @@ impl RaftTransport for RaftTransportService {
             .await
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(SetDrainingResponse {}))
+    }
+
+    async fn publish_event(
+        &self,
+        request: Request<PublishEventRequest>,
+    ) -> Result<Response<PublishEventResponse>, Status> {
+        let event = request.into_inner();
+        let event = crate::proto::Event {
+            r#type: event.r#type,
+            owner_id: event.owner_id,
+        };
+        crate::service::validate_peer_event(&event)?;
+        self.broadcaster.publish_from_peer(event);
+        Ok(Response::new(PublishEventResponse {}))
     }
 }
 

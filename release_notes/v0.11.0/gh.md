@@ -239,6 +239,14 @@ owner lease in O(1) instead of enumerating every held path. A `Renew` that
 finds no live `alive` key returns `LOST(missing_alive)`; one whose owner has
 no portfolio returns `LOST(missing_owner_set)`.
 
+### Changed: authenticated internal transport
+
+Raft protocol traffic, leader forwarding, snapshots, draining, and peer event
+fan-out now use the internal `RaftTransport` service on `raft_addr` and require
+the shared `internal_auth_token` (`PATHLOCKD_INTERNAL_AUTH_TOKEN`, minimum 32
+bytes). `PublishEvent` is no longer exposed on the public `PathLock` service.
+Static `peers` entries now name internal Raft endpoints.
+
 ### Changed: RocksDB block cache is `AutoHyperClockCache`
 
 The shared block cache is now an `AutoHyperClockCache` (lock-free clock
@@ -312,6 +320,10 @@ This release is **not** backward compatible:
   upgrade all clients (including `pathlockd-nodejs-client`) and deploy
   them together with the daemon. Mixed 0.8.x / 0.11.0 clients and daemons
   are unsupported.
+- **Internal authentication is required** — configure the same random
+  `internal_auth_token` on every node before startup. Mixed tokens cannot form
+  a cluster. The default internal transport remains plaintext, so keep
+  `raft_addr` private or terminate it through a mutually authenticated proxy.
 - **Default routing resolution changed** — `routing_prefix_segments`
   defaults to `1` instead of `0`. Existing deployments that relied on
   handler-wide single-group sharding must set

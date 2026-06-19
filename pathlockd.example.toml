@@ -98,8 +98,9 @@ group_gc_batch = 1024
 gc_compact_interval_secs = 600
 
 # Cross-instance event fan-out: cluster members are discovered via gossip
-# automatically; this adds extra static endpoints (rarely needed).
+# automatically; this adds extra static internal Raft endpoints (rarely needed).
 peers = []
+internal_auth_token = "replace-with-a-shared-random-secret-of-at-least-32-bytes"
 
 # In-process event broadcast channel capacity.
 event_buffer = 8192

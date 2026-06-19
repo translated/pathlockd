@@ -27,9 +27,11 @@ use crate::store_keys::{
     decode_queue_entry_seq, decode_queue_path_seq, expired, queue_entry_key, queue_entry_lower,
     queue_entry_upper, queue_owner_key, queue_path_key, queue_path_prefix, queue_path_upper,
     rd_prefix, sem_prefix, wr_key, CF_META, CF_QUEUE, CF_READ_LOCKS, CF_SEMAPHORE, CF_WRITE_LOCKS,
-    META_QUEUE_SEQ_KEY,
+    META_QUEUE_COUNT_KEY, META_QUEUE_SEQ_KEY,
 };
-use crate::store_rocksdb::{decode_record, encode_record, StoreTxn, StoredRecord, WriteTxn};
+use crate::store_rocksdb::{
+    decode_record, encode_record, SetScanLimitExceeded, StoreTxn, StoredRecord, WriteTxn,
+};
 
 /// How long an enqueued waiter survives without being granted. Comfortably
 /// exceeds a client's acquire deadline, so a live waiter never expires
@@ -66,6 +68,19 @@ fn new_scoped_paths(args: &AcquireArgs, namespace: &str) -> Vec<(String, Mode)> 
     new_paths(args)
         .map(|(path, mode)| (scoped_path(namespace, path), mode))
         .collect()
+}
+
+fn queue_units(args: &AcquireArgs) -> u64 {
+    u64::try_from(new_paths(args).count().max(1)).unwrap_or(u64::MAX)
+}
+
+fn stored_queue_units(raw: &[u8]) -> u64 {
+    match decode_record(raw) {
+        Ok(StoredRecord::Bytes { v, .. }) => decode_queue_entry(&v)
+            .map(|entry| queue_units(&entry.args))
+            .unwrap_or(1),
+        _ => 1,
+    }
 }
 
 /// Whether two acquire requests cannot be held simultaneously: a write covers
@@ -119,6 +134,53 @@ fn next_seq(tx: &mut WriteTxn) -> anyhow::Result<u64> {
     Ok(next)
 }
 
+fn queue_count(tx: &mut WriteTxn) -> anyhow::Result<u64> {
+    if let Some(bytes) = tx.get_raw(CF_META, META_QUEUE_COUNT_KEY)? {
+        if let StoredRecord::Counter { v } = decode_record(&bytes)? {
+            return Ok(v.max(0) as u64);
+        }
+    }
+    let lower = queue_entry_lower();
+    let upper = queue_entry_upper();
+    let mut count = 0u64;
+    tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        if decode_queue_entry_seq(key).is_some() {
+            count = count.saturating_add(stored_queue_units(value));
+        }
+        Ok(true)
+    })?;
+    set_queue_count(tx, count)?;
+    Ok(count)
+}
+
+fn set_queue_count(tx: &mut WriteTxn, count: u64) -> anyhow::Result<()> {
+    tx.put_raw(
+        CF_META,
+        META_QUEUE_COUNT_KEY,
+        encode_record(&StoredRecord::Counter {
+            v: i64::try_from(count).unwrap_or(i64::MAX),
+        })?,
+    )
+}
+
+fn reserve_queue_units(tx: &mut WriteTxn, old_units: u64, new_units: u64) -> anyhow::Result<()> {
+    let count = queue_count(tx)?;
+    let next = count.saturating_sub(old_units).saturating_add(new_units);
+    if next > QUEUE_SCAN_LIMIT as u64 {
+        return Err(SetScanLimitExceeded {
+            operation: "enqueue",
+            limit: QUEUE_SCAN_LIMIT,
+        }
+        .into());
+    }
+    set_queue_count(tx, next)
+}
+
+fn release_queue_units(tx: &mut WriteTxn, units: u64) -> anyhow::Result<()> {
+    let count = queue_count(tx)?;
+    set_queue_count(tx, count.saturating_sub(units))
+}
+
 // ---------------------------------------------------------------------------
 // Enqueue / dequeue / scan
 // ---------------------------------------------------------------------------
@@ -140,9 +202,11 @@ pub fn enqueue<P: Into<LockPolicy>>(
 ) -> anyhow::Result<u64> {
     let policy = policy.into();
     let owner = args.owner_id.clone();
+    let mut old_units = 0;
     let seq = match owner_seq(tx, &owner)? {
         Some(existing) => {
             if let Some(entry) = read_entry(tx, existing)? {
+                old_units = queue_units(&entry.args);
                 if entry.namespace == namespace && entry.args == *args && entry.policy == policy {
                     delete_path_indexes(tx, &entry)?;
                     existing
@@ -153,12 +217,14 @@ pub fn enqueue<P: Into<LockPolicy>>(
                     next_seq(tx)?
                 }
             } else {
+                expire_entry(tx, &queue_entry_key(existing))?;
                 tx.del(CF_QUEUE, &queue_owner_key(&owner))?;
                 next_seq(tx)?
             }
         }
         None => next_seq(tx)?,
     };
+    reserve_queue_units(tx, old_units, queue_units(args))?;
     // The client sends its wait deadline as the entry TTL; 0 → server default.
     let ttl = if args.queue_ttl_ms > 0 {
         args.queue_ttl_ms
@@ -183,13 +249,37 @@ pub fn enqueue<P: Into<LockPolicy>>(
 /// the owner is not queued.
 pub fn dequeue(tx: &mut WriteTxn, owner: &str) -> anyhow::Result<()> {
     if let Some(seq) = owner_seq(tx, owner)? {
+        let raw = tx.get_raw(CF_QUEUE, &queue_entry_key(seq))?;
         if let Some(entry) = read_entry(tx, seq)? {
             delete_path_indexes(tx, &entry)?;
+        }
+        if let Some(raw) = raw {
+            release_queue_units(tx, stored_queue_units(&raw))?;
         }
         tx.del(CF_QUEUE, &queue_entry_key(seq))?;
     }
     tx.del(CF_QUEUE, &queue_owner_key(owner))?;
     Ok(())
+}
+
+pub fn expire_entry(tx: &mut WriteTxn, primary_key: &[u8]) -> anyhow::Result<bool> {
+    let Some(seq) = decode_queue_entry_seq(primary_key) else {
+        return Ok(false);
+    };
+    let Some(raw) = tx.get_raw(CF_QUEUE, primary_key)? else {
+        return Ok(false);
+    };
+    if let Ok(StoredRecord::Bytes { v, .. }) = decode_record(&raw) {
+        if let Some(entry) = decode_queue_entry(&v) {
+            delete_path_indexes(tx, &entry)?;
+            if owner_seq(tx, &entry.owner)? == Some(seq) {
+                tx.del(CF_QUEUE, &queue_owner_key(&entry.owner))?;
+            }
+        }
+    }
+    release_queue_units(tx, stored_queue_units(&raw))?;
+    tx.del(CF_QUEUE, primary_key)?;
+    Ok(true)
 }
 
 /// All live queued waiters, in FIFO (ascending seq) order.
@@ -216,25 +306,53 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
     Ok(out)
 }
 
-/// Dequeue every live waiter enqueued **under** `namespace`, returning the
-/// dequeued owners (deterministic, ascending-seq order). Used when a namespace's
-/// lock algorithm changes: a waiter queued under the old semantics must not be
-/// granted in place under the new ones, so it is dropped (the caller signals it
-/// via a KILLED event).
-///
-/// The match is on the waiter's stored routing namespace (set at enqueue), not
-/// path containment: a waiter parked under a more-specific nested namespace was
-/// queued under that namespace's policy and must survive this one's change.
-pub fn clear_namespace(tx: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
-    let entries = scan(tx)?;
+/// Dequeue live waiters selected by a namespace transition, returning owners in
+/// ascending sequence order. Algorithm changes select the exact stored
+/// namespace; a new routing root also selects its previous routes while
+/// preserving already-explicit nested namespaces.
+pub fn clear_namespace(
+    tx: &mut WriteTxn,
+    namespace: &str,
+    include_legacy_routes: bool,
+    preserved_namespaces: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<Vec<String>> {
+    let entries = scan_all(tx)?;
     let mut cleared = Vec::new();
     for entry in entries {
-        if entry.namespace == namespace {
+        let legacy_match = include_legacy_routes
+            && (entry.args.requests.iter().any(|req| {
+                crate::cluster::placement::namespace_contains_path(namespace, &req.path)
+            }) || entry.args.release_requests.iter().any(|req| {
+                crate::cluster::placement::namespace_contains_path(namespace, &req.path)
+            }))
+            && !preserved_namespaces.contains(&entry.namespace);
+        if entry.namespace == namespace || legacy_match {
             dequeue(tx, &entry.owner)?;
             cleared.push(entry.owner);
         }
     }
     Ok(cleared)
+}
+
+fn scan_all(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
+    let now = tx.now_ms();
+    let lower = queue_entry_lower();
+    let upper = queue_entry_upper();
+    let mut out = Vec::new();
+    tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        if decode_queue_entry_seq(key).is_none() {
+            return Ok(true);
+        }
+        if let Ok(StoredRecord::Bytes { v, exp }) = decode_record(value) {
+            if !expired(exp, now) {
+                if let Some(entry) = decode_queue_entry(&v) {
+                    out.push(entry);
+                }
+            }
+        }
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 fn decode_queue_entry(bytes: &[u8]) -> Option<QueueEntry> {
@@ -329,7 +447,12 @@ fn collect_exact_path_seqs(
     let lower = queue_path_prefix(path);
     let upper = queue_path_upper(path);
     let mut raw = 0usize;
+    let mut exceeded = false;
     tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        if raw >= QUEUE_SCAN_LIMIT {
+            exceeded = true;
+            return Ok(false);
+        }
         raw += 1;
         if let Some(seq) = decode_queue_path_seq(key) {
             if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
@@ -338,8 +461,15 @@ fn collect_exact_path_seqs(
                 }
             }
         }
-        Ok(out.len() < QUEUE_SCAN_LIMIT && raw < QUEUE_SCAN_LIMIT)
+        Ok(true)
     })?;
+    if exceeded {
+        return Err(SetScanLimitExceeded {
+            operation: "queue exact-path scan",
+            limit: QUEUE_SCAN_LIMIT,
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -351,7 +481,12 @@ fn collect_prefixed_path_seqs(
     let now = tx.now_ms();
     let (lower, upper) = queue_index_prefix_range(path_prefix);
     let mut raw = 0usize;
+    let mut exceeded = false;
     tx.scan_merged(CF_QUEUE, Some(&lower), upper.as_deref(), |key, value| {
+        if raw >= QUEUE_SCAN_LIMIT {
+            exceeded = true;
+            return Ok(false);
+        }
         raw += 1;
         if let Some(seq) = decode_queue_path_seq(key) {
             if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
@@ -360,8 +495,15 @@ fn collect_prefixed_path_seqs(
                 }
             }
         }
-        Ok(out.len() < QUEUE_SCAN_LIMIT && raw < QUEUE_SCAN_LIMIT)
+        Ok(true)
     })?;
+    if exceeded {
+        return Err(SetScanLimitExceeded {
+            operation: "queue prefix scan",
+            limit: QUEUE_SCAN_LIMIT,
+        }
+        .into());
+    }
     Ok(())
 }
 
@@ -787,6 +929,48 @@ mod tests {
         assert_eq!(q[0].owner, "o2");
         // idempotent
         dequeue(&mut tx, "o1").unwrap();
+    }
+
+    #[test]
+    fn queue_capacity_tracks_indexed_paths_across_replacement() {
+        let (db, _d) = open_temp_db();
+        let mut tx = txn(&db, 1_000);
+        enqueue(
+            &mut tx,
+            "h",
+            &args(
+                "o1",
+                vec![req("h:/a", Mode::Write), req("h:/b", Mode::Write)],
+            ),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        assert_eq!(queue_count(&mut tx).unwrap(), 2);
+        enqueue(
+            &mut tx,
+            "h",
+            &args("o1", vec![req("h:/c", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        assert_eq!(queue_count(&mut tx).unwrap(), 1);
+        dequeue(&mut tx, "o1").unwrap();
+        assert_eq!(queue_count(&mut tx).unwrap(), 0);
+    }
+
+    #[test]
+    fn queue_capacity_rejects_more_indexed_paths_than_can_be_scanned() {
+        let (db, _d) = open_temp_db();
+        let mut tx = txn(&db, 1_000);
+        set_queue_count(&mut tx, QUEUE_SCAN_LIMIT as u64).unwrap();
+        let err = enqueue(
+            &mut tx,
+            "h",
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<SetScanLimitExceeded>().is_some());
     }
 
     #[test]

@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::store_keys::{
     alive_key, fence_key, hold_algorithm_key, namespace_policy_key, own_prefix, rd_prefix,
     rddesc_prefix, revoke_key, sem_prefix, semaphore_permits_key, wait_key, wr_key, wrdesc_key,
-    FENCE_MIN_TTL_MS, MAX_SET_ENUM_MEMBERS,
+    MAX_SET_ENUM_MEMBERS,
 };
 use crate::store_rocksdb::StoreTxn;
 
@@ -38,15 +38,7 @@ const SCAN_WARN_THRESHOLD: usize = 1024;
 
 /// Page size for owner-wide cleanup scans (`release_all`, `force_release`).
 const RELEASE_PAGE: usize = 4096;
-/// Absolute safety valve on members processed by one owner-wide cleanup
-/// command. Cleanup past this point is left to TTL expiry + GC; the owner's
-/// liveness marker is still removed, so the residue stops blocking anyone.
-///
-/// Kept moderate on purpose: one command's deletions (plus per-member
-/// descendant-index removals) accumulate in a single WriteBatch + overlay
-/// held in memory and applied synchronously by every replica's apply loop.
-const MAX_RELEASE_MEMBERS: usize = 1 << 16;
-const SCOPED_PATH_SEP: char = '\x1f';
+pub const SCOPED_PATH_SEP: char = '\x1f';
 // ---------------------------------------------------------------------------
 // Public value types
 // ---------------------------------------------------------------------------
@@ -1082,7 +1074,6 @@ pub fn acquire_inner_in_namespace<T: StoreTxn>(
 ) -> anyhow::Result<AcquireOutcome> {
     let owner = &args.owner_id;
     let ttl = args.ttl_ms;
-    let fence_ttl = ttl.max(FENCE_MIN_TTL_MS);
     let token = args.fencing_token;
     let alive_k = alive_key(owner);
     let own_pfx = own_prefix(owner);
@@ -1092,11 +1083,15 @@ pub fn acquire_inner_in_namespace<T: StoreTxn>(
     }
 
     let has_held = args.requests.iter().any(|r| r.state == State::Held);
-    if has_held && tx.get_str(ALIVE_CF, &alive_k)?.is_none() {
+    let alive = tx.get_str(ALIVE_CF, &alive_k)?.is_some();
+    if has_held && !alive {
         return Ok(AcquireOutcome::Lost {
             path: String::new(),
             reason: Reason::MissingAlive,
         });
+    }
+    if !has_held && !alive && !args.requests.is_empty() {
+        release_owner_wide(tx, owner, false)?;
     }
 
     if let Some(outcome) = validate_acquire(tx, owner, token, &args.requests, namespace, policy)? {
@@ -1108,7 +1103,6 @@ pub fn acquire_inner_in_namespace<T: StoreTxn>(
         namespace,
         request_algorithm: policy.algorithm,
         token,
-        fence_ttl,
         own_pfx: &own_pfx,
     };
     for req in &args.requests {
@@ -1335,7 +1329,6 @@ struct AcquireApplyCtx<'a> {
     namespace: &'a str,
     request_algorithm: LockAlgorithm,
     token: i64,
-    fence_ttl: u64,
     own_pfx: &'a [u8],
 }
 
@@ -1371,15 +1364,7 @@ fn apply_acquire<T: StoreTxn>(
             None
         }
     } else if req.mode == Mode::Write {
-        apply_write_acquire(
-            tx,
-            ctx.owner,
-            path,
-            req.state,
-            &key_path,
-            ctx.token,
-            ctx.fence_ttl,
-        )?
+        apply_write_acquire(tx, ctx.owner, path, req.state, &key_path, ctx.token)?
     } else {
         let rd_pfx = rd_prefix(&key_path);
         tx.sadd(RD_CF, &rd_pfx, ctx.owner, 0)?;
@@ -1404,25 +1389,24 @@ fn apply_write_acquire<T: StoreTxn>(
     state: State,
     key_path: &str,
     token: i64,
-    fence_ttl: u64,
 ) -> anyhow::Result<Option<AcquireOutcome>> {
     let wr_k = wr_key(key_path);
     let fence_k = fence_key(key_path);
     match state {
         State::Held => {
             tx.set_str(WR_CF, &wr_k, owner, 0)?;
-            tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+            tx.set_str(FENCE_CF, &fence_k, &token.to_string(), 0)?;
             add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
         }
         State::New => match tx.get_str(WR_CF, &wr_k)? {
             None => {
                 tx.set_str(WR_CF, &wr_k, owner, 0)?;
-                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), 0)?;
                 add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
             }
             Some(current) if current == owner => {
                 tx.set_str(WR_CF, &wr_k, owner, 0)?;
-                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), fence_ttl)?;
+                tx.set_str(FENCE_CF, &fence_k, &token.to_string(), 0)?;
                 add_descendant_indexes(tx, Mode::Write, key_path, 0)?;
             }
             Some(current) => return Ok(Some(conflict(path, &current, Reason::WriteLocked))),
@@ -1597,9 +1581,8 @@ fn release_held_member<T: StoreTxn>(tx: &mut T, owner: &str, item: &str) -> anyh
 /// renew/acquire would error out, which previously made `release_all` and
 /// `force_release` fail for exactly the owners that most needed them).
 ///
-/// The owner's liveness and wait-edge markers are removed unconditionally at
-/// the end: even if physical cleanup is capped, a dead `alive` record means
-/// every remaining record is prunable on next touch and reclaimable by GC.
+/// The owner's liveness and wait-edge markers are removed after every hold has
+/// been deleted.
 fn release_owner_wide<T: StoreTxn>(
     tx: &mut T,
     owner: &str,
@@ -1607,26 +1590,15 @@ fn release_owner_wide<T: StoreTxn>(
 ) -> anyhow::Result<()> {
     let own_pfx = own_prefix(owner);
     let mut cursor: Option<Vec<u8>> = None;
-    let mut processed = 0usize;
     loop {
         let (members, next) = tx.smembers_page(OWN_CF, &own_pfx, cursor.take(), RELEASE_PAGE)?;
         for item in &members {
             release_held_member(tx, owner, item)?;
             tx.srem(OWN_CF, &own_pfx, item)?;
-            processed += 1;
         }
         match next {
             None => break,
-            Some(c) => {
-                if processed >= MAX_RELEASE_MEMBERS {
-                    warn!(
-                        owner,
-                        processed, "owner-wide release hit member cap; residue left to TTL+GC"
-                    );
-                    break;
-                }
-                cursor = Some(c);
-            }
+            Some(c) => cursor = Some(c),
         }
     }
 

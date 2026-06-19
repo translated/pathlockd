@@ -87,9 +87,9 @@ into four opt-in policies. The contract:
   absolute root. A nested explicit namespace routes to a different Raft group
   and a different algorithm; parent recursive locks do not coordinate with
   it.
-- **Fencing tokens are monotonic** per path and outlive the lease (TTL
-  `max(ttl, 1 day)`). A stale token is rejected as `stale_fencing_token`,
-  with the persisted fence in `AcquireResponse.owner` so the client can
+- **Fencing tokens are monotonic** per path and persist as durable high-water
+  marks. A stale token is rejected as `stale_fencing_token`,
+  with the persisted fence in `AcquireResponse.current_fencing_token` so the client can
   refresh without re-reading.
 - **Every lock is a TTL lease** (`ttl_ms > 0`). If the holder dies the lease
   expires and the subtree frees itself — no orphaned locks.

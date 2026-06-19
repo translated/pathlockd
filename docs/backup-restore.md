@@ -105,7 +105,7 @@ This prevents state/log divergence after a process crash.
 | `raft_log` | Raft log entries | Yes — needed for catch-up |
 | `write_locks` | Exclusive write lock state | Yes |
 | `read_locks` | Shared read lock state | Yes |
-| `fences` | Per-path fencing tokens | Yes (long-lived) |
+| `fences` | Per-path fencing tokens | Yes (durable high-water marks) |
 | `desc_write` | Write descendant indexes | Yes |
 | `desc_read` | Read descendant indexes | Yes |
 | `owner_alive` | Owner liveness leases | Yes |

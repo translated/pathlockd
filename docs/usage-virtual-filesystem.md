@@ -251,8 +251,8 @@ Handle them:
 > backstops, so events are the fast path, not a guarantee.
 
 In a multi-replica deployment, keep an owner sticky to one replica (one lock =
-one connection). If clients hop replicas, set `PATHLOCKD_PEERS` so events fan out
-to siblings.
+one connection). If clients hop replicas, set `PATHLOCKD_PEERS` to the siblings'
+internal Raft endpoints so events fan out.
 
 ---
 

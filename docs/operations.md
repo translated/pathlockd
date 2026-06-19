@@ -33,6 +33,7 @@ Configuration is loaded from lowest to highest precedence:
 | `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
 | `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
 | `public_addr` / `raft_addr` | localhost | Addresses advertised to peers — must be reachable cluster-wide |
+| `internal_auth_token` | required | Shared secret for the internal Raft transport; use the same random value on every node (minimum 32 bytes) |
 | `gossip_addr` | `0.0.0.0:7946` | SWIM UDP bind; `gossip_advertise_addr` overrides the advertised ip:port |
 | `gossip_cluster_size` | `32` | Expected SWIM members for Foca dissemination/suspicion tuning |
 | `gossip_max_packet_size` | `1400` | Maximum Foca UDP payload size |
@@ -75,6 +76,7 @@ node_id = "pathlockd-0"
 data_dir = "/var/lib/pathlockd"
 public_addr = "http://pathlockd-0.pathlockd:50051"
 raft_addr = "http://pathlockd-0.pathlockd:50052"
+internal_auth_token = "replace-with-a-shared-random-secret-of-at-least-32-bytes"
 gossip_addr = "0.0.0.0:7946"
 gossip_cluster_size = 32
 gossip_max_packet_size = 1400
@@ -88,6 +90,11 @@ event_buffer = 8192
 request_timeout_ms = 30000
 log_level = "info"
 ```
+
+The internal transport rejects requests without the shared token. Keep
+`raft_addr` on a private network because the default transport is plaintext;
+use network policy or a mutually authenticated proxy when traffic crosses an
+untrusted network.
 
 ## Running
 

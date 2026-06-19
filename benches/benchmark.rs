@@ -270,6 +270,7 @@ data_dir = "{data}"
 public_addr = "http://127.0.0.1:{public}"
 raft_addr = "http://127.0.0.1:{raft}"
 gossip_addr = "127.0.0.1:{gossip}"
+internal_auth_token = "benchmark-internal-auth-token-32x"
 group_count = {groups}
 replication_factor = {rf}
 bootstrap = {bootstrap}

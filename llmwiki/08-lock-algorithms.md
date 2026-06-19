@@ -419,8 +419,8 @@ hits one group per namespace, no amplification.
 ## Invariants preserved across all algorithms
 
 - An owner never conflicts with itself; re-entrancy is unconditional.
-- Fencing tokens are monotonic per path and outlive the lease (TTL
-  `max(ttl, 1 day)`) — **except `semaphore`, which does not fence**.
+- Fencing tokens are durable monotonic high-water marks per path — **except
+  `semaphore`, which does not fence**.
 - A `STALE_FENCING_TOKEN` always wins over a held-lock reason (it never arises
   under `semaphore`).
 - `semaphore` is the only algorithm that admits more than one holder per path;

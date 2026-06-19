@@ -36,7 +36,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cluster::placement::GroupId;
 
-pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
 
 /// Expiry-index timestamps for long leases are rounded up to this quantum so
@@ -54,6 +53,7 @@ pub const META_GC_CURSOR_KEY: &[u8] = b"gc_cursor";
 /// entries. Bumped deterministically in the apply path, so every replica
 /// assigns identical ordering (= Raft log order).
 pub const META_QUEUE_SEQ_KEY: &[u8] = b"queue_seq";
+pub const META_QUEUE_COUNT_KEY: &[u8] = b"queue_count";
 pub const META_LAST_NOW_KEY: &[u8] = b"last_now_ms";
 pub const META_VOTE_KEY: &[u8] = b"raft_vote";
 pub const META_COMMITTED_KEY: &[u8] = b"raft_committed";

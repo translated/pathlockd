@@ -112,6 +112,7 @@ The env vars you actually need:
 | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable identifier; must end in a unique integer per node |
 | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a new cluster (exactly one node) |
 | `PATHLOCKD_SEED_NODES` | *(none)* | Comma-separated gossip seed addresses (multi-node) |
+| `PATHLOCKD_INTERNAL_AUTH_TOKEN` | *(required)* | Shared random cluster credential, at least 32 bytes |
 | `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
 ## Container image
@@ -123,6 +124,7 @@ every `v*` tag). Single-node run:
 docker run -d --restart=unless-stopped \
   -p 50051:50051 \
   -e PATHLOCKD_BOOTSTRAP=true \
+  -e PATHLOCKD_INTERNAL_AUTH_TOKEN=replace-with-a-random-32-byte-secret \
   -v pathlockd-data:/data/pathlockd \
   ghcr.io/alexpacio/pathlockd:latest
 ```

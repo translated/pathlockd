@@ -8,6 +8,7 @@ use std::{
 
 use futures::FutureExt;
 use tonic::transport::{Endpoint, Server};
+use tonic::Request;
 use tracing::{error, info, warn};
 
 use pathlockd::cluster::controller::{spawn_controller, ControllerOptions};
@@ -32,6 +33,34 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const CLUSTER_CONFIG_FINGERPRINT_KEY: &[u8] = b"pathlockd/cluster-config-fingerprint/v1";
+
+fn ensure_local_cluster_config(db: &rocksdb::DB, expected: u64) -> anyhow::Result<()> {
+    let cf = db
+        .cf_handle(pathlockd::store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    if let Some(raw) = db.get_cf(&cf, CLUSTER_CONFIG_FINGERPRINT_KEY)? {
+        let stored = u64::from_be_bytes(
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid stored cluster configuration"))?,
+        );
+        anyhow::ensure!(
+            stored == expected,
+            "cluster configuration differs from this data directory (stored {stored:016x}, configured {expected:016x})"
+        );
+        return Ok(());
+    }
+    let mut options = rocksdb::WriteOptions::default();
+    options.set_sync(true);
+    db.put_cf_opt(
+        &cf,
+        CLUSTER_CONFIG_FINGERPRINT_KEY,
+        expected.to_be_bytes(),
+        &options,
+    )?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -81,6 +110,7 @@ async fn main() -> anyhow::Result<()> {
             enable_pipelined_write: cfg.rocksdb_enable_pipelined_write,
         },
     )?;
+    ensure_local_cluster_config(&db, cfg.cluster_config_fingerprint())?;
     otel::register_rocksdb_metrics(db.clone());
 
     // The node-wide WAL fsync batcher (group commit across all raft groups).
@@ -94,7 +124,7 @@ async fn main() -> anyhow::Result<()> {
         raft_config(&cfg),
         cfg.raft_snapshot_max_bytes,
         batcher,
-        PeerPool::new(),
+        PeerPool::new(&cfg.internal_auth_token),
         cfg.default_lock_algorithm,
     )?;
 
@@ -105,10 +135,14 @@ async fn main() -> anyhow::Result<()> {
     let resumed = resume_local_groups(&groups, &db, cfg.group_count).await?;
     info!(resumed, "resumed locally-known raft groups");
 
+    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers, &cfg.internal_auth_token)?;
+
     // Internal raft transport (protocol RPCs, forwarding) on raft_addr.
     let raft_listen = raft_listen_addr(&cfg.raft_addr)?;
     {
-        let transport = RaftTransportService::new(groups.clone(), cfg.group_count);
+        let transport =
+            RaftTransportService::new(groups.clone(), cfg.group_count, broadcaster.clone());
+        let internal_auth_token = cfg.internal_auth_token.clone();
         let listener = tokio::net::TcpListener::bind(raft_listen)
             .await
             .map_err(|e| anyhow::anyhow!("binding raft transport {raft_listen}: {e}"))?;
@@ -117,7 +151,16 @@ async fn main() -> anyhow::Result<()> {
                 .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
                 .tcp_keepalive(Some(TCP_KEEPALIVE))
-                .add_service(RaftTransportServer::new(transport))
+                .add_service(RaftTransportServer::with_interceptor(
+                    transport,
+                    move |request: Request<()>| {
+                        pathlockd::raft::network::authenticate_internal_request(
+                            &request,
+                            &internal_auth_token,
+                        )?;
+                        Ok(request)
+                    },
+                ))
                 .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
             if let Err(e) = server {
@@ -148,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         meta: advertised_meta,
         incarnation: pathlockd::store_keys::now_ms(),
+        config_fingerprint: cfg.cluster_config_fingerprint(),
     };
     info!(%gossip_advertised, "gossip advertise address");
     let members = gossip::start_gossip_with_options(
@@ -219,7 +263,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Events: cross-instance fan-out — static peers + gossip-discovered ones.
-    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
     spawn_event_peer_sync(broadcaster.clone(), members.clone(), node_id);
 
     // GC: each node sweeps the groups it leads (the sweep is a raft command,
@@ -362,8 +405,8 @@ fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembe
                 let peers: Vec<String> = rx
                     .borrow()
                     .values()
-                    .filter(|m| m.node_id != self_id && !m.meta.public_addr.is_empty())
-                    .map(|m| m.meta.public_addr.clone())
+                    .filter(|m| m.node_id != self_id && !m.meta.raft_addr.is_empty())
+                    .map(|m| m.meta.raft_addr.clone())
                     .collect();
                 broadcaster.reconcile_dynamic_peers(&peers);
             }
@@ -587,5 +630,14 @@ mod tests {
             "0.0.0.0:50052".parse::<SocketAddr>().unwrap()
         );
         assert!(raft_listen_addr("http://nodeport").is_err());
+    }
+
+    #[test]
+    fn data_directory_rejects_a_changed_cluster_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("db"), &DbTuning::default()).unwrap();
+        ensure_local_cluster_config(&db, 7).unwrap();
+        ensure_local_cluster_config(&db, 7).unwrap();
+        assert!(ensure_local_cluster_config(&db, 8).is_err());
     }
 }

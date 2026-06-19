@@ -12,7 +12,7 @@ All lock metadata lives across these RocksDB column families:
 |---|---|
 | `CF_WRITE_LOCKS` | Active write lock: scoped_path → owner |
 | `CF_READ_LOCKS` | Active read locks: scoped_path\0owner → presence (set) |
-| `CF_FENCES` | Write-lock fencing tokens: scoped_path → token (min 24h TTL) |
+| `CF_FENCES` | Write-lock fencing tokens: scoped_path → durable high-water token |
 | `CF_DESC_WRITE` | Descendant write index: ancestor\0path (reverse index) |
 | `CF_DESC_READ` | Descendant read index: ancestor\0path |
 | `CF_OWNER_ALIVE` | Owner lease marker: owner → "1" (the only lease TTL for a held portfolio) |
@@ -21,7 +21,7 @@ All lock metadata lives across these RocksDB column families:
 | `CF_NAMESPACE_SETTINGS` | Namespace settings: namespace → `<epoch>:<algorithm>` / explicit route root |
 | `CF_QUEUE` | Wait queue: entry keys (`'e'`+be_u64(seq) → owner+namespace+AcquireArgs) iterate FIFO; owner keys (`'o'`+owner → seq) for O(1) dequeue; path index keys (`'p'`+scoped_path+\0+seq) power admission |
 | `CF_EXPIRY` | TTL index: expires_at\0cf\0primary_key (shadow records) |
-| `CF_META` | Per-group metadata: fence_counter (monotonic), per-group queue sequence |
+| `CF_META` | Per-group metadata: fence_counter (monotonic), queue sequence/count |
 | `CF_RAFT_LOG` | Raft log entries (managed by openraft) |
 | `CF_DEFAULT` | Catch-all safety net |
 
@@ -49,13 +49,14 @@ extend-only — re-adding a member can never shorten it.
 
 - **Owner leases** stamp `CF_OWNER_ALIVE` with `exp = now_ms + ttl`; held lock
   records, owner-hold members, and descendant indexes are non-expiring and are
-  valid only while their owner is alive. Fence keys use `max(ttl, 1 day)` so a
-  stale token outlives the lock.
+  valid only while their owner is alive. Fence keys are durable high-water marks.
 - **Lazy expiry (correctness):** a read of an expired owner lease returns
   *absent*, and the next lock touch prunes that owner's stale held records.
 - **Active expiry (housekeeping):** the GC sweep task periodically scans the
   `CF_EXPIRY` column family for shadow records whose `expires_at <= now_ms`,
-  verifies the shadowed data record is still expired, and deletes both.
+  verifies the shadowed data record is still expired, and deletes both. Expired
+  owner leases also release their complete portfolio so owner-hold metadata does
+  not accumulate or revive when an owner id is reused.
   Configurable via `group_gc_interval_secs` and `group_gc_batch`. It is
   best-effort and never required for correctness.
 

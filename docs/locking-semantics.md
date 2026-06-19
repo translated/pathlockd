@@ -164,8 +164,9 @@ stale writer:
   (`stale_fencing_token` otherwise). A holder calls this right before mutating the
   backing store so a lock it lost mid-operation cannot corrupt newer state.
 
-The fence key outlives the lock (its TTL is `max(ttl, 1 day)`) so a token that
-briefly outlives its lease is still rejected.
+The fence key is a durable per-path high-water mark. It does not expire when a
+lease expires or is released, so a later caller can never move the path's token
+backward.
 
 ## Leases, renewal, and lock-loss
 

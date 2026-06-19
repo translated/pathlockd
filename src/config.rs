@@ -59,9 +59,7 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// Public gRPC address for clients and peers.
     pub public_addr: String,
-    /// Internal Raft transport address. Also unauthenticated: it accepts
-    /// protocol traffic and forwarded commands from anyone who can reach it,
-    /// so it must only be reachable from cluster peers.
+    /// Internal Raft transport address.
     pub raft_addr: String,
     /// SWIM gossip bind address (UDP).
     pub gossip_addr: String,
@@ -112,9 +110,11 @@ pub struct Config {
     pub group_gc_batch: u32,
     /// Per-subscriber event queue depth.
     pub event_buffer: usize,
-    /// Extra static pathlockd endpoints for cross-instance event fan-out
+    /// Extra static internal Raft endpoints for cross-instance event fan-out
     /// (optional; cluster members are discovered via gossip automatically).
     pub peers: Vec<String>,
+    /// Shared credential attached to every internal Raft transport request.
+    pub internal_auth_token: String,
     /// Server-side deadline for each unary/stream setup RPC.
     pub request_timeout_ms: u64,
     /// Per-HTTP/2-connection request concurrency limit.
@@ -231,6 +231,7 @@ impl Default for Config {
             group_gc_batch: 1024,
             event_buffer: 8192,
             peers: Vec::new(),
+            internal_auth_token: String::new(),
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
             bootstrap: false,
@@ -294,6 +295,7 @@ struct FileConfig {
     group_gc_batch: Option<u32>,
     event_buffer: Option<usize>,
     peers: Option<Vec<String>>,
+    internal_auth_token: Option<String>,
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
     bootstrap: Option<bool>,
@@ -392,6 +394,11 @@ impl Config {
         if self.event_buffer == 0 || self.event_buffer > MAX_EVENT_BUFFER {
             anyhow::bail!("event_buffer must be > 0 and <= {MAX_EVENT_BUFFER}");
         }
+        if self.internal_auth_token.len() < 32 {
+            anyhow::bail!("internal_auth_token must be at least 32 bytes");
+        }
+        tonic::metadata::MetadataValue::try_from(self.internal_auth_token.as_str())
+            .map_err(|e| anyhow::anyhow!("internal_auth_token is not valid header data: {e}"))?;
         if self.replication_factor % 2 == 0 {
             anyhow::bail!("replication_factor must be odd");
         }
@@ -401,8 +408,17 @@ impl Config {
         if self.group_count == u32::MAX {
             anyhow::bail!("group_count must be < u32::MAX (reserved for the system group)");
         }
+        if self.group_count > 65_536 {
+            anyhow::bail!("group_count must be <= 65536");
+        }
+        if self.routing_prefix_segments > 256 {
+            anyhow::bail!("routing_prefix_segments must be <= 256");
+        }
         if self.raft_snapshot_max_bytes == 0 {
             anyhow::bail!("raft_snapshot_max_bytes must be > 0");
+        }
+        if self.raft_snapshot_interval_entries == 0 {
+            anyhow::bail!("raft_snapshot_interval_entries must be > 0");
         }
         if self.raft_max_inflight == 0 {
             anyhow::bail!("raft_max_inflight must be > 0");
@@ -447,6 +463,9 @@ impl Config {
         }
         if self.max_inflight_per_group == 0 {
             anyhow::bail!("max_inflight_per_group must be > 0");
+        }
+        if self.max_concurrent_reconciles == 0 {
+            anyhow::bail!("max_concurrent_reconciles must be > 0");
         }
         if self.group_gc_batch == 0 {
             anyhow::bail!("group_gc_batch must be > 0");
@@ -535,6 +554,17 @@ impl Config {
             gossip_addr: self.gossip_addr.clone(),
         }
     }
+
+    pub fn cluster_config_fingerprint(&self) -> u64 {
+        let value = format!(
+            "v1:{}:{}:{}:{}",
+            self.group_count,
+            self.routing_prefix_segments,
+            self.default_lock_algorithm.as_str(),
+            self.replication_factor,
+        );
+        xxhash_rust::xxh3::xxh3_64(value.as_bytes())
+    }
 }
 
 fn apply_file(cfg: &mut Config, file: FileConfig) {
@@ -569,6 +599,7 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(group_gc_batch);
     apply!(event_buffer);
     apply!(peers);
+    apply!(internal_auth_token);
     apply!(request_timeout_ms);
     apply!(max_concurrent_requests_per_connection);
     apply!(bootstrap);
@@ -676,6 +707,9 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     }
     if let Some(v) = env_list("PATHLOCKD_PEERS") {
         cfg.peers = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_INTERNAL_AUTH_TOKEN") {
+        cfg.internal_auth_token = v;
     }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_REQUEST_TIMEOUT_MS")? {
         cfg.request_timeout_ms = v;
@@ -853,5 +887,31 @@ mod tests {
         assert!(!is_host_port("host:0"));
         assert!(!is_host_port("host:70000"));
         assert!(!is_host_port("host:grpc"));
+    }
+
+    #[test]
+    fn validation_rejects_disabled_reconciliation_and_snapshotting() {
+        let mut cfg = Config {
+            bootstrap: true,
+            internal_auth_token: "test-internal-auth-token-32-bytes".into(),
+            ..Config::default()
+        };
+        cfg.max_concurrent_reconciles = 0;
+        assert!(cfg.validate().is_err());
+        cfg.max_concurrent_reconciles = 1;
+        cfg.raft_snapshot_interval_entries = 0;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn cluster_fingerprint_covers_deterministic_routing_settings() {
+        let cfg = Config::default();
+        let base = cfg.cluster_config_fingerprint();
+        let mut changed = cfg.clone();
+        changed.routing_prefix_segments += 1;
+        assert_ne!(base, changed.cluster_config_fingerprint());
+        changed = cfg.clone();
+        changed.default_lock_algorithm = LockAlgorithm::PointWrite;
+        assert_ne!(base, changed.cluster_config_fingerprint());
     }
 }

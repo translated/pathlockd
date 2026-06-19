@@ -24,11 +24,10 @@ use crate::proto::{
     GetNamespacePolicyResponse, HealthRequest, HealthResponse, IncrFencingTokenRequest,
     IncrFencingTokenResponse, InspectPathRequest, InspectPathResponse, IsBlockingRequest,
     IsBlockingResponse, IsOwnerAliveRequest, IsOwnerAliveResponse, ListOwnerLocksRequest,
-    ListOwnerLocksResponse, LockEntry, OwnedLock, PublishEventRequest, PublishEventResponse,
-    ReasonCode, ReleaseAllRequest, ReleaseLocksRequest, ReleaseResponse, RenewRequest,
-    RenewResponse, RenewStatus, RequestRevokeRequest, RequestRevokeResponse,
-    SetNamespacePolicyRequest, SetNamespacePolicyResponse, SetWaitEdgeRequest, SetWaitEdgeResponse,
-    SubscribeRequest,
+    ListOwnerLocksResponse, LockEntry, OwnedLock, ReasonCode, ReleaseAllRequest,
+    ReleaseLocksRequest, ReleaseResponse, RenewRequest, RenewResponse, RenewStatus,
+    RequestRevokeRequest, RequestRevokeResponse, SetNamespacePolicyRequest,
+    SetNamespacePolicyResponse, SetWaitEdgeRequest, SetWaitEdgeResponse, SubscribeRequest,
 };
 
 fn engine_err(e: anyhow::Error) -> Status {
@@ -79,6 +78,7 @@ const MAX_PATH_SEGMENTS: usize = 256;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
 const MAX_PATHS_PER_STREAMED_ACQUIRE: usize = 65_536;
 const MAX_STREAMED_ACQUIRE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RENEW_DOMAINS: usize = 1024;
 const MAX_CYCLE_DEPTH: u32 = 64;
 const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
 const MAX_DUMP_OWNER_PAGE: u32 = 512;
@@ -149,8 +149,10 @@ fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
         return Err(Status::invalid_argument("path empty or too long"));
     }
-    if path.contains('\0') {
-        return Err(Status::invalid_argument("path must not contain NUL bytes"));
+    if path.contains('\0') || path.contains(engine::SCOPED_PATH_SEP) {
+        return Err(Status::invalid_argument(
+            "path contains a reserved control character",
+        ));
     }
     let colon = path.find(':').ok_or_else(|| {
         Status::invalid_argument(format!(
@@ -204,6 +206,11 @@ fn check_namespace(namespace: &str) -> Result<(), Status> {
     if namespace.is_empty() {
         return Err(Status::invalid_argument("namespace must be non-empty"));
     }
+    if namespace.contains('\0') || namespace.contains(engine::SCOPED_PATH_SEP) {
+        return Err(Status::invalid_argument(
+            "namespace contains a reserved control character",
+        ));
+    }
     if namespace.contains(':') {
         if namespace.len() > MAX_PATH_LEN {
             return Err(Status::invalid_argument(format!(
@@ -245,7 +252,7 @@ fn check_write_fencing_token(fencing_token: i64) -> Result<(), Status> {
 }
 
 #[allow(clippy::result_large_err)]
-fn check_event(ev: &Event) -> Result<(), Status> {
+pub(crate) fn validate_peer_event(ev: &Event) -> Result<(), Status> {
     check_id("event.owner_id", &ev.owner_id)?;
     match proto::EventType::try_from(ev.r#type) {
         Ok(proto::EventType::Killed | proto::EventType::Revoke | proto::EventType::Grant) => Ok(()),
@@ -783,6 +790,14 @@ impl PathLock for PathLockService {
             let req = request.into_inner();
             check_id("owner_id", &req.owner_id)?;
             check_ttl(req.ttl_ms)?;
+            if req.domains.len() > MAX_RENEW_DOMAINS {
+                return Err(Status::invalid_argument(format!(
+                    "too many renew domains (max {MAX_RENEW_DOMAINS})"
+                )));
+            }
+            for domain in &req.domains {
+                check_namespace(domain)?;
+            }
             let idempotency_key = idempotency_key(&req.idempotency_key)?;
             let router = self.router.clone();
             let owner_id = req.owner_id.clone();
@@ -1213,27 +1228,6 @@ impl PathLock for PathLockService {
         .await
     }
 
-    async fn publish_event(
-        &self,
-        request: Request<PublishEventRequest>,
-    ) -> Result<Response<PublishEventResponse>, Status> {
-        crate::otel::observe_rpc(
-            PATH_LOCK_SERVICE,
-            "PublishEvent",
-            request,
-            |request| async move {
-                let ev = request
-                    .into_inner()
-                    .event
-                    .ok_or_else(|| Status::invalid_argument("event is required"))?;
-                check_event(&ev)?;
-                self.broadcaster.publish_from_peer(ev);
-                Ok(Response::new(PublishEventResponse {}))
-            },
-        )
-        .await
-    }
-
     async fn health(
         &self,
         request: Request<HealthRequest>,
@@ -1298,6 +1292,7 @@ mod tests {
         assert!(check_path("h:/a/../b").is_err());
         assert!(check_path("h:/a/./b").is_err());
         assert!(check_path("h:/a\0b").is_err());
+        assert!(check_path("h:/a\x1fb").is_err());
         assert!(check_path(&format!(
             "h:/{}",
             vec!["x"; MAX_PATH_SEGMENTS + 1].join("/")
@@ -1313,6 +1308,8 @@ mod tests {
         assert!(check_namespace("google_drive:/").is_ok());
         assert!(check_namespace("google_drive:/folder/").is_err());
         assert!(check_namespace("google_drive/folder").is_err());
+        assert!(check_namespace("google_drive\0folder").is_err());
+        assert!(check_namespace("google_drive\x1ffolder").is_err());
     }
 
     #[test]

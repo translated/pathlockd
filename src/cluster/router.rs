@@ -30,7 +30,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tracing::debug;
 
@@ -122,6 +122,8 @@ const DOMAIN_CACHE_MAX: usize = 16_384;
 /// administrative and persisted through Raft; keeping this cache off the per
 /// acquire hot path preserves horizontal scaling while still converging quickly.
 const NAMESPACE_CACHE_REFRESH_MS: u64 = 250;
+const NAMESPACE_CACHE_FAILURE_BACKOFF_MS: u64 = 5_000;
+const NAMESPACE_CACHE_REFRESH_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone)]
 pub struct RoutingOptions {
@@ -168,7 +170,9 @@ pub struct Router {
     /// sorted longest-first for longest-prefix routing.
     namespace_roots: RwLock<Vec<String>>,
     namespace_policies: RwLock<HashMap<String, NamespacePolicyEntry>>,
+    namespace_cache_origin: Instant,
     namespace_cache_loaded_ms: AtomicU64,
+    namespace_cache_retry_after_ms: AtomicU64,
     namespace_refresh: tokio::sync::Mutex<()>,
     inflight: HashMap<GroupId, Arc<tokio::sync::Semaphore>>,
     inflight_total: Arc<AtomicUsize>,
@@ -210,7 +214,9 @@ impl Router {
             domain_groups: RwLock::new(HashMap::new()),
             namespace_roots: RwLock::new(Vec::new()),
             namespace_policies: RwLock::new(HashMap::new()),
+            namespace_cache_origin: Instant::now(),
             namespace_cache_loaded_ms: AtomicU64::new(0),
+            namespace_cache_retry_after_ms: AtomicU64::new(0),
             namespace_refresh: tokio::sync::Mutex::new(()),
             inflight,
             inflight_total: Arc::new(AtomicUsize::new(0)),
@@ -295,22 +301,60 @@ impl Router {
         policies.remove(namespace);
     }
 
+    fn namespace_cache_now_ms(&self) -> u64 {
+        u64::try_from(self.namespace_cache_origin.elapsed().as_millis())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
+    }
+
+    fn invalidate_namespace_cache(&self) {
+        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+        self.namespace_cache_retry_after_ms
+            .store(0, Ordering::Relaxed);
+    }
+
     async fn refresh_namespace_cache_if_stale(&self) -> anyhow::Result<()> {
-        let now_ms = crate::store_keys::now_ms();
+        let now_ms = self.namespace_cache_now_ms();
         let loaded = self.namespace_cache_loaded_ms.load(Ordering::Relaxed);
         if loaded != 0 && now_ms.saturating_sub(loaded) < NAMESPACE_CACHE_REFRESH_MS {
             return Ok(());
         }
-        let _refresh = self.namespace_refresh.lock().await;
+        let retry_after = self.namespace_cache_retry_after_ms.load(Ordering::Relaxed);
+        if retry_after != 0 && now_ms < retry_after {
+            return if loaded == 0 {
+                Err(NamespaceResolverUnavailable.into())
+            } else {
+                Ok(())
+            };
+        }
+        let _refresh = if loaded == 0 {
+            self.namespace_refresh.lock().await
+        } else {
+            match self.namespace_refresh.try_lock() {
+                Ok(guard) => guard,
+                Err(_) => return Ok(()),
+            }
+        };
+        let now_ms = self.namespace_cache_now_ms();
         let loaded = self.namespace_cache_loaded_ms.load(Ordering::Relaxed);
         if loaded != 0 && now_ms.saturating_sub(loaded) < NAMESPACE_CACHE_REFRESH_MS {
             return Ok(());
         }
-        match self
-            .read_linearizable(SYS_GROUP, ReadOp::ListNamespaces)
-            .await
+        let retry_after = self.namespace_cache_retry_after_ms.load(Ordering::Relaxed);
+        if retry_after != 0 && now_ms < retry_after {
+            return if loaded == 0 {
+                Err(NamespaceResolverUnavailable.into())
+            } else {
+                Ok(())
+            };
+        }
+        match tokio::time::timeout(
+            NAMESPACE_CACHE_REFRESH_TIMEOUT,
+            self.read_linearizable(SYS_GROUP, ReadOp::ListNamespaces),
+        )
+        .await
         {
-            Ok(ReadResult::NamespaceList(entries)) => {
+            Ok(Ok(ReadResult::NamespaceList(entries))) => {
                 let policies: HashMap<String, NamespacePolicyEntry> = entries
                     .into_iter()
                     .map(|entry| (entry.namespace.clone(), entry))
@@ -329,18 +373,40 @@ impl Router {
                 *policy_cache = policies;
                 self.namespace_cache_loaded_ms
                     .store(now_ms, Ordering::Relaxed);
+                self.namespace_cache_retry_after_ms
+                    .store(0, Ordering::Relaxed);
                 Ok(())
             }
-            Ok(_) => {
+            Ok(Ok(_)) => {
                 debug!("unexpected namespace cache refresh read result");
+                self.namespace_cache_retry_after_ms.store(
+                    now_ms.saturating_add(NAMESPACE_CACHE_FAILURE_BACKOFF_MS),
+                    Ordering::Relaxed,
+                );
                 if loaded == 0 {
                     Err(NamespaceResolverUnavailable.into())
                 } else {
                     Ok(())
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 debug!(error = %e, "namespace cache refresh failed; using cached/fallback routing");
+                self.namespace_cache_retry_after_ms.store(
+                    now_ms.saturating_add(NAMESPACE_CACHE_FAILURE_BACKOFF_MS),
+                    Ordering::Relaxed,
+                );
+                if loaded == 0 {
+                    Err(NamespaceResolverUnavailable.into())
+                } else {
+                    Ok(())
+                }
+            }
+            Err(_) => {
+                debug!("namespace cache refresh timed out; using cached/fallback routing");
+                self.namespace_cache_retry_after_ms.store(
+                    now_ms.saturating_add(NAMESPACE_CACHE_FAILURE_BACKOFF_MS),
+                    Ordering::Relaxed,
+                );
                 if loaded == 0 {
                     Err(NamespaceResolverUnavailable.into())
                 } else {
@@ -737,6 +803,9 @@ impl Router {
         let command = bincode::serde::encode_to_vec(cmd, bincode::config::standard())
             .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
         let mut request = tonic::Request::new(ForwardRequest { group, command });
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| ForwardError::Other(e.to_string()))?;
         request.set_timeout(FORWARD_TIMEOUT);
         // Transport failure means the *target* is unreachable, not that the
         // command failed: like the read path, report `Unreachable` so the
@@ -857,6 +926,9 @@ impl Router {
         let read_op = bincode::serde::encode_to_vec(op, bincode::config::standard())
             .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
         let mut request = tonic::Request::new(ForwardReadRequest { group, read_op });
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| ForwardError::Other(e.to_string()))?;
         request.set_timeout(FORWARD_TIMEOUT);
         let resp = client
             .forward_read(request)
@@ -1041,7 +1113,7 @@ impl Router {
                             )
                         })
                     {
-                        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+                        self.invalidate_namespace_cache();
                         self.refresh_namespace_cache_if_stale().await?;
                         continue;
                     }
@@ -1192,8 +1264,11 @@ impl Router {
         let declared = !domains.is_empty();
         let groups: Vec<GroupId> = if declared {
             let mut set: std::collections::BTreeSet<GroupId> = std::collections::BTreeSet::new();
+            let mut seen = std::collections::HashSet::new();
             for domain in domains {
-                set.insert(self.group_of_domain(domain));
+                if seen.insert(domain) {
+                    set.insert(place_domain(domain, self.routing.group_count));
+                }
             }
             set.into_iter().collect()
         } else {
@@ -1393,7 +1468,7 @@ impl Router {
         algorithm: LockAlgorithm,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
-        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+        self.invalidate_namespace_cache();
         self.refresh_namespace_cache_if_stale().await?;
         let (_, explicit) = self.namespace_policy_record(namespace).await?;
         let route_changes = self.namespace_route_would_change(namespace, explicit);
@@ -1456,7 +1531,7 @@ impl Router {
         namespace: &str,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
-        self.namespace_cache_loaded_ms.store(0, Ordering::Relaxed);
+        self.invalidate_namespace_cache();
         self.refresh_namespace_cache_if_stale().await?;
         let (_, explicit) = self.namespace_policy_record(namespace).await?;
         if explicit {
@@ -1841,7 +1916,7 @@ mod tests {
             raft_config(&cfg),
             cfg.raft_snapshot_max_bytes,
             batcher,
-            crate::raft::network::PeerPool::new(),
+            crate::raft::network::PeerPool::new("test-internal-auth-token"),
             cfg.default_lock_algorithm,
         )
         .unwrap();
@@ -1860,6 +1935,12 @@ mod tests {
             .await
             .expect("test router sys group must elect a leader");
         (router, dir)
+    }
+
+    async fn shutdown_test_router(router: Arc<Router>, dir: tempfile::TempDir) {
+        router.groups.shutdown_all().await;
+        drop(router);
+        drop(dir);
     }
 
     fn wr_req(path: &str) -> LockReq {
@@ -1889,7 +1970,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_idempotency_retries_incr_fence_once() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
 
         let first = router
             .incr_fencing_token_with_idempotency(Some("fence-retry-1"))
@@ -1903,11 +1984,12 @@ mod tests {
 
         assert_eq!(first, retry);
         assert_eq!(next, first + 1);
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn external_idempotency_retries_lock_mutations_once() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
 
         let args = AcquireArgs {
             owner_id: "idem-owner".into(),
@@ -1983,11 +2065,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!router.is_owner_alive("victim").await.unwrap());
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn release_idempotency_is_scoped_per_namespace_on_the_same_group() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
         let mut by_group = HashMap::new();
         let (first, second) = (0..=router.routing.group_count)
             .find_map(|i| {
@@ -2040,13 +2123,14 @@ mod tests {
                 None
             );
         }
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn acquire_echoes_routing_namespace_and_renew_targets_it() {
         // With sub-sharding on (segments = 2), a deep path routes to its
         // first-two-segment prefix namespace, not the whole handler.
-        let (router, _dir) = test_router_with_segments(2).await;
+        let (router, dir) = test_router_with_segments(2).await;
 
         let (outcome, _granted, namespace) = router
             .acquire_with_idempotency(
@@ -2082,11 +2166,12 @@ mod tests {
                 revoke_requested: false
             }
         );
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn raft_round_trips_commands_and_probe() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
 
         router
             .probe_writer(Duration::from_secs(10))
@@ -2113,11 +2198,12 @@ mod tests {
             router.gc_sweep(router.group_of("h:/r"), 128).await.unwrap();
         assert!(scanned <= 128);
         assert!(router.writer_healthy());
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn fallback_namespace_is_first_segment_and_root_requires_explicit_namespace() {
-        let (router, _dir) = test_router_with_segments(1).await;
+        let (router, dir) = test_router_with_segments(1).await;
 
         let err = router
             .acquire(AcquireArgs {
@@ -2166,11 +2252,12 @@ mod tests {
                 .0,
             AcquireOutcome::Queued { reason, .. } if reason == Reason::AncestorLocked
         ));
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn explicit_nested_namespace_controls_routing_policy_and_delete_falls_back() {
-        let (router, _dir) = test_router_with_segments(1).await;
+        let (router, dir) = test_router_with_segments(1).await;
 
         router
             .set_namespace_policy("h:/a/b", LockAlgorithm::PointWrite, None)
@@ -2233,11 +2320,12 @@ mod tests {
                 .0,
             AcquireOutcome::Ok { .. }
         ));
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn namespace_route_changes_require_drained_subtree() {
-        let (router, _dir) = test_router_with_segments(1).await;
+        let (router, dir) = test_router_with_segments(1).await;
 
         assert!(matches!(
             router
@@ -2299,11 +2387,12 @@ mod tests {
             .delete_namespace_policy("h:/delete-me", None)
             .await
             .unwrap();
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn concurrent_writes_serialize_correctly() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
 
         // Many tasks contend for the same write lock; exactly one may win.
         let mut handles = Vec::new();
@@ -2331,11 +2420,12 @@ mod tests {
             }
         }
         assert_eq!(winners, 1, "exactly one owner may hold the write lock");
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn owner_wide_ops_fan_out_across_domains() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
 
         // Same owner locks paths in two different routing namespaces.
         for path in ["alpha:/a", "beta:/b"] {
@@ -2394,11 +2484,12 @@ mod tests {
         assert_eq!(info.write_owner, None);
         let info = router.inspect_path("beta:/b").await.unwrap();
         assert_eq!(info.write_owner, None);
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn dump_pages_across_groups_with_composite_cursor() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
         for (i, domain) in ["alpha", "beta", "gamma", "delta"].iter().enumerate() {
             router
                 .acquire(AcquireArgs {
@@ -2426,17 +2517,19 @@ mod tests {
             }
         }
         assert_eq!(total, 4);
+        shutdown_test_router(router, dir).await;
     }
 
     #[tokio::test]
     async fn fencing_tokens_are_monotonic_through_sys_group() {
-        let (router, _dir) = test_router().await;
+        let (router, dir) = test_router().await;
         let mut last = 0;
         for _ in 0..5 {
             let token = router.incr_fencing_token().await.unwrap();
             assert!(token > last, "tokens must increase");
             last = token;
         }
+        shutdown_test_router(router, dir).await;
     }
 
     // The wait queue is per-group. With the static fallback prefix and no
@@ -2446,7 +2539,7 @@ mod tests {
     // ancestor, and is granted in place when the ancestor releases.
     #[tokio::test]
     async fn queue_shards_with_locks_under_routing_prefix_segments() {
-        let (router, _dir) = test_router_with_segments(1).await;
+        let (router, dir) = test_router_with_segments(1).await;
 
         // With K=1 the shard key is the first segment, so a subtree and all its
         // descendants live in one group.
@@ -2514,5 +2607,6 @@ mod tests {
                 .0,
             AcquireOutcome::Ok { .. }
         ));
+        shutdown_test_router(router, dir).await;
     }
 }

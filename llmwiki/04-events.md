@@ -52,8 +52,9 @@ the *policy* (who leads, grace timing) is the client's.
 With multiple pathlockd replicas, an event is raised on the replica that handled
 the request. If clients are sticky to one replica per owner (recommended — one
 lock keeps one connection), the owner's subscription is on that same replica and
-gets the event directly. Otherwise set `PATHLOCKD_PEERS` so each replica forwards
-events to its peers' internal `PublishEvent` RPC. Forwarding is done by one
+gets the event directly. Otherwise set `PATHLOCKD_PEERS` to internal Raft
+endpoints so each replica forwards events through the Raft-transport
+`PublishEvent` RPC. Forwarding is done by one
 long-lived task per peer draining a bounded queue (with a per-RPC timeout): a
 slow or dead peer can neither pile up tasks nor stall the request path — a full
 queue just drops the event. The client recheck remains the correctness backstop,

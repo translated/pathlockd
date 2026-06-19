@@ -24,6 +24,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
+use axum::extract::{Request, State};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -40,6 +43,7 @@ use self::state::AppState;
 
 const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WEB_CONNECTIONS: usize = 4096;
+const MAX_WEB_REQUESTS: usize = 4096;
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the facade and spawn its listeners. Binding happens before returning so
@@ -58,9 +62,17 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
         retention,
     );
     let state = AppState { svc, log };
+    let request_gate = WebRequestGate {
+        permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_REQUESTS)),
+        timeout: Duration::from_millis(cfg.request_timeout_ms),
+    };
     let app: Router = rest::routes()
         .merge(sse::routes())
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            request_gate,
+            limit_web_request,
+        ))
         .with_state(state);
 
     // --- TCP: HTTP/1.1 + HTTP/2 over TLS ---
@@ -80,6 +92,28 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
         info!(%h3_addr, "web facade listening (HTTP/3)");
     }
     Ok(())
+}
+
+#[derive(Clone)]
+struct WebRequestGate {
+    permits: std::sync::Arc<tokio::sync::Semaphore>,
+    timeout: Duration,
+}
+
+async fn limit_web_request(
+    State(gate): State<WebRequestGate>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let Ok(permit) = gate.permits.try_acquire_owned() else {
+        return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let response = tokio::time::timeout(gate.timeout, next.run(request)).await;
+    drop(permit);
+    match response {
+        Ok(response) => response,
+        Err(_) => axum::http::StatusCode::GATEWAY_TIMEOUT.into_response(),
+    }
 }
 
 async fn serve_tcp(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {

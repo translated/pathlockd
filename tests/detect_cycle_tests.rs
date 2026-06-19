@@ -43,7 +43,7 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
         raft_config(&cfg),
         cfg.raft_snapshot_max_bytes,
         batcher,
-        PeerPool::new(),
+        PeerPool::new("test-internal-auth-token"),
         cfg.default_lock_algorithm,
     )
     .unwrap();

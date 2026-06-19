@@ -409,14 +409,6 @@ message Event {
   string owner_id = 2;
 }
 
-// Internal: instances forward events to configured peers so an event raised on
-// instance A reaches the owner's subscription on instance B.
-message PublishEventRequest {
-  Event event = 1;
-}
-
-message PublishEventResponse {}
-
 // ---------------------------------------------------------------------------
 // Inspection (read-only observability)
 //
@@ -539,7 +531,4 @@ service PathLock {
   rpc DumpLocks(DumpLocksRequest) returns (DumpLocksResponse);
   rpc Subscribe(SubscribeRequest) returns (stream Event);
   rpc Health(HealthRequest) returns (HealthResponse);
-
-  // Internal peer fan-out.
-  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
 }

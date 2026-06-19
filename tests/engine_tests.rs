@@ -2397,11 +2397,8 @@ fn force_release_recovers_owner_beyond_enumeration_limit() {
     );
 }
 
-/// Refreshing a long-TTL record (the fence, re-stamped on every heartbeat
-/// with a one-day TTL) must reuse one quantized expiry-index slot instead of
-/// accreting a fresh index row per refresh.
 #[test]
-fn fence_refreshes_reuse_one_quantized_expiry_slot() {
+fn renewed_lease_keeps_its_fence_and_rejects_later_regression() {
     let (db, _dir) = open_temp_db();
     let now: u64 = 1_000_000;
 
@@ -2410,46 +2407,65 @@ fn fence_refreshes_reuse_one_quantized_expiry_slot() {
         Command {
             request_id: None,
             now_ms: now,
-            op: acquire_op(acquire_args("alice", 30_000, 1, vec![wr("h:/f")])),
+            op: acquire_op(acquire_args("alice", 30_000, 100, vec![wr("h:/f")])),
         },
     );
-    for i in 1..=3u64 {
-        let resp = apply(
+    assert!(matches!(
+        apply(
             &db,
             Command {
                 request_id: None,
-                now_ms: now + i * 1_000,
+                now_ms: now + 20_000,
                 op: Op::Renew {
                     owner: "alice".into(),
-                    ttl_ms: 30_000,
+                    ttl_ms: 2 * 86_400_000,
                 },
             },
-        );
-        assert!(matches!(
-            resp,
-            ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok { .. })
-        ));
-    }
+        ),
+        ApplyResponse::Renew(pathlockd::engine::RenewOutcome::Ok { .. })
+    ));
 
-    // Count expiry-index entries pointing at the fences CF.
-    let expiry = db.cf_handle(store_keys::CF_EXPIRY).unwrap();
-    let mut fence_entries = 0;
-    let mut iter = db.raw_iterator_cf(&expiry);
-    iter.seek_to_first();
-    while iter.valid() {
-        // Strip the 4-byte group prefix before decoding the expiry entry.
-        let key = iter.key().unwrap();
-        if let Some((_exp, cf, _pk)) = store_keys::decode_expiry_entry(&key[4..]) {
-            if cf == store_keys::CF_FENCES {
-                fence_entries += 1;
-            }
-        }
-        iter.next();
-    }
+    let after_one_day = now + 86_400_001;
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, after_one_day);
     assert_eq!(
-        fence_entries, 1,
-        "1 acquire + 3 renews must share one quantized fence expiry slot"
+        pathlockd::engine::assert_fencing_inner(
+            &mut txn,
+            "h",
+            "alice",
+            100,
+            &["h:/f".to_string()],
+        )
+        .unwrap(),
+        pathlockd::engine::AssertOutcome::Ok
     );
+
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: after_one_day + 1,
+            op: Op::Release {
+                namespace: "h".into(),
+                owner: "alice".into(),
+                reqs: vec![rel("h:/f", Mode::Write)],
+                del_wait: false,
+            },
+        },
+    );
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: after_one_day + 2,
+                op: acquire_op(acquire_args("bob", 30_000, 1, vec![wr("h:/f")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Conflict {
+            reason: Reason::StaleFencingToken,
+            ..
+        })
+    ));
 }
 
 #[test]
@@ -3012,6 +3028,166 @@ fn algorithm_change_clears_locks_in_path_scoped_namespace() {
                     policy: LockPolicy::new(LockAlgorithm::RecursiveWrite, 0),
                     args: acquire_args("carol", 60_000, 3, vec![wr("drive:/tenant/deep/file")]),
                 },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+}
+
+#[test]
+fn new_namespace_root_clears_locks_and_waiters_from_the_previous_route() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    let old_namespace = "drive:/tenant";
+    let new_namespace = "drive:/tenant/deep";
+    let path = "drive:/tenant/deep/file";
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: Op::AcquireInNamespace {
+                    namespace: old_namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::RecursiveRw, 0),
+                    args: acquire_args("alice", 60_000, 1, vec![wr(path)]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::AcquireInNamespace {
+                    namespace: old_namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::RecursiveRw, 0),
+                    args: acquire_args("bob", 60_000, 2, vec![wr(path)]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+    ));
+
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 2,
+            op: Op::SetNamespacePolicy {
+                namespace: new_namespace.into(),
+                algorithm: LockAlgorithm::PointWrite,
+            },
+        },
+    ) {
+        ApplyResponse::NamespaceCleared(owners) => {
+            assert_eq!(owners, vec!["alice".to_string(), "bob".to_string()]);
+        }
+        other => panic!("expected NamespaceCleared, got {other:?}"),
+    }
+
+    let mut old_txn = pathlockd::store_rocksdb::RocksDbTxn::new(db.clone(), G, now + 3);
+    let old_info =
+        pathlockd::engine::inspect_path_inner(&mut old_txn, old_namespace, path).unwrap();
+    assert!(old_info.write_owner.is_none());
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 3,
+                op: Op::AcquireInNamespace {
+                    namespace: new_namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::PointWrite, 1),
+                    args: acquire_args("carol", 60_000, 3, vec![wr(path)]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+}
+
+#[test]
+fn new_parent_namespace_preserves_existing_nested_namespace_locks() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    let parent = "drive:/tenant";
+    let child = "drive:/tenant/deep";
+    let path = "drive:/tenant/deep/file";
+
+    set_policy(&db, now, child, LockAlgorithm::PointWrite);
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::AcquireInNamespace {
+                    namespace: child.into(),
+                    policy: LockPolicy::new(LockAlgorithm::PointWrite, 1),
+                    args: acquire_args("alice", 60_000, 1, vec![wr(path)]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::SetNamespacePolicy {
+                    namespace: parent.into(),
+                    algorithm: LockAlgorithm::RecursiveWrite,
+                },
+            },
+        ),
+        ApplyResponse::Unit
+    ));
+
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db, G, now + 3);
+    let info = pathlockd::engine::inspect_path_inner(&mut txn, child, path).unwrap();
+    assert_eq!(info.write_owner.as_deref(), Some("alice"));
+}
+
+#[test]
+fn expired_owner_id_reuse_does_not_resurrect_old_locks() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: acquire_op(acquire_args("alice", 1, 10, vec![wr("h:/old")])),
+        },
+    );
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: acquire_op(acquire_args("alice", 60_000, 11, vec![wr("h:/new")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 3,
+                op: acquire_op(acquire_args("bob", 60_000, 12, vec![wr("h:/old")])),
             },
         ),
         ApplyResponse::Acquire(AcquireOutcome::Ok { .. })

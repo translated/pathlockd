@@ -28,7 +28,8 @@ Resolution order, lowest to highest precedence:
 | GC interval | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 = off) |
 | GC batch | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
 | Event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | Per-subscriber event queue depth |
-| Peers | `peers` | `PATHLOCKD_PEERS` | `[]` | Static peer list for event fan-out |
+| Peers | `peers` | `PATHLOCKD_PEERS` | `[]` | Static internal Raft endpoint list for event fan-out |
+| Internal auth token | `internal_auth_token` | `PATHLOCKD_INTERNAL_AUTH_TOKEN` | required | Shared cluster credential (at least 32 bytes) for every internal Raft RPC |
 | Peer discovery DNS | `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | Headless Service DNS for dynamic peer discovery |
 | Self IP | `self_ip` | `PATHLOCKD_SELF_IP` | none | Exclude own IP from discovered peers |
 | Peer refresh | `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | How often to re-resolve peer_discovery_dns |
