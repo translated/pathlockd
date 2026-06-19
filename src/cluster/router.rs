@@ -888,14 +888,20 @@ impl Router {
         &self,
         args: AcquireArgs,
     ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
-        self.acquire_with_idempotency(args, None).await
+        let (outcome, granted, _namespace) = self.acquire_with_idempotency(args, None).await?;
+        Ok((outcome, granted))
     }
 
+    /// Returns `(outcome, granted, namespace)`. `namespace` is the single routing
+    /// namespace this acquire resolved to (one acquire never spans namespaces);
+    /// the service echoes it on an OK so the client can target Renew.domains at
+    /// exactly the groups the owner holds. `None` only when the request had no
+    /// paths at all.
     pub async fn acquire_with_idempotency(
         &self,
         args: AcquireArgs,
         idempotency_key: Option<&str>,
-    ) -> anyhow::Result<(AcquireOutcome, Vec<String>)> {
+    ) -> anyhow::Result<(AcquireOutcome, Vec<String>, Option<String>)> {
         for attempt in 0..2 {
             self.refresh_namespace_cache_if_stale().await?;
             let mut routes: HashMap<String, NamespaceRoute> = HashMap::new();
@@ -915,8 +921,11 @@ impl Router {
                 return Err(MultiDomainUnsupported.into());
             }
             let Some(route) = routes.into_values().next() else {
-                return Ok((AcquireOutcome::Ok { fencing_token: 0 }, Vec::new()));
+                return Ok((AcquireOutcome::Ok { fencing_token: 0 }, Vec::new(), None));
             };
+            // Echoed to the client on OK; same string the lock is placed under,
+            // so the client's Renew.domains map to the identical group.
+            let namespace = route.namespace.clone();
             let group = self.group_of_domain(&route.namespace);
             let response = self
                 .apply_to(
@@ -932,9 +941,9 @@ impl Router {
                 )
                 .await;
             match response {
-                Ok(ApplyResponse::Acquire(outcome)) => return Ok((outcome, Vec::new())),
+                Ok(ApplyResponse::Acquire(outcome)) => return Ok((outcome, Vec::new(), Some(namespace))),
                 Ok(ApplyResponse::AcquireGranted { outcome, granted }) => {
-                    return Ok((outcome, granted));
+                    return Ok((outcome, granted, Some(namespace)));
                 }
                 Ok(_) => anyhow::bail!("unexpected response type"),
                 Err(e) => {
@@ -1853,6 +1862,43 @@ mod tests {
             .await
             .unwrap();
         assert!(!router.is_owner_alive("victim").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn acquire_echoes_routing_namespace_and_renew_targets_it() {
+        // With sub-sharding on (segments = 2), a deep path routes to its
+        // first-two-segment prefix namespace, not the whole handler.
+        let (router, _dir) = test_router_with_segments(2).await;
+
+        let (outcome, _granted, namespace) = router
+            .acquire_with_idempotency(
+                AcquireArgs {
+                    owner_id: "ns-owner".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req("h:/a/b/c")],
+                    fencing_token: 0,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(outcome, AcquireOutcome::Ok { .. }));
+        // The echoed namespace is exactly the routing namespace the lock is
+        // placed under — the client records it verbatim.
+        let namespace = namespace.expect("an OK acquire echoes its routing namespace");
+        assert_eq!(namespace, "h:/a/b");
+
+        // End-to-end guarantee: replaying that namespace as a Renew domain maps
+        // to the lock's own group, so the targeted renew succeeds. (A wrong
+        // domain would hit a group where the owner holds nothing and report a
+        // wholesale Lost.)
+        assert_eq!(
+            router.renew("ns-owner", 30_000, &[namespace]).await.unwrap(),
+            RenewOutcome::Ok
+        );
     }
 
     #[tokio::test]

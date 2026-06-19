@@ -444,7 +444,7 @@ impl PathLockService {
         };
 
         let router = self.router.clone();
-        let (outcome, granted) = router
+        let (outcome, granted, namespace) = router
             .acquire_with_idempotency(args, idempotency_key.as_deref())
             .await
             .map_err(engine_err)?;
@@ -456,6 +456,8 @@ impl PathLockService {
             AcquireOutcome::Ok { fencing_token } => AcquireResponse {
                 status: AcquireStatus::Ok as i32,
                 fencing_token,
+                // The routing namespace the client records for targeted renew.
+                namespace: namespace.unwrap_or_default(),
                 ..Default::default()
             },
             AcquireOutcome::Conflict {

@@ -179,6 +179,14 @@ message AcquireResponse {
   int64 fencing_token = 5;
   // STALE_FENCING_TOKEN: persisted current token for the path.
   int64 current_fencing_token = 6;
+  // OK: the routing namespace this acquire resolved to. Every path in a single
+  // acquire shares one routing namespace (the daemon rejects acquires that span
+  // namespaces), so this one value covers them all. Record it per held path and
+  // replay the distinct set as Renew.domains: renew then targets exactly the
+  // groups where the owner holds locks, with no client-side routing logic and
+  // explicit namespaces honored — the daemon resolved it, so it can never
+  // mis-map. Empty for non-OK responses.
+  string namespace = 7;
 }
 
 // ---------------------------------------------------------------------------
