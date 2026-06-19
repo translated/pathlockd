@@ -145,6 +145,12 @@ impl RaftTransport for RaftTransportService {
         &self,
         request: Request<Streaming<SnapshotChunk>>,
     ) -> Result<Response<RaftFrame>, Status> {
+        static SNAPSHOT_INSTALL_LIMIT: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(1);
+        let _permit = SNAPSHOT_INSTALL_LIMIT
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("snapshot installer closed"))?;
         let mut stream = request.into_inner();
 
         let mut assembler = SnapshotAssembler::new(
@@ -385,9 +391,11 @@ pub fn execute_read_blocking(
     // Clamp the read clock to the group's persisted monotone apply clock so
     // a node with a lagging wall clock cannot judge TTL liveness more
     // generously at read time than the apply path would.
-    let now_ms =
-        crate::store_keys::now_ms().max(crate::raft::state_machine::read_last_now(db, group)?);
-    let mut txn = crate::store_rocksdb::RocksDbTxn::new(db.clone(), group, now_ms);
+    let snapshot = db.snapshot();
+    let now_ms = crate::store_keys::now_ms().max(
+        crate::raft::state_machine::read_last_now_snapshot(db, &snapshot, group)?,
+    );
+    let mut txn = crate::store_rocksdb::SnapshotTxn::new(db, &snapshot, group, now_ms);
     match op {
         ReadOp::AssertFencing {
             namespace,

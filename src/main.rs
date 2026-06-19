@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         return health_probe(&cfg.listen).await;
     }
 
-    let telemetry = otel::init(&cfg.log_level)?;
+    let telemetry = otel::init(&cfg.log_level, cfg.log_file.as_deref())?;
     let node_id = cfg.numeric_node_id()?;
     let node_meta = cfg.node_meta();
 
@@ -76,8 +76,12 @@ async fn main() -> anyhow::Result<()> {
             max_background_jobs: cfg.rocksdb_max_background_jobs,
             block_cache_mb: cfg.rocksdb_block_cache_mb,
             write_buffer_mb: cfg.rocksdb_write_buffer_mb,
+            write_buffer_manager_mb: cfg.rocksdb_write_buffer_manager_mb,
+            max_write_buffers: cfg.rocksdb_max_write_buffers,
+            enable_pipelined_write: cfg.rocksdb_enable_pipelined_write,
         },
     )?;
+    otel::register_rocksdb_metrics(db.clone());
 
     // The node-wide WAL fsync batcher (group commit across all raft groups).
     let batcher = FsyncBatcher::start(db.clone(), cfg.rocksdb_wal_sync);
@@ -105,13 +109,16 @@ async fn main() -> anyhow::Result<()> {
     let raft_listen = raft_listen_addr(&cfg.raft_addr)?;
     {
         let transport = RaftTransportService::new(groups.clone(), cfg.group_count);
+        let listener = tokio::net::TcpListener::bind(raft_listen)
+            .await
+            .map_err(|e| anyhow::anyhow!("binding raft transport {raft_listen}: {e}"))?;
         tokio::spawn(async move {
             let server = Server::builder()
                 .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
                 .tcp_keepalive(Some(TCP_KEEPALIVE))
                 .add_service(RaftTransportServer::new(transport))
-                .serve(raft_listen)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
             if let Err(e) = server {
                 error!(error = %e, "raft transport server exited");
@@ -220,6 +227,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.group_gc_interval_secs > 0 {
         spawn_group_gc(
             router.clone(),
+            broadcaster.clone(),
             cfg.group_gc_interval_secs,
             cfg.group_gc_batch,
         );
@@ -373,19 +381,23 @@ fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembe
 /// spent, so GC throughput adapts to the write rate.
 const GC_PASS_BUDGET: Duration = Duration::from_millis(250);
 
-fn spawn_group_gc(router: Arc<Router>, interval_secs: u64, batch: u32) {
+fn spawn_group_gc(router: Arc<Router>, broadcaster: Broadcaster, interval_secs: u64, batch: u32) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
-            run_background_step("group gc", group_gc_pass(router.clone(), batch)).await;
+            run_background_step(
+                "group gc",
+                group_gc_pass(router.clone(), broadcaster.clone(), batch),
+            )
+            .await;
         }
     });
 }
 
-async fn group_gc_pass(router: Arc<Router>, batch: u32) {
+async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32) {
     let started = Instant::now();
     let mut total_scanned = 0u64;
     let mut total_reclaimed = 0u64;
@@ -394,7 +406,10 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
     'groups: for group in router.led_groups() {
         loop {
             match router.gc_sweep(group, batch).await {
-                Ok((scanned, reclaimed)) => {
+                Ok((scanned, reclaimed, granted)) => {
+                    for owner in granted {
+                        broadcaster.grant(&owner);
+                    }
                     total_scanned += u64::from(scanned);
                     total_reclaimed += reclaimed;
                     if scanned < batch {
@@ -420,17 +435,18 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
 
 fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, groups: Arc<RaftGroups>, interval_secs: u64) {
     tokio::spawn(async move {
+        let mut compacted = std::collections::HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
             let hosted = groups.hosted();
-            run_background_step(
-                "expiry maintenance",
-                expiry_maintenance_pass(db.clone(), hosted),
-            )
-            .await;
+            let result = expiry_maintenance_pass(db.clone(), hosted, compacted.clone()).await;
+            match result {
+                Ok(next) => compacted = next,
+                Err(e) => error!(error = %e, "expiry index maintenance failed"),
+            }
         }
     });
 }
@@ -438,19 +454,23 @@ fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, groups: Arc<RaftGroups>, inter
 async fn expiry_maintenance_pass(
     db: Arc<rocksdb::DB>,
     groups: Vec<pathlockd::cluster::placement::GroupId>,
-) {
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    mut compacted: std::collections::HashMap<pathlockd::cluster::placement::GroupId, Vec<u8>>,
+) -> anyhow::Result<std::collections::HashMap<pathlockd::cluster::placement::GroupId, Vec<u8>>> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         for group in groups {
+            let Some(cursor) = pathlockd::store_rocksdb::expiry_gc_cursor(&db, group)? else {
+                continue;
+            };
+            if compacted.get(&group) == Some(&cursor) {
+                continue;
+            }
             pathlockd::store_rocksdb::compact_swept_expiry(&db, group)?;
+            compacted.insert(group, cursor);
         }
-        Ok(())
+        Ok(compacted)
     })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!(error = %e, "expiry index maintenance failed"),
-        Err(e) => error!(error = %e, "expiry index maintenance task failed"),
-    }
+    .await
+    .map_err(|e| anyhow::anyhow!("expiry index maintenance task failed: {e}"))?
 }
 
 // --- Health probe ---

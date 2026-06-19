@@ -31,6 +31,9 @@
 //! rocksdb_max_background_jobs = 4
 //! rocksdb_block_cache_mb = 128
 //! rocksdb_write_buffer_mb = 16
+//! rocksdb_write_buffer_manager_mb = 256
+//! rocksdb_max_write_buffers = 3
+//! rocksdb_enable_pipelined_write = true
 //! log_level        = "info"
 //! ```
 
@@ -165,8 +168,18 @@ pub struct Config {
     pub rocksdb_block_cache_mb: u64,
     /// Per-column-family memtable size (MiB).
     pub rocksdb_write_buffer_mb: u64,
+    /// Node-wide soft cap for memory held by RocksDB memtables (MiB).
+    pub rocksdb_write_buffer_manager_mb: u64,
+    /// Maximum mutable and immutable memtables retained per column family.
+    pub rocksdb_max_write_buffers: i32,
+    /// Overlap WAL and memtable writes across concurrent Raft groups.
+    pub rocksdb_enable_pipelined_write: bool,
     /// tracing-subscriber log filter.
     pub log_level: String,
+    /// Optional file path for persistent logs. When set, log output is
+    /// duplicated to this file (append mode) in addition to stdout. Empty
+    /// means stdout-only (the default, suitable for containers/journald).
+    pub log_file: Option<PathBuf>,
 
     // --- Web facade (HTTP/1.1 + HTTP/2 over TLS, and HTTP/3) ---
     /// TCP listen address for the HTTPS (HTTP/1.1 + HTTP/2) facade. Empty
@@ -240,7 +253,11 @@ impl Default for Config {
             rocksdb_max_background_jobs: 4,
             rocksdb_block_cache_mb: 128,
             rocksdb_write_buffer_mb: 16,
+            rocksdb_write_buffer_manager_mb: 256,
+            rocksdb_max_write_buffers: 3,
+            rocksdb_enable_pipelined_write: true,
             log_level: "info".to_string(),
+            log_file: None,
             web_listen: String::new(),
             h3_listen: String::new(),
             tls_cert_path: None,
@@ -299,7 +316,11 @@ struct FileConfig {
     rocksdb_max_background_jobs: Option<i32>,
     rocksdb_block_cache_mb: Option<u64>,
     rocksdb_write_buffer_mb: Option<u64>,
+    rocksdb_write_buffer_manager_mb: Option<u64>,
+    rocksdb_max_write_buffers: Option<i32>,
+    rocksdb_enable_pipelined_write: Option<bool>,
     log_level: Option<String>,
+    log_file: Option<PathBuf>,
     web_listen: Option<String>,
     h3_listen: Option<String>,
     tls_cert_path: Option<PathBuf>,
@@ -439,6 +460,12 @@ impl Config {
         if self.rocksdb_write_buffer_mb == 0 {
             anyhow::bail!("rocksdb_write_buffer_mb must be > 0");
         }
+        if self.rocksdb_write_buffer_manager_mb == 0 {
+            anyhow::bail!("rocksdb_write_buffer_manager_mb must be > 0");
+        }
+        if self.rocksdb_max_write_buffers < 2 {
+            anyhow::bail!("rocksdb_max_write_buffers must be >= 2");
+        }
         if self.web_enabled() {
             self.web_listen.parse::<SocketAddr>().map_err(|e| {
                 anyhow::anyhow!("invalid web_listen address {}: {e}", self.web_listen)
@@ -564,7 +591,13 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(rocksdb_max_background_jobs);
     apply!(rocksdb_block_cache_mb);
     apply!(rocksdb_write_buffer_mb);
+    apply!(rocksdb_write_buffer_manager_mb);
+    apply!(rocksdb_max_write_buffers);
+    apply!(rocksdb_enable_pipelined_write);
     apply!(log_level);
+    if let Some(v) = file.log_file {
+        cfg.log_file = Some(v);
+    }
     apply!(web_listen);
     apply!(h3_listen);
     if let Some(v) = file.tls_cert_path {
@@ -701,8 +734,20 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB")? {
         cfg.rocksdb_write_buffer_mb = v;
     }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_ROCKSDB_WRITE_BUFFER_MANAGER_MB")? {
+        cfg.rocksdb_write_buffer_manager_mb = v;
+    }
+    if let Some(v) = env_parse::<i32>("PATHLOCKD_ROCKSDB_MAX_WRITE_BUFFERS")? {
+        cfg.rocksdb_max_write_buffers = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_ROCKSDB_ENABLE_PIPELINED_WRITE")? {
+        cfg.rocksdb_enable_pipelined_write = v;
+    }
     if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
         cfg.log_level = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_LOG_FILE") {
+        cfg.log_file = Some(PathBuf::from(v));
     }
     if let Some(v) = env_string("PATHLOCKD_WEB_LISTEN") {
         cfg.web_listen = v;

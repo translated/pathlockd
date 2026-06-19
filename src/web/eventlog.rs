@@ -41,16 +41,32 @@ pub struct EventLog {
     capacity: usize,
     retention: Duration,
     owners: Mutex<HashMap<String, Arc<OwnerLog>>>,
+    last_evict: Mutex<Instant>,
 }
 
 impl EventLog {
     pub fn new(broadcaster: Broadcaster, capacity: usize, retention: Duration) -> Arc<Self> {
-        Arc::new(Self {
+        let log = Arc::new(Self {
             broadcaster,
             capacity: capacity.max(1),
             retention,
             owners: Mutex::new(HashMap::new()),
-        })
+            last_evict: Mutex::new(Instant::now()),
+        });
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&log);
+            handle.spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tick.tick().await;
+                    let Some(log) = weak.upgrade() else {
+                        return;
+                    };
+                    log.evict_expired();
+                }
+            });
+        }
+        log
     }
 
     fn owners(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<OwnerLog>>> {
@@ -74,6 +90,12 @@ impl EventLog {
     /// Drop owner logs whose last client detached longer ago than the retention
     /// window. Cheap and lazy: runs on every attach.
     fn evict_expired(&self) {
+        let mut last = self.last_evict.lock().unwrap_or_else(|p| p.into_inner());
+        if last.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
         let mut owners = self.owners();
         owners.retain(|_, log| {
             if log.refs.load(Ordering::Acquire) > 0 {

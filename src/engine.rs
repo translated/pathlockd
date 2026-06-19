@@ -429,7 +429,7 @@ pub enum State {
     Held,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LockReq {
     pub path: String,
     pub mode: Mode,
@@ -438,13 +438,13 @@ pub struct LockReq {
     pub permits: u32,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RelReq {
     pub path: String,
     pub mode: Mode,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AcquireArgs {
     pub owner_id: String,
     pub ttl_ms: u64,
@@ -1229,15 +1229,24 @@ fn validate_new<T: StoreTxn>(
         }
         return Ok(None);
     }
-    if let Some(wr_owner) = get_live_write_owner(tx, &key_path)? {
-        if wr_owner != owner {
+    let same_owner_write = match get_live_write_owner(tx, &key_path)? {
+        Some(wr_owner) if wr_owner != owner => {
             return Ok(Some(conflict(path, &wr_owner, Reason::WriteLocked)));
         }
-    }
+        Some(_) => true,
+        None => false,
+    };
     if req.mode == Mode::Write {
-        if let Some(outcome) =
-            validate_new_write(tx, owner, token, path, namespace, &key_path, algorithm)?
-        {
+        if let Some(outcome) = validate_new_write(
+            tx,
+            owner,
+            token,
+            path,
+            namespace,
+            &key_path,
+            algorithm,
+            same_owner_write,
+        )? {
             return Ok(Some(outcome));
         }
     }
@@ -1265,6 +1274,7 @@ fn validate_new_ancestors<T: StoreTxn>(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_new_write<T: StoreTxn>(
     tx: &mut T,
     owner: &str,
@@ -1273,6 +1283,7 @@ fn validate_new_write<T: StoreTxn>(
     namespace: &str,
     key_path: &str,
     algorithm: LockAlgorithm,
+    same_owner_write: bool,
 ) -> anyhow::Result<Option<AcquireOutcome>> {
     let rd_owners = prune_dead_read_owners(tx, key_path)?;
     if rd_owners.is_empty() {
@@ -1304,7 +1315,7 @@ fn validate_new_write<T: StoreTxn>(
         }
     }
     if let Some(cur) = parse_fence(tx.get_str(FENCE_CF, &fence_key(key_path))?) {
-        if cur > token {
+        if cur > token || (cur == token && !same_owner_write) {
             return Ok(Some(conflict(
                 path,
                 &cur.to_string(),
@@ -1699,6 +1710,12 @@ pub fn assert_fencing_inner<T: StoreTxn>(
     fencing_token: i64,
     paths: &[String],
 ) -> anyhow::Result<AssertOutcome> {
+    if !paths.is_empty() && !owner_alive(tx, owner)? {
+        return Ok(AssertOutcome::Fail {
+            path: paths[0].clone(),
+            reason: Reason::StaleOwner,
+        });
+    }
     let token_str = fencing_token.to_string();
     for path in paths {
         let key_path = scoped_path(namespace, path);
@@ -1947,6 +1964,9 @@ pub fn list_owner_locks_inner<T: StoreTxn>(
     owner: &str,
 ) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
     let alive = tx.get_str(ALIVE_CF, &alive_key(owner))?.is_some();
+    if !alive {
+        return Ok((false, Vec::new()));
+    }
     let own_pfx = own_prefix(owner);
     let members = tx.smembers_limited(OWN_CF, &own_pfx, MAX_SET_ENUM_MEMBERS)?;
 

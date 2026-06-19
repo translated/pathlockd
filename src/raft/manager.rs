@@ -143,6 +143,7 @@ impl RaftGroups {
             group,
             self.batcher.clone(),
             self.default_algorithm,
+            self.snapshot_max_bytes,
         );
         let network = RaftClientFactory::new(group, self.pool.clone(), self.snapshot_max_bytes);
         let raft = Raft::new(

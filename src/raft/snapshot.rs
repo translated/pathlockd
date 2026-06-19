@@ -136,6 +136,15 @@ pub fn build_group_image_from_snapshot(
     snapshot: &rocksdb::Snapshot<'_>,
     group: GroupId,
 ) -> anyhow::Result<Vec<u8>> {
+    build_group_image_from_snapshot_limited(db, snapshot, group, usize::MAX)
+}
+
+pub fn build_group_image_from_snapshot_limited(
+    db: &Arc<DB>,
+    snapshot: &rocksdb::Snapshot<'_>,
+    group: GroupId,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
     let mut image = Vec::from(IMAGE_MAGIC);
     for (idx, cf_name) in store_keys::STATE_CFS.iter().enumerate() {
         scan_group_cf_snapshot(db, snapshot, cf_name, group, |key, value| {
@@ -147,6 +156,10 @@ pub fn build_group_image_from_snapshot(
                     value: value.to_vec(),
                 },
             )?;
+            anyhow::ensure!(
+                image.len() <= max_bytes,
+                "snapshot image exceeds {max_bytes} bytes"
+            );
             Ok(())
         })?;
     }
@@ -162,6 +175,10 @@ pub fn build_group_image_from_snapshot(
                 value: value.to_vec(),
             },
         )?;
+        anyhow::ensure!(
+            image.len() <= max_bytes,
+            "snapshot image exceeds {max_bytes} bytes"
+        );
         Ok(())
     })?;
     Ok(image)

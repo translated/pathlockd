@@ -19,12 +19,12 @@ pub const SYS_GROUP: GroupId = u32::MAX;
 pub fn place_domain(domain: &str, group_count: u32) -> GroupId {
     let mut best_group: GroupId = 0;
     let mut best_weight = 0u64;
+    let mut buf = Vec::with_capacity(8 + domain.len());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(domain.as_bytes());
 
     for g in 0..group_count {
-        let seed = (g as u64).to_le_bytes();
-        let mut buf = Vec::with_capacity(seed.len() + domain.len());
-        buf.extend_from_slice(&seed);
-        buf.extend_from_slice(domain.as_bytes());
+        buf[..8].copy_from_slice(&(g as u64).to_le_bytes());
         let weight = xxh3_64(&buf);
         if weight > best_weight {
             best_weight = weight;

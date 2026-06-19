@@ -23,6 +23,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -36,6 +37,10 @@ use crate::service::PathLockService;
 
 use self::eventlog::EventLog;
 use self::state::AppState;
+
+const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_WEB_CONNECTIONS: usize = 4096;
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Build the facade and spawn its listeners. Binding happens before returning so
 /// address/cert errors surface at startup; the accept loops then run detached
@@ -53,7 +58,10 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
         retention,
     );
     let state = AppState { svc, log };
-    let app: Router = rest::routes().merge(sse::routes()).with_state(state);
+    let app: Router = rest::routes()
+        .merge(sse::routes())
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .with_state(state);
 
     // --- TCP: HTTP/1.1 + HTTP/2 over TLS ---
     let tcp_addr: SocketAddr = cfg.web_listen.parse()?;
@@ -75,6 +83,7 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
 }
 
 async fn serve_tcp(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -85,14 +94,24 @@ async fn serve_tcp(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
         };
         let acceptor = acceptor.clone();
         let app = app.clone();
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
         tokio::spawn(async move {
-            let tls = match acceptor.accept(stream).await {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(error = %e, "web TLS handshake failed");
-                    return;
-                }
-            };
+            let _permit = permit;
+            let tls =
+                match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "web TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!("web TLS handshake timed out");
+                        return;
+                    }
+                };
             let io = TokioIo::new(tls);
             let service = TowerToHyperService::new(app);
             if let Err(e) = ConnBuilder::new(TokioExecutor::new())

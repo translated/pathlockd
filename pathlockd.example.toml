@@ -80,6 +80,9 @@ rocksdb_max_total_wal_size_mb = 512    # cap total WAL size (cold CFs get flushe
 rocksdb_max_background_jobs = 4        # flush/compaction parallelism
 rocksdb_block_cache_mb = 128           # shared block cache
 rocksdb_write_buffer_mb = 16           # per-column-family memtable size
+rocksdb_write_buffer_manager_mb = 256  # node-wide soft cap across all memtables
+rocksdb_max_write_buffers = 3           # mutable + immutable memtables per CF
+rocksdb_enable_pipelined_write = true   # overlap WAL and memtable insertion
 
 # In-flight write budget per Raft group; excess writes are rejected with
 # UNAVAILABLE (fail-fast backpressure instead of unbounded queueing).
@@ -107,6 +110,12 @@ max_concurrent_requests_per_connection = 256
 
 # tracing log filter.
 log_level = "info"
+
+# Optional: duplicate log output to a file (append mode) in addition to stdout.
+# Leave unset for stdout-only (containers/journald). The file is opened append-only
+# and created if missing; the daemon does not rotate it — use logrotate(8) or a
+# container log driver for rotation.
+# log_file = "/var/log/pathlockd/pathlockd.log"
 
 # --- Web facade (optional): the same RPCs as JSON over HTTPS (HTTP/1.1 +
 # HTTP/2) and HTTP/3, plus event streaming via SSE and a long-poll fallback.

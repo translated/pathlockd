@@ -38,10 +38,19 @@ Resolution order, lowest to highest precedence:
 | Join | `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
 | Raft snapshot interval | `raft_snapshot_interval_entries` | `PATHLOCKD_RAFT_SNAPSHOT_INTERVAL_ENTRIES` | `10000` | Entries between snapshots |
 | Raft snapshot min log | `raft_snapshot_min_log_entries` | `PATHLOCKD_RAFT_SNAPSHOT_MIN_LOG_ENTRIES` | `5000` | Min entries to trigger snapshot |
+| Raft snapshot max bytes | `raft_snapshot_max_bytes` | `PATHLOCKD_RAFT_SNAPSHOT_MAX_BYTES` | `536870912` | Maximum in-memory snapshot image |
 | Raft max inflight | `raft_max_inflight` | `PATHLOCKD_RAFT_MAX_INFLIGHT` | `256` | Max in-flight proposals |
 | RocksDB WAL sync | `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL on every write |
 | RocksDB max open files | `rocksdb_max_open_files` | `PATHLOCKD_ROCKSDB_MAX_OPEN_FILES` | `4096` | File descriptor limit |
+| RocksDB total WAL | `rocksdb_max_total_wal_size_mb` | `PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB` | `512` | Total WAL cap before cold-CF flushes |
+| RocksDB background jobs | `rocksdb_max_background_jobs` | `PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS` | `4` | Flush and compaction worker budget |
+| RocksDB block cache | `rocksdb_block_cache_mb` | `PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB` | `128` | Shared cache across column families |
+| RocksDB write buffer | `rocksdb_write_buffer_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB` | `16` | Memtable size per column family |
+| RocksDB memtable cap | `rocksdb_write_buffer_manager_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MANAGER_MB` | `256` | Node-wide soft cap across memtables |
+| RocksDB write buffers | `rocksdb_max_write_buffers` | `PATHLOCKD_ROCKSDB_MAX_WRITE_BUFFERS` | `3` | Mutable and immutable memtables per CF |
+| RocksDB pipelined writes | `rocksdb_enable_pipelined_write` | `PATHLOCKD_ROCKSDB_ENABLE_PIPELINED_WRITE` | `true` | Pipeline WAL and memtable write stages |
 | Log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
+| Log file | `log_file` | `PATHLOCKD_LOG_FILE` | none | Duplicate logs to an append-only file |
 
 Env lists are comma-separated. `RUST_LOG`, if set, overrides `log_level`
 (standard `tracing-subscriber` env filter).
@@ -68,3 +77,8 @@ export stays off and normal tracing logs still initialize.
 - **WAL fsync** (`rocksdb_wal_sync = true` by default) ensures every committed
   apply is durable before the RPC returns. Disable only for throughput testing
   where occasional node loss is acceptable.
+- **Memtable budgeting** is node-wide. Keep `rocksdb_write_buffer_manager_mb`
+  below the container memory limit after reserving the shared block cache,
+  Raft snapshots, event buffers, and process overhead.
+- **Pipelined writes** overlap WAL and memtable work without weakening WAL sync.
+  Disable them only when diagnosing a RocksDB-specific write-ordering issue.

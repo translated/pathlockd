@@ -20,6 +20,9 @@ use tracing::{debug, warn};
 
 use super::rest;
 
+const MAX_REQUEST_BODY_BYTES: usize = 4 * 1024 * 1024;
+const MAX_REQUESTS_PER_CONNECTION: usize = 256;
+
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
 /// Bind the QUIC endpoint (surfacing bind errors synchronously) and spawn the
@@ -75,6 +78,7 @@ async fn handle_connection(
 
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
         h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+    let requests = Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_PER_CONNECTION));
 
     loop {
         match h3_conn.accept().await {
@@ -88,7 +92,9 @@ async fn handle_connection(
                 };
                 let app = app.clone();
                 let flag = handshake_done.clone();
+                let permit = requests.clone().acquire_owned().await?;
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_request(req, stream, app, flag).await {
                         debug!(error = %e, "h3 request failed");
                     }
@@ -130,6 +136,14 @@ async fn handle_request(
     while let Some(mut chunk) = stream.recv_data().await? {
         while chunk.has_remaining() {
             let slice = chunk.chunk();
+            if body.len().saturating_add(slice.len()) > MAX_REQUEST_BODY_BYTES {
+                let resp = http::Response::builder()
+                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                    .body(())?;
+                stream.send_response(resp).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
             body.extend_from_slice(slice);
             let n = slice.len();
             chunk.advance(n);

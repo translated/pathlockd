@@ -91,6 +91,23 @@ pub(crate) fn read_last_now(db: &DB, group: GroupId) -> anyhow::Result<u64> {
     })
 }
 
+pub(crate) fn read_last_now_snapshot(
+    db: &DB,
+    snapshot: &rocksdb::Snapshot<'_>,
+    group: GroupId,
+) -> anyhow::Result<u64> {
+    let meta = db
+        .cf_handle(store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    let key = store_keys::group_key(group, store_keys::META_LAST_NOW_KEY);
+    Ok(match snapshot.get_cf(&meta, &key)? {
+        Some(v) if v.len() == 8 => {
+            u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+        }
+        _ => 0,
+    })
+}
+
 /// Like [`apply`], additionally reporting whether anything was written (used
 /// by the writer to decide whether a group needs a WAL fsync).
 pub fn apply_committing(
@@ -224,18 +241,22 @@ fn apply_with_meta(
         }
         txn.commit()?
     } else {
-        // Rejected outcome: the engine's writes are discarded, but the
-        // applied position must still advance (the entry IS applied).
+        let mut meta_txn = WriteTxn::new(db.clone(), group, now_eff);
+        if now_eff > last_now && !matches!(cmd.op, Op::Noop) {
+            meta_txn.put_raw(
+                store_keys::CF_META,
+                store_keys::META_LAST_NOW_KEY,
+                now_eff.to_be_bytes().to_vec(),
+            )?;
+        }
         if let Some(applied) = applied_position {
-            let mut meta_txn = WriteTxn::new(db.clone(), group, now_eff);
             meta_txn.put_raw(
                 store_keys::CF_META,
                 store_keys::META_LAST_APPLIED_KEY,
                 applied,
             )?;
-            meta_txn.commit()?;
         }
-        false
+        meta_txn.commit()?
     };
     Ok((resp, wrote))
 }
@@ -474,10 +495,17 @@ fn execute_op(
             ApplyResponse::Unit
         }
         Op::GcSweep { now_ms: _, batch } => {
-            let (scanned, reclaimed) = gc_sweep(txn, now_eff, *batch)?;
-            // Reaping an expired lock frees its path; grant any waiter behind it.
-            sweep_grants(txn)?;
-            ApplyResponse::Gc { scanned, reclaimed }
+            let (scanned, reclaimed, may_unblock) = gc_sweep(txn, now_eff, *batch)?;
+            let granted = if may_unblock {
+                sweep_grants(txn)?
+            } else {
+                Vec::new()
+            };
+            ApplyResponse::Gc {
+                scanned,
+                reclaimed,
+                granted,
+            }
         }
         Op::IncrFence => {
             let token = incr_fence_inner(txn)?;
@@ -508,11 +536,11 @@ fn execute_op(
         } => {
             // The algorithm in force before this write: the explicit row's
             // value, or the configured fallback when none exists.
-            let (before, _) =
+            let (before, explicit) =
                 engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
             let after = LockPolicy::new(*algorithm, before.epoch);
             engine::set_namespace_policy_inner(txn, namespace, *algorithm)?;
-            if after.algorithm == before.algorithm {
+            if explicit && after.algorithm == before.algorithm {
                 // No effective change (re-set to the same value); locks stay.
                 ApplyResponse::Unit
             } else {
@@ -520,13 +548,12 @@ fn execute_op(
             }
         }
         Op::DeleteNamespacePolicy { namespace } => {
-            let (before, explicit) =
+            let (_before, explicit) =
                 engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
             engine::delete_namespace_policy_inner(txn, namespace)?;
-            // Deleting reverts the namespace to the configured default. Clear
-            // only when that actually changes the effective algorithm — i.e. an
-            // explicit row existed and it differed from the default.
-            if explicit && before != LockPolicy::from_algorithm(default_algorithm) {
+            // Deleting reverts the namespace to the configured default and
+            // removes its routing boundary.
+            if explicit {
                 namespace_cleared_response(clear_namespace(txn, namespace)?)
             } else {
                 ApplyResponse::Unit
@@ -537,6 +564,9 @@ fn execute_op(
             policy,
             args,
         } => {
+            if let Some(resp) = reject_stale_routing(txn, namespace, args)? {
+                return Ok(resp);
+            }
             if cmd.request_id.is_some() {
                 if let Some(resp) =
                     reject_stale_policy_epoch(txn, namespace, *policy, default_algorithm)?
@@ -547,6 +577,55 @@ fn execute_op(
             execute_acquire(txn, namespace, args, *policy)?
         }
     })
+}
+
+fn reject_stale_routing(
+    txn: &WriteTxn,
+    stamped_namespace: &str,
+    args: &AcquireArgs,
+) -> anyhow::Result<Option<ApplyResponse>> {
+    let now_ms = txn.now_ms();
+    let mut roots = Vec::new();
+    txn.scan_merged(
+        store_keys::CF_NAMESPACE_SETTINGS,
+        None,
+        None,
+        |key, value| {
+            let record = decode_record(value)?;
+            let StoredRecord::Str { exp, .. } = record else {
+                return Ok(true);
+            };
+            if store_keys::expired(exp, now_ms) {
+                return Ok(true);
+            }
+            if let Ok(root) = std::str::from_utf8(key) {
+                roots.push(root.to_string());
+            }
+            Ok(true)
+        },
+    )?;
+    roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    for path in args
+        .requests
+        .iter()
+        .map(|req| req.path.as_str())
+        .chain(args.release_requests.iter().map(|req| req.path.as_str()))
+    {
+        if let Some(current) = roots
+            .iter()
+            .find(|root| crate::cluster::placement::namespace_contains_path(root.as_str(), path))
+        {
+            if current != stamped_namespace {
+                return Ok(Some(ApplyResponse::Rejected {
+                    kind: RejectKind::RoutingStale,
+                    detail: format!(
+                        "routing namespace for {path} changed: stamped {stamped_namespace}, current {current}"
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(None)
 }
 
 fn reject_stale_policy_epoch(
@@ -590,7 +669,7 @@ fn reject_stale_policy_epoch(
 /// index entry is always dropped. Returns `(scanned, reclaimed)`; a `scanned`
 /// equal to `batch` signals remaining backlog, letting the caller loop until
 /// caught up.
-fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32, u64)> {
+fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32, u64, bool)> {
     let cursor = txn.get_raw(store_keys::CF_META, store_keys::META_GC_CURSOR_KEY)?;
     let upper = store_keys::expiry_scan_upper(now_ms);
 
@@ -606,11 +685,14 @@ fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32,
     )?;
 
     let mut reclaimed = 0u64;
+    let mut may_unblock = false;
     for key in &keys {
         if let Some((_exp, cf, primary_key)) = store_keys::decode_expiry_entry(key) {
             // The expiry entry names its CF by string; map to the static name
             // so the overlay (keyed by &'static str) stays coherent.
             if let Some(static_cf) = static_cf_name(cf) {
+                may_unblock |=
+                    matches!(static_cf, store_keys::CF_OWNER_ALIVE | store_keys::CF_QUEUE);
                 if let Some(bytes) = txn.get_raw(static_cf, primary_key)? {
                     if let Ok(StoredRecord::Str { exp, .. } | StoredRecord::Bytes { exp, .. }) =
                         decode_record(&bytes)
@@ -637,7 +719,7 @@ fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32,
         )?;
     }
 
-    Ok((keys.len() as u32, reclaimed))
+    Ok((keys.len() as u32, reclaimed, may_unblock))
 }
 
 /// Map a CF name decoded from an expiry-index key to its `&'static str`
@@ -712,6 +794,7 @@ pub struct GroupStateMachine {
     /// row (`Config::default_lock_algorithm`). Carried into the deterministic
     /// apply path; must be identical on every replica.
     default_algorithm: LockAlgorithm,
+    snapshot_max_bytes: u64,
 }
 
 impl GroupStateMachine {
@@ -720,12 +803,14 @@ impl GroupStateMachine {
         group: GroupId,
         batcher: FsyncBatcher,
         default_algorithm: LockAlgorithm,
+        snapshot_max_bytes: u64,
     ) -> Self {
         Self {
             db,
             group,
             batcher,
             default_algorithm,
+            snapshot_max_bytes,
         }
     }
 
@@ -915,12 +1000,15 @@ pub struct GroupSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
+        static SNAPSHOT_BUILD_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _permit = SNAPSHOT_BUILD_LIMIT.acquire().await.map_err(io_err)?;
         let db_snapshot = self.sm.db.snapshot();
         let (last_applied, membership) = self.sm.applied_state_from_snapshot(&db_snapshot)?;
-        let image = crate::raft::snapshot::build_group_image_from_snapshot(
+        let image = crate::raft::snapshot::build_group_image_from_snapshot_limited(
             &self.sm.db,
             &db_snapshot,
             self.sm.group,
+            usize::try_from(self.sm.snapshot_max_bytes).unwrap_or(usize::MAX),
         )
         .map_err(io_err)?;
 

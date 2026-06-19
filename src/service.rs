@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use futures::Stream;
 use futures::StreamExt;
+use prost::Message as _;
 use tonic::{Request, Response, Status};
 
 use crate::cluster::router::Router;
@@ -45,9 +46,8 @@ fn engine_err(e: anyhow::Error) -> Status {
             crate::raft::command::RejectKind::IdempotencyMismatch => {
                 Status::invalid_argument(err.detail.clone())
             }
-            crate::raft::command::RejectKind::PolicyEpochStale => {
-                Status::aborted(err.detail.clone())
-            }
+            crate::raft::command::RejectKind::PolicyEpochStale
+            | crate::raft::command::RejectKind::RoutingStale => Status::aborted(err.detail.clone()),
         }
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::MultiDomainUnsupported>() {
         Status::invalid_argument(err.to_string())
@@ -75,8 +75,10 @@ fn engine_err(e: anyhow::Error) -> Status {
 const MAX_TTL_MS: u64 = 7 * 86_400_000;
 const MAX_ID_LEN: usize = 1024;
 const MAX_PATH_LEN: usize = 4096;
+const MAX_PATH_SEGMENTS: usize = 256;
 const MAX_PATHS_PER_REQUEST: usize = 1024;
 const MAX_PATHS_PER_STREAMED_ACQUIRE: usize = 65_536;
+const MAX_STREAMED_ACQUIRE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CYCLE_DEPTH: u32 = 64;
 const DEFAULT_DUMP_OWNER_PAGE: u32 = 64;
 const MAX_DUMP_OWNER_PAGE: u32 = 512;
@@ -93,6 +95,11 @@ fn check_id(label: &str, id: &str) -> Result<(), Status> {
             "{label} too long (max {MAX_ID_LEN} bytes)"
         )));
     }
+    if id.contains('\0') {
+        return Err(Status::invalid_argument(format!(
+            "{label} must not contain NUL bytes"
+        )));
+    }
     Ok(())
 }
 
@@ -105,6 +112,11 @@ fn idempotency_key(key: &str) -> Result<Option<String>, Status> {
         return Err(Status::invalid_argument(format!(
             "idempotency_key too long (max {MAX_ID_LEN} bytes)"
         )));
+    }
+    if key.contains('\0') {
+        return Err(Status::invalid_argument(
+            "idempotency_key must not contain NUL bytes",
+        ));
     }
     Ok(Some(key.to_string()))
 }
@@ -123,9 +135,22 @@ fn check_ttl(ttl_ms: u64) -> Result<(), Status> {
 }
 
 #[allow(clippy::result_large_err)]
+fn check_queue_ttl(ttl_ms: u64) -> Result<(), Status> {
+    if ttl_ms > MAX_TTL_MS {
+        return Err(Status::invalid_argument(format!(
+            "queue_ttl_ms too large (max {MAX_TTL_MS} ms)"
+        )));
+    }
+    Ok(())
+}
+
+#[allow(clippy::result_large_err)]
 fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
         return Err(Status::invalid_argument("path empty or too long"));
+    }
+    if path.contains('\0') {
+        return Err(Status::invalid_argument("path must not contain NUL bytes"));
     }
     let colon = path.find(':').ok_or_else(|| {
         Status::invalid_argument(format!(
@@ -152,7 +177,14 @@ fn check_path(path: &str) -> Result<(), Status> {
             "normalized path must not end with '/': {path}"
         )));
     }
+    let mut segments = 0usize;
     for seg in p[1..].split('/') {
+        segments += 1;
+        if segments > MAX_PATH_SEGMENTS {
+            return Err(Status::invalid_argument(format!(
+                "normalized path has too many segments (max {MAX_PATH_SEGMENTS}): {path}"
+            )));
+        }
         if seg.is_empty() {
             return Err(Status::invalid_argument(format!(
                 "normalized path has an empty segment ('//'): {path}"
@@ -379,6 +411,15 @@ impl PathLockService {
                 ));
             }
         }
+        if chunk.queue_ttl_ms != 0 {
+            if base.queue_ttl_ms == 0 {
+                base.queue_ttl_ms = chunk.queue_ttl_ms;
+            } else if base.queue_ttl_ms != chunk.queue_ttl_ms {
+                return Err(Status::invalid_argument(
+                    "acquire stream queue_ttl_ms changed between chunks",
+                ));
+            }
+        }
         if !chunk.idempotency_key.is_empty() {
             if base.idempotency_key.is_empty() {
                 base.idempotency_key = chunk.idempotency_key;
@@ -400,6 +441,7 @@ impl PathLockService {
     ) -> Result<AcquireResponse, Status> {
         check_id("owner_id", &req.owner_id)?;
         check_ttl(req.ttl_ms)?;
+        check_queue_ttl(req.queue_ttl_ms)?;
         let idempotency_key = idempotency_key(&req.idempotency_key)?;
         if req.requests.len() + req.release_requests.len() > max_paths {
             return Err(Status::invalid_argument(format!(
@@ -539,9 +581,14 @@ impl PathLock for PathLockService {
             let mut stream = request.into_inner();
             let mut merged: Option<AcquireRequest> = None;
             let mut total_paths = 0usize;
+            let mut total_bytes = 0usize;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
+                total_bytes = total_bytes.checked_add(chunk.encoded_len()).ok_or_else(|| Status::resource_exhausted("acquire stream too large"))?;
+                if total_bytes > MAX_STREAMED_ACQUIRE_BYTES {
+                    return Err(Status::resource_exhausted(format!("acquire stream too large (max {MAX_STREAMED_ACQUIRE_BYTES} encoded bytes)")));
+                }
                 let chunk_paths = chunk.requests.len() + chunk.release_requests.len();
                 if chunk_paths > MAX_PATHS_PER_REQUEST {
                     return Err(Status::invalid_argument(format!("too many paths in one streamed chunk (max {MAX_PATHS_PER_REQUEST})")));
@@ -1219,10 +1266,18 @@ mod tests {
     }
 
     #[test]
+    fn queue_ttl_is_bounded() {
+        assert!(check_queue_ttl(0).is_ok());
+        assert!(check_queue_ttl(MAX_TTL_MS).is_ok());
+        assert!(check_queue_ttl(MAX_TTL_MS + 1).is_err());
+    }
+
+    #[test]
     fn check_id_rejects_empty() {
         assert!(check_id("owner_id", "").is_err());
         assert!(check_id("owner_id", &"x".repeat(MAX_ID_LEN + 1)).is_err());
         assert!(check_id("owner_id", "ok").is_ok());
+        assert!(check_id("owner_id", "bad\0owner").is_err());
     }
 
     #[test]
@@ -1242,6 +1297,12 @@ mod tests {
         assert!(check_path("h:/a//b").is_err());
         assert!(check_path("h:/a/../b").is_err());
         assert!(check_path("h:/a/./b").is_err());
+        assert!(check_path("h:/a\0b").is_err());
+        assert!(check_path(&format!(
+            "h:/{}",
+            vec!["x"; MAX_PATH_SEGMENTS + 1].join("/")
+        ))
+        .is_err());
     }
 
     #[test]

@@ -89,7 +89,7 @@ pub trait StoreTxn {
 
 Two implementations exist:
 - **Raft state machine WriteBatch wrapper** — for mutating operations.
-- **`RocksDbTxn`** — a read-only snapshot wrapper for observability reads
+- **`SnapshotTxn`** — a read-only RocksDB snapshot wrapper for observability reads
   (`inspect_path`, `list_owner_locks`, `dump_locks`, `detect_cycle`,
   `is_blocking`). Write methods bail; `del`/`srem`/`del_set` are silent no-ops
   (lazy cleanup of already-expired entries is best-effort).

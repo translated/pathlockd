@@ -593,7 +593,10 @@ fn renew_extends_lease() {
             },
         },
     );
-    assert!(matches!(resp, ApplyResponse::Renew(RenewOutcome::Ok { .. })));
+    assert!(matches!(
+        resp,
+        ApplyResponse::Renew(RenewOutcome::Ok { .. })
+    ));
 
     // Alice still holds after original lease would have expired
     let args = AcquireArgs {
@@ -726,6 +729,105 @@ fn assert_fencing_validates_ownership() {
             reason: Reason::StaleOwner
         }
     );
+}
+
+#[test]
+fn assert_fencing_rejects_an_expired_owner() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: acquire_op(acquire_args("alice", 10, 7, vec![wr("h:/expired")])),
+        },
+    );
+    let mut txn = pathlockd::store_rocksdb::RocksDbTxn::new(db, G, now + 11);
+    assert_eq!(
+        pathlockd::engine::assert_fencing_inner(
+            &mut txn,
+            "h",
+            "alice",
+            7,
+            &["h:/expired".to_string()],
+        )
+        .unwrap(),
+        AssertOutcome::Fail {
+            path: "h:/expired".to_string(),
+            reason: Reason::StaleOwner,
+        }
+    );
+}
+
+#[test]
+fn new_owner_cannot_reuse_the_previous_fence() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: acquire_op(acquire_args("alice", 10, 7, vec![wr("h:/reuse")])),
+        },
+    );
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 11,
+                op: acquire_op(acquire_args("bob", 10, 7, vec![wr("h:/reuse")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Conflict {
+            reason: Reason::StaleFencingToken,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn rejected_commands_still_advance_the_monotonic_clock() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now,
+            op: acquire_op(acquire_args("alice", 50, 1, vec![wr("h:/clock")])),
+        },
+    );
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 100,
+                op: Op::Renew {
+                    owner: "alice".into(),
+                    ttl_ms: 50,
+                },
+            },
+        ),
+        ApplyResponse::Renew(RenewOutcome::Lost { .. })
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 25,
+                op: Op::Renew {
+                    owner: "alice".into(),
+                    ttl_ms: 50,
+                },
+            },
+        ),
+        ApplyResponse::Renew(RenewOutcome::Lost { .. })
+    ));
 }
 
 #[test]
@@ -2170,7 +2272,9 @@ fn gc_sweep_resumes_from_cursor_and_drains_backlog() {
                 op: Op::GcSweep { now_ms: at, batch },
             },
         ) {
-            ApplyResponse::Gc { scanned, reclaimed } => (scanned, reclaimed),
+            ApplyResponse::Gc {
+                scanned, reclaimed, ..
+            } => (scanned, reclaimed),
             other => panic!("expected Gc response, got {other:?}"),
         }
     };
@@ -2574,6 +2678,51 @@ fn expired_queue_entries_are_gc_swept() {
 }
 
 #[test]
+fn gc_reports_waiters_granted_after_holder_expiry() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now,
+                op: acquire_op(acquire_args("alice", 1_000, 1, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: acquire_op(acquire_args("bob", 60_000, 2, vec![wr("h:/a")])),
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+    ));
+
+    let later = now + 2_000;
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: later,
+            op: Op::GcSweep {
+                now_ms: later,
+                batch: 4096,
+            },
+        },
+    ) {
+        ApplyResponse::Gc { granted, .. } => assert_eq!(granted, vec!["bob"]),
+        other => panic!("expected Gc, got {other:?}"),
+    }
+}
+
+#[test]
 fn point_rw_policy_is_nonrecursive_but_same_path_rw() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
@@ -2784,6 +2933,33 @@ fn algorithm_change_clears_held_locks_under_namespace() {
             },
         ),
         ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+}
+
+#[test]
+fn stale_parent_route_is_rejected_after_nested_namespace_creation() {
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    set_policy(&db, now, "h:/nested", LockAlgorithm::RecursiveRw);
+
+    let response = apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 1,
+            op: Op::AcquireInNamespace {
+                namespace: "h".into(),
+                policy: LockPolicy::new(LockAlgorithm::RecursiveRw, 0),
+                args: acquire_args("alice", 60_000, 1, vec![wr("h:/nested/item")]),
+            },
+        },
+    );
+    assert!(matches!(
+        response,
+        ApplyResponse::Rejected {
+            kind: pathlockd::raft::command::RejectKind::RoutingStale,
+            ..
+        }
     ));
 }
 

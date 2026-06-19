@@ -53,8 +53,19 @@ Configuration is loaded from lowest to highest precedence:
 |---|---|---|
 | `rocksdb_wal_sync` | `true` | Sync WAL on every write (set to `false` for throughput) |
 | `rocksdb_max_open_files` | `4096` | RocksDB max open files |
+| `rocksdb_max_total_wal_size_mb` | `512` | Total WAL cap before RocksDB flushes cold column families |
+| `rocksdb_max_background_jobs` | `4` | Flush and compaction worker budget |
+| `rocksdb_block_cache_mb` | `128` | Shared block cache across column families |
+| `rocksdb_write_buffer_mb` | `16` | Memtable size per column family |
+| `rocksdb_write_buffer_manager_mb` | `256` | Node-wide soft cap across all memtables |
+| `rocksdb_max_write_buffers` | `3` | Mutable and immutable memtables allowed per column family |
+| `rocksdb_enable_pipelined_write` | `true` | Overlap WAL and memtable write stages |
 | `raft_snapshot_interval_entries` | `10000` | Entries between snapshots |
 | `raft_snapshot_min_log_entries` | `5000` | Minimum log entries before snapshot |
+| `raft_snapshot_max_bytes` | `536870912` | Maximum snapshot image built, sent, or accepted |
+
+`log_file` optionally duplicates stdout logs to an append-only file. Rotation
+is external; use the container logging driver or `logrotate`.
 
 ### Example config
 
@@ -278,4 +289,10 @@ Set `group_gc_interval_secs = 0` to disable active GC (lazy expiry still applies
 ### Memory usage
 
 - `rocksdb_max_open_files`: Lower this if file descriptor limits are tight
+- Budget `rocksdb_write_buffer_manager_mb` and `rocksdb_block_cache_mb`
+  together; snapshots are additional transient memory up to
+  `raft_snapshot_max_bytes`.
+- Monitor `pathlockd.rocksdb.memtable_bytes`,
+  `pathlockd.rocksdb.block_cache_bytes`, and
+  `pathlockd.rocksdb.pending_compaction_bytes` before increasing write buffers.
 - `event_buffer`: Per-subscriber event queue depth; large values increase memory

@@ -120,6 +120,7 @@ pub enum RejectKind {
     /// dedupe window.
     IdempotencyMismatch,
     PolicyEpochStale,
+    RoutingStale,
 }
 
 /// Responses returned by the state machine after applying an Op.
@@ -135,6 +136,7 @@ pub enum ApplyResponse {
     Gc {
         scanned: u32,
         reclaimed: u64,
+        granted: Vec<String>,
     },
     Unit,
     /// The command was refused and none of its writes committed. Logical

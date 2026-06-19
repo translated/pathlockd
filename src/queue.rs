@@ -143,9 +143,19 @@ pub fn enqueue<P: Into<LockPolicy>>(
     let seq = match owner_seq(tx, &owner)? {
         Some(existing) => {
             if let Some(entry) = read_entry(tx, existing)? {
-                delete_path_indexes(tx, &entry)?;
+                if entry.namespace == namespace && entry.args == *args && entry.policy == policy {
+                    delete_path_indexes(tx, &entry)?;
+                    existing
+                } else {
+                    delete_path_indexes(tx, &entry)?;
+                    tx.del(CF_QUEUE, &queue_entry_key(existing))?;
+                    tx.del(CF_QUEUE, &queue_owner_key(&owner))?;
+                    next_seq(tx)?
+                }
+            } else {
+                tx.del(CF_QUEUE, &queue_owner_key(&owner))?;
+                next_seq(tx)?
             }
-            existing
         }
         None => next_seq(tx)?,
     };
@@ -188,7 +198,9 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
     let lower = queue_entry_lower();
     let upper = queue_entry_upper();
     let mut out = Vec::new();
+    let mut raw = 0usize;
     tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        raw += 1;
         if decode_queue_entry_seq(key).is_none() {
             return Ok(true);
         }
@@ -199,7 +211,7 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
                 }
             }
         }
-        Ok(out.len() < QUEUE_SCAN_LIMIT)
+        Ok(out.len() < QUEUE_SCAN_LIMIT && raw < QUEUE_SCAN_LIMIT)
     })?;
     Ok(out)
 }
@@ -317,7 +329,9 @@ fn collect_exact_path_seqs(
     let now = tx.now_ms();
     let lower = queue_path_prefix(path);
     let upper = queue_path_upper(path);
+    let mut raw = 0usize;
     tx.scan_merged(CF_QUEUE, Some(&lower), Some(&upper), |key, value| {
+        raw += 1;
         if let Some(seq) = decode_queue_path_seq(key) {
             if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
                 if !expired(exp, now) {
@@ -325,7 +339,7 @@ fn collect_exact_path_seqs(
                 }
             }
         }
-        Ok(out.len() < QUEUE_SCAN_LIMIT)
+        Ok(out.len() < QUEUE_SCAN_LIMIT && raw < QUEUE_SCAN_LIMIT)
     })?;
     Ok(())
 }
@@ -337,7 +351,9 @@ fn collect_prefixed_path_seqs(
 ) -> anyhow::Result<()> {
     let now = tx.now_ms();
     let (lower, upper) = queue_index_prefix_range(path_prefix);
+    let mut raw = 0usize;
     tx.scan_merged(CF_QUEUE, Some(&lower), upper.as_deref(), |key, value| {
+        raw += 1;
         if let Some(seq) = decode_queue_path_seq(key) {
             if let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) {
                 if !expired(exp, now) {
@@ -345,7 +361,7 @@ fn collect_prefixed_path_seqs(
                 }
             }
         }
-        Ok(out.len() < QUEUE_SCAN_LIMIT)
+        Ok(out.len() < QUEUE_SCAN_LIMIT && raw < QUEUE_SCAN_LIMIT)
     })?;
     Ok(())
 }
@@ -453,15 +469,10 @@ where
 {
     let entries = scan(tx)?;
     let mut notify = Vec::new();
-    let mut reserved: Vec<(String, Mode, LockAlgorithm)> = Vec::new();
+    let mut reserved = ReservedPaths::default();
     for entry in entries {
-        if args_conflicts_with(&entry.args, &entry.namespace, entry.policy, &reserved).is_some() {
-            reserve(
-                &mut reserved,
-                &entry.namespace,
-                &entry.args,
-                entry.policy.algorithm,
-            );
+        if reserved.conflicts(&entry.args, &entry.namespace, entry.policy) {
+            reserved.insert(&entry.namespace, &entry.args, entry.policy.algorithm);
             continue;
         }
         match try_acquire(tx, &entry.namespace, &entry.args, entry.policy)? {
@@ -475,35 +486,86 @@ where
             } => {
                 // Wake to refresh-and-retry; stays queued and reserved so later
                 // waiters keep their place behind it.
-                reserve(
-                    &mut reserved,
-                    &entry.namespace,
-                    &entry.args,
-                    entry.policy.algorithm,
-                );
+                reserved.insert(&entry.namespace, &entry.args, entry.policy.algorithm);
                 notify.push(entry.owner);
             }
             _ => {
-                reserve(
-                    &mut reserved,
-                    &entry.namespace,
-                    &entry.args,
-                    entry.policy.algorithm,
-                );
+                reserved.insert(&entry.namespace, &entry.args, entry.policy.algorithm);
             }
         }
     }
     Ok(notify)
 }
 
-fn reserve(
-    reserved: &mut Vec<(String, Mode, LockAlgorithm)>,
-    namespace: &str,
-    args: &AcquireArgs,
-    algorithm: LockAlgorithm,
-) {
-    for (p, m) in new_scoped_paths(args, namespace) {
-        reserved.push((p, m, algorithm));
+#[derive(Default)]
+struct ReservedPaths {
+    by_path: std::collections::BTreeMap<String, Vec<(Mode, LockAlgorithm)>>,
+}
+
+impl ReservedPaths {
+    fn conflicts(&self, args: &AcquireArgs, namespace: &str, policy: LockPolicy) -> bool {
+        for (path, mode) in new_scoped_paths(args, namespace) {
+            if self.path_conflicts(&path, mode, policy.algorithm) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn path_conflicts(&self, path: &str, mode: Mode, algorithm: LockAlgorithm) -> bool {
+        if self.by_path.get(path).is_some_and(|entries| {
+            entries.iter().any(|(other_mode, other_algorithm)| {
+                requests_conflict(algorithm, path, mode, *other_algorithm, path, *other_mode)
+            })
+        }) {
+            return true;
+        }
+        for ancestor in get_ancestors(path) {
+            if self.by_path.get(&ancestor).is_some_and(|entries| {
+                entries.iter().any(|(other_mode, other_algorithm)| {
+                    requests_conflict(
+                        algorithm,
+                        path,
+                        mode,
+                        *other_algorithm,
+                        &ancestor,
+                        *other_mode,
+                    )
+                })
+            }) {
+                return true;
+            }
+        }
+        if mode == Mode::Write && algorithm.recursive() {
+            let prefix = descendant_index_prefix(path);
+            for (other_path, entries) in self.by_path.range(prefix.clone()..) {
+                if !other_path.starts_with(&prefix) {
+                    break;
+                }
+                if entries.iter().any(|(other_mode, other_algorithm)| {
+                    requests_conflict(
+                        algorithm,
+                        path,
+                        mode,
+                        *other_algorithm,
+                        other_path,
+                        *other_mode,
+                    )
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn insert(&mut self, namespace: &str, args: &AcquireArgs, algorithm: LockAlgorithm) {
+        for (path, mode) in new_scoped_paths(args, namespace) {
+            self.by_path
+                .entry(path)
+                .or_default()
+                .push((mode, algorithm));
+        }
     }
 }
 
@@ -676,6 +738,30 @@ mod tests {
         assert_eq!(q.len(), 2);
         assert_eq!(q[0].owner, "o1"); // FIFO order
         assert_eq!(q[1].owner, "o2");
+    }
+
+    #[test]
+    fn changed_owner_request_gets_a_new_sequence() {
+        let (db, _d) = open_temp_db();
+        let mut tx = txn(&db, 1_000);
+        let first = enqueue(
+            &mut tx,
+            "h",
+            &args("o1", vec![req("h:/a", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        let changed = enqueue(
+            &mut tx,
+            "h",
+            &args("o1", vec![req("h:/b", Mode::Write)]),
+            LockAlgorithm::default(),
+        )
+        .unwrap();
+        assert!(changed > first);
+        let queued = scan(&tx).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].seq, changed);
     }
 
     #[test]
