@@ -1352,13 +1352,20 @@ pub fn namespace_has_live_locks(
     Ok(found)
 }
 
-/// Every LIVE held lock in this group whose path is contained by `namespace`,
-/// returned as `(owner, mode, path)` against the transaction's merged view
-/// (committed state plus the apply's own pending writes).
+/// Every LIVE held lock in this group acquired **under** the routing namespace
+/// `namespace` (i.e. the lock's stored namespace equals `namespace`), returned
+/// as `(owner, mode, path)` against the transaction's merged view (committed
+/// state plus the apply's own pending writes).
 ///
-/// Used to force-clear a namespace when its lock algorithm changes. Like
-/// [`namespace_has_live_locks`] the scan is unbounded (administrative): the
-/// clear is all-or-nothing within a group rather than risking a partially
+/// Used to force-clear a namespace when its lock algorithm changes. The match
+/// is on the stored namespace rather than mere path containment for two
+/// reasons: it is the scope the lock keys were actually written under (so the
+/// caller can delete them via `release_inner_in_namespace`), and a lock taken
+/// under a more-specific nested namespace was governed by that namespace's
+/// policy, not this one — changing this namespace must not clear it.
+///
+/// Like [`namespace_has_live_locks`] the scan is unbounded (administrative):
+/// the clear is all-or-nothing within a group rather than risking a partially
 /// cleared namespace under a scan cap.
 pub fn collect_namespace_holds(
     txn: &WriteTxn,
@@ -1379,7 +1386,7 @@ pub fn collect_namespace_holds(
         let Some(held) = crate::engine::parse_hold_member(&member) else {
             return Ok(true);
         };
-        if crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str()) {
+        if held.namespace.as_str() == namespace {
             out.push((
                 owner.to_string(),
                 held.mode.as_str().to_string(),

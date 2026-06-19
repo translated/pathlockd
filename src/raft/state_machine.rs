@@ -389,20 +389,25 @@ fn mint_fence_if_needed(
     Ok(minted)
 }
 
-/// Force-clear every lock — held and queued — whose path is contained by
-/// `namespace`, returning the affected owners (deterministic, sorted). Invoked
-/// when a namespace's effective lock algorithm changes: those locks were taken
-/// under the old algorithm's conflict semantics, so they are dropped and the
-/// owners are told (via a KILLED event) to re-establish under the new policy.
+/// Force-clear every lock — held and queued — acquired **under** the routing
+/// namespace `namespace`, returning the affected owners (deterministic,
+/// sorted). Invoked when a namespace's effective lock algorithm changes: those
+/// locks were taken under the old algorithm's conflict semantics, so they are
+/// dropped and the owners are told (via a KILLED event) to re-establish under
+/// the new policy.
 ///
 /// Held locks are released path-by-path (an owner keeps any locks it holds in
 /// other namespaces), and queued waiters targeting the namespace are dropped.
+/// The release is scoped to `namespace` — the same routing namespace the locks
+/// were written under — so the lock keys are addressed correctly even when it
+/// is path-scoped (e.g. `drive:/tenant/deep`) and differs from the handler.
 fn clear_namespace(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
     use std::collections::{BTreeMap, BTreeSet};
 
     // Group the namespace's held locks by owner, then release each owner's set
     // in one call. Collecting the full set up front means the release writes
-    // never mutate the scan mid-iteration.
+    // never mutate the scan mid-iteration. Every collected hold was stored
+    // under `namespace`, so the release uses it directly as the key scope.
     let holds = crate::store_rocksdb::collect_namespace_holds(txn, namespace)?;
     let mut by_owner: BTreeMap<String, Vec<engine::RelReq>> = BTreeMap::new();
     for (owner, mode, path) in holds {
@@ -418,7 +423,7 @@ fn clear_namespace(txn: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<St
 
     let mut affected: BTreeSet<String> = BTreeSet::new();
     for (owner, reqs) in by_owner {
-        engine::release_inner(txn, &owner, &reqs, false)?;
+        engine::release_inner_in_namespace(txn, namespace, &owner, &reqs, false)?;
         affected.insert(owner);
     }
 
@@ -591,8 +596,11 @@ fn reject_stale_routing(
         None,
         None,
         |key, value| {
-            let record = decode_record(value)?;
-            let StoredRecord::Str { exp, .. } = record else {
+            // Lenient: an undecodable or non-Str settings row is skipped, not
+            // surfaced as an error. This runs in the deterministic apply path,
+            // where a propagated decode error is not a `SetScanLimitExceeded`
+            // and would therefore poison-pill the raft core on every replica.
+            let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) else {
                 return Ok(true);
             };
             if store_keys::expired(exp, now_ms) {

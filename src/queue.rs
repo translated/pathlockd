@@ -216,21 +216,20 @@ pub fn scan(tx: &WriteTxn) -> anyhow::Result<Vec<QueueEntry>> {
     Ok(out)
 }
 
-/// Dequeue every live waiter whose acquire targets `namespace`, returning the
+/// Dequeue every live waiter enqueued **under** `namespace`, returning the
 /// dequeued owners (deterministic, ascending-seq order). Used when a namespace's
 /// lock algorithm changes: a waiter queued under the old semantics must not be
 /// granted in place under the new ones, so it is dropped (the caller signals it
 /// via a KILLED event).
+///
+/// The match is on the waiter's stored routing namespace (set at enqueue), not
+/// path containment: a waiter parked under a more-specific nested namespace was
+/// queued under that namespace's policy and must survive this one's change.
 pub fn clear_namespace(tx: &mut WriteTxn, namespace: &str) -> anyhow::Result<Vec<String>> {
     let entries = scan(tx)?;
     let mut cleared = Vec::new();
     for entry in entries {
-        let targets = entry
-            .args
-            .requests
-            .iter()
-            .any(|r| crate::cluster::placement::namespace_contains_path(namespace, &r.path));
-        if targets {
+        if entry.namespace == namespace {
             dequeue(tx, &entry.owner)?;
             cleared.push(entry.owner);
         }

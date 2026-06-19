@@ -2937,6 +2937,88 @@ fn algorithm_change_clears_held_locks_under_namespace() {
 }
 
 #[test]
+fn algorithm_change_clears_locks_in_path_scoped_namespace() {
+    // Regression: locks are stored under their routing namespace. For a
+    // path-scoped namespace ("drive:/tenant/deep") that scope differs from the
+    // handler ("drive"), so a force-clear that re-derived the scope from the
+    // handler addressed the wrong keys and left the locks (and queued waiters)
+    // in place while still reporting them cleared.
+    let (db, _dir) = open_temp_db();
+    let now = store_keys::now_ms();
+    let namespace = "drive:/tenant/deep";
+    set_policy(&db, now, namespace, LockAlgorithm::PointWrite);
+
+    // alice holds a write lock and bob queues behind it, both under the
+    // path-scoped namespace.
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 1,
+                op: Op::AcquireInNamespace {
+                    namespace: namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::PointWrite, 0),
+                    args: acquire_args("alice", 60_000, 1, vec![wr("drive:/tenant/deep/file")]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 2,
+                op: Op::AcquireInNamespace {
+                    namespace: namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::PointWrite, 0),
+                    args: acquire_args("bob", 60_000, 2, vec![wr("drive:/tenant/deep/file")]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+    ));
+
+    // Changing the algorithm force-clears the held lock and the queued waiter.
+    match apply(
+        &db,
+        Command {
+            request_id: None,
+            now_ms: now + 3,
+            op: Op::SetNamespacePolicy {
+                namespace: namespace.into(),
+                algorithm: LockAlgorithm::RecursiveWrite,
+            },
+        },
+    ) {
+        ApplyResponse::NamespaceCleared(owners) => {
+            assert_eq!(owners, vec!["alice".to_string(), "bob".to_string()]);
+        }
+        other => panic!("expected NamespaceCleared, got {other:?}"),
+    }
+
+    // The lock state is genuinely gone: a fresh acquirer takes the path
+    // outright (before the fix it stayed write-locked behind alice's residue).
+    assert!(matches!(
+        apply(
+            &db,
+            Command {
+                request_id: None,
+                now_ms: now + 4,
+                op: Op::AcquireInNamespace {
+                    namespace: namespace.into(),
+                    policy: LockPolicy::new(LockAlgorithm::RecursiveWrite, 0),
+                    args: acquire_args("carol", 60_000, 3, vec![wr("drive:/tenant/deep/file")]),
+                },
+            },
+        ),
+        ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+    ));
+}
+
+#[test]
 fn stale_parent_route_is_rejected_after_nested_namespace_creation() {
     let (db, _dir) = open_temp_db();
     let now = store_keys::now_ms();
