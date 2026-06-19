@@ -34,6 +34,7 @@
 //! log_level        = "info"
 //! ```
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -166,6 +167,33 @@ pub struct Config {
     pub rocksdb_write_buffer_mb: u64,
     /// tracing-subscriber log filter.
     pub log_level: String,
+
+    // --- Web facade (HTTP/1.1 + HTTP/2 over TLS, and HTTP/3) ---
+    /// TCP listen address for the HTTPS (HTTP/1.1 + HTTP/2) facade. Empty
+    /// disables the entire web facade (gRPC is unaffected). This surface
+    /// exposes the same RPCs as JSON plus SSE/long-poll event streaming.
+    pub web_listen: String,
+    /// UDP listen address for the HTTP/3 (QUIC) facade. Empty disables HTTP/3
+    /// while leaving HTTP/1.1/2 up. Conventionally the same port as
+    /// `web_listen` so a single `Alt-Svc` advertisement upgrades clients.
+    pub h3_listen: String,
+    /// PEM certificate chain for the web facade. Empty + a non-empty
+    /// `web_listen` means an ephemeral self-signed cert is generated at boot
+    /// (development only; clients must skip verification).
+    pub tls_cert_path: Option<PathBuf>,
+    /// PEM private key matching `tls_cert_path` (PKCS#8 or RSA).
+    pub tls_key_path: Option<PathBuf>,
+    /// Allow QUIC 0-RTT early data on HTTP/3. Early data is replayable, so the
+    /// facade only ever dispatches **read-only** RPCs from it; mutating RPCs in
+    /// early data are rejected and must be retried on the 1-RTT connection.
+    pub web_zero_rtt: bool,
+    /// Per-owner retained event ring depth backing SSE replay (`Last-Event-ID`)
+    /// and the long-poll fallback. Larger = more history for reconnecting or
+    /// legacy pollers, at a bounded per-owner memory cost.
+    pub web_event_log_capacity: usize,
+    /// Maximum time a long-poll request blocks waiting for new events before
+    /// returning an empty batch (legacy clients without SSE).
+    pub web_poll_wait_ms: u64,
 }
 
 impl Default for Config {
@@ -216,6 +244,13 @@ impl Default for Config {
             rocksdb_block_cache_mb: 128,
             rocksdb_write_buffer_mb: 16,
             log_level: "info".to_string(),
+            web_listen: String::new(),
+            h3_listen: String::new(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            web_zero_rtt: true,
+            web_event_log_capacity: 1024,
+            web_poll_wait_ms: 25_000,
         }
     }
 }
@@ -269,6 +304,13 @@ struct FileConfig {
     rocksdb_block_cache_mb: Option<u64>,
     rocksdb_write_buffer_mb: Option<u64>,
     log_level: Option<String>,
+    web_listen: Option<String>,
+    h3_listen: Option<String>,
+    tls_cert_path: Option<PathBuf>,
+    tls_key_path: Option<PathBuf>,
+    web_zero_rtt: Option<bool>,
+    web_event_log_capacity: Option<usize>,
+    web_poll_wait_ms: Option<u64>,
 }
 
 #[derive(Parser, Debug)]
@@ -402,7 +444,39 @@ impl Config {
         if self.rocksdb_write_buffer_mb == 0 {
             anyhow::bail!("rocksdb_write_buffer_mb must be > 0");
         }
+        if self.web_enabled() {
+            self.web_listen.parse::<SocketAddr>().map_err(|e| {
+                anyhow::anyhow!("invalid web_listen address {}: {e}", self.web_listen)
+            })?;
+            if !self.h3_listen.is_empty() {
+                self.h3_listen.parse::<SocketAddr>().map_err(|e| {
+                    anyhow::anyhow!("invalid h3_listen address {}: {e}", self.h3_listen)
+                })?;
+            }
+            match (&self.tls_cert_path, &self.tls_key_path) {
+                (Some(_), None) | (None, Some(_)) => anyhow::bail!(
+                    "tls_cert_path and tls_key_path must be set together \
+                     (or both omitted for a self-signed dev cert)"
+                ),
+                _ => {}
+            }
+            if self.web_event_log_capacity == 0 {
+                anyhow::bail!("web_event_log_capacity must be > 0");
+            }
+        }
         Ok(())
+    }
+
+    /// Whether the HTTP/JSON facade should start. The facade is opt-in: an
+    /// empty `web_listen` leaves only gRPC running.
+    pub fn web_enabled(&self) -> bool {
+        !self.web_listen.is_empty()
+    }
+
+    /// Whether HTTP/3 should start. Requires the web facade and a non-empty
+    /// `h3_listen`.
+    pub fn h3_enabled(&self) -> bool {
+        self.web_enabled() && !self.h3_listen.is_empty()
     }
 
     /// The stable numeric Raft node id, derived from the trailing integer of
@@ -496,6 +570,17 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(rocksdb_block_cache_mb);
     apply!(rocksdb_write_buffer_mb);
     apply!(log_level);
+    apply!(web_listen);
+    apply!(h3_listen);
+    if let Some(v) = file.tls_cert_path {
+        cfg.tls_cert_path = Some(v);
+    }
+    if let Some(v) = file.tls_key_path {
+        cfg.tls_key_path = Some(v);
+    }
+    apply!(web_zero_rtt);
+    apply!(web_event_log_capacity);
+    apply!(web_poll_wait_ms);
 }
 
 fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
@@ -624,6 +709,27 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     }
     if let Some(v) = env_string("PATHLOCKD_LOG_LEVEL") {
         cfg.log_level = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_WEB_LISTEN") {
+        cfg.web_listen = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_H3_LISTEN") {
+        cfg.h3_listen = v;
+    }
+    if let Some(v) = env_string("PATHLOCKD_TLS_CERT_PATH") {
+        cfg.tls_cert_path = Some(PathBuf::from(v));
+    }
+    if let Some(v) = env_string("PATHLOCKD_TLS_KEY_PATH") {
+        cfg.tls_key_path = Some(PathBuf::from(v));
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_WEB_ZERO_RTT")? {
+        cfg.web_zero_rtt = v;
+    }
+    if let Some(v) = env_parse::<usize>("PATHLOCKD_WEB_EVENT_LOG_CAPACITY")? {
+        cfg.web_event_log_capacity = v;
+    }
+    if let Some(v) = env_parse::<u64>("PATHLOCKD_WEB_POLL_WAIT_MS")? {
+        cfg.web_poll_wait_ms = v;
     }
     Ok(())
 }

@@ -32,3 +32,4 @@ pub mod raft;
 pub mod service;
 pub mod store_keys;
 pub mod store_rocksdb;
+pub mod web;

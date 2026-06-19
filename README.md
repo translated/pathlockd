@@ -44,6 +44,41 @@ next sweep, never wedges a path.
   events (`released` / `killed` / `revoke` / `grant`). Cross-node fan-out is
   automatic via gossip.
 
+## Where it fits
+
+`pathlockd` coordinates *who may touch what* across processes and machines; it
+never stores your data. Anywhere a tree of resources is mutated concurrently and
+a stale actor must be fenced out, the path-lock model fits.
+
+- **User-space virtual filesystems.** A path is a file/folder; a write lock owns
+  the whole subtree, a read lock pins one node. The handler prefix (`s3:`,
+  `google_drive:`, `local:`) selects the backend; fencing tokens let the backing
+  store reject a writer that paused too long. End-to-end walkthrough in
+  [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md).
+- **Object-store / blob mutations.** Read-modify-write on an S3 key or a DB row
+  is safe when the key is a locked path and you `AssertFencing` immediately
+  before the `PUT`. The store enforces monotonicity even across leader
+  failovers, so a delayed write from a wedged client is rejected, not applied.
+- **Hierarchical multi-tenant resources.** Lock `tenant:/acme/projects/42` and
+  you own that project's whole subtree without enumerating its children; a
+  reader on `tenant:/acme` doesn't block writers deeper in the tree. Natural fit
+  for collaborative-doc backends, CMS folder trees, and config hierarchies.
+- **Data-pipeline / ETL partition ownership.** Each worker takes a write lock on
+  its partition path (`etl:/2026/06/19/shard-7`); the subtree rule guarantees no
+  two workers claim overlapping ranges, and a crashed worker's lease lapses so
+  the partition reprocesses instead of wedging.
+- **Singleton jobs & leader election.** A write lock on `cron:/nightly-rollup`
+  with a TTL is an only-one-runner gate. The holder renews to keep running; if
+  it dies the lease frees on the next sweep and a standby is granted in place
+  via its `Subscribe` stream — no retry-loop thundering herd.
+- **Bounded concurrency / resource pools.** The `semaphore` primitive is a
+  counting lock: cap a path at N concurrent acquires to throttle a rate-limited
+  upstream, a license pool, or a fixed worker fleet, without a separate
+  rate-limiter service.
+- **Migrations & deploy locks.** A short-lived write lock on
+  `deploy:/region/us-east` serializes schema migrations or rollouts; the
+  mandatory TTL means a forgotten lock can never strand the pipeline.
+
 ## Quick start
 
 ```bash
@@ -100,6 +135,41 @@ The `PathLock` service exposes `Acquire`, `Release`, `ReleaseAll`, `Renew`,
 `ForceRelease`, `AssertFencing`, `DetectCycle`, `IsBlocking`,
 `SetNamespacePolicy` / `GetNamespacePolicy` / `DeleteNamespacePolicy`,
 `IncrFencingToken`, `IsOwnerAlive`, and a server-streaming `Subscribe`.
+
+## Web facade (HTTP/1.1, HTTP/2, HTTP/3)
+
+Set `web_listen` (off by default) to expose the *same* `PathLock` engine as a
+JSON API over **HTTPS** (HTTP/1.1 + HTTP/2) and, with `h3_listen`, over
+**HTTP/3** (QUIC) — alongside the gRPC server, sharing one code path through the
+engine. With `tls_cert_path`/`tls_key_path` unset, a self-signed dev cert is
+generated at boot.
+
+- **Every RPC as JSON.** `POST /v1/<rpc>` with the request message as a
+  proto3-JSON body (camelCase fields), e.g. `POST /v1/acquire`,
+  `/v1/release`, `/v1/renew`, `/v1/incrFencingToken`; `GET /v1/health`. gRPC
+  status codes map to HTTP status codes.
+- **Events over SSE.** `GET /v1/events/sse?owner_id=…` is a `text/event-stream`
+  of that owner's lifecycle events; each frame carries a monotonic `id`, so a
+  reconnecting `EventSource` resumes from `Last-Event-ID`.
+- **Long-poll fallback.** `GET /v1/events/poll?owner_id=…&after=<id>` for clients
+  without SSE: returns events newer than `after`, or blocks up to
+  `web_poll_wait_ms` and returns an empty batch. A per-owner retained ring
+  bridges the gaps between polls.
+- **HTTP/3 0-RTT, reads-only.** QUIC early data is replayable, so the facade
+  dispatches **only read-only RPCs** received before the handshake completes;
+  mutating RPCs in early data get `425 Too Early` and must retry on the 1-RTT
+  connection.
+
+```bash
+curl -k https://localhost:8443/v1/health
+curl -k -X POST https://localhost:8443/v1/incrFencingToken \
+  -H 'content-type: application/json' -d '{"path":"s3:/a/b"}'
+curl -kN "https://localhost:8443/v1/events/sse?owner_id=op-7"
+```
+
+Config keys (and `PATHLOCKD_WEB_*` env equivalents) are in
+[`pathlockd.example.toml`](pathlockd.example.toml). The facade is unauthenticated
+like gRPC — front it with an mTLS/auth proxy or restrict reachability.
 
 ## Documentation
 

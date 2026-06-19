@@ -333,6 +333,7 @@ fn to_state(i: i32) -> Result<engine::State, Status> {
 // PathLock service
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 pub struct PathLockService {
     pub router: Arc<Router>,
     pub broadcaster: Broadcaster,

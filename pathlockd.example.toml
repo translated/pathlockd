@@ -108,6 +108,18 @@ max_concurrent_requests_per_connection = 256
 # tracing log filter.
 log_level = "info"
 
+# --- Web facade (optional): the same RPCs as JSON over HTTPS (HTTP/1.1 +
+# HTTP/2) and HTTP/3, plus event streaming via SSE and a long-poll fallback.
+# Leave web_listen empty (the default) to run gRPC only.
+#
+# web_listen = "0.0.0.0:8443"      # TCP: HTTP/1.1 + HTTP/2 over TLS
+# h3_listen  = "0.0.0.0:8443"      # UDP: HTTP/3 over QUIC (usually same port)
+# tls_cert_path = "/etc/pathlockd/tls/cert.pem"   # PEM chain; omit both for a
+# tls_key_path  = "/etc/pathlockd/tls/key.pem"    # self-signed dev cert
+# web_zero_rtt = true              # allow HTTP/3 0-RTT (read-only RPCs only)
+# web_event_log_capacity = 1024    # retained events per owner (SSE replay/poll)
+# web_poll_wait_ms = 25000         # max long-poll block before empty return
+
 # OpenTelemetry tracing/metrics export is configured via standard OTEL_* env
 # vars, not TOML. For example:
 # OTEL_SERVICE_NAME=pathlockd

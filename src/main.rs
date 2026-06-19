@@ -231,6 +231,16 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let path_lock = PathLockService::new(router, broadcaster.clone());
+
+    // Optional HTTP/1.1+HTTP/2+HTTP/3 facade over the same engine (opt-in via
+    // web_listen). Spawned before the blocking gRPC serve; binding errors here
+    // abort startup.
+    if cfg.web_enabled() {
+        pathlockd::web::spawn(&cfg, path_lock.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("starting web facade: {e}"))?;
+    }
+
     let addr: SocketAddr = cfg
         .listen
         .parse()
