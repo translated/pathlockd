@@ -493,6 +493,12 @@ async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32
                         break;
                     }
                     if started.elapsed() >= GC_PASS_BUDGET {
+                        // Budget spent mid-group: cede to the next group so a
+                        // perpetually backlogged group cannot starve later
+                        // groups' expiry reclamation and queue-expiry grants.
+                        // Its own persisted GC cursor resumes its progress when
+                        // the rotation comes back around.
+                        next_offset = (offset + i + 1) % led.len();
                         break 'groups;
                     }
                 }

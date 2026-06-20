@@ -365,10 +365,15 @@ fn execute_acquire(
                 // freed path set is not known here.
                 crate::queue::dequeue(txn, &args.owner_id)?;
                 let freed = scoped_freed_paths(namespace, &args.release_requests);
-                let granted = if !freed.is_empty() {
-                    sweep_grants_for_paths(txn, &freed)?
-                } else if !was_alive && !args.requests.is_empty() {
+                let granted = if !was_alive && !args.requests.is_empty() {
+                    // The engine ran `release_owner_wide`, freeing stale holds
+                    // that are not in `release_requests`; a targeted sweep would
+                    // miss their waiters. The full sweep also covers any
+                    // explicit releases carried in this same command, so it must
+                    // take precedence over the targeted branch below.
                     sweep_grants(txn)?
+                } else if !freed.is_empty() {
+                    sweep_grants_for_paths(txn, &freed)?
                 } else {
                     Vec::new()
                 };
@@ -1167,5 +1172,115 @@ impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
             meta,
             snapshot: std::io::Cursor::new(image),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{AcquireArgs, LockPolicy, LockReq, Mode, RelReq, State};
+    use crate::raft::command::{Command, Op};
+
+    fn open_temp_db() -> (Arc<DB>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::store_rocksdb::open_db(
+            &dir.path().join("db"),
+            &crate::store_rocksdb::DbTuning::default(),
+        )
+        .unwrap();
+        (db, dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_cmd(
+        owner: &str,
+        path: &str,
+        state: State,
+        token: i64,
+        ttl_ms: u64,
+        releases: &[&str],
+        now_ms: u64,
+    ) -> Command {
+        Command {
+            request_id: None,
+            now_ms,
+            op: Op::AcquireInNamespace {
+                namespace: "h".to_string(),
+                policy: LockPolicy::from_algorithm(LockAlgorithm::RecursiveRw),
+                args: AcquireArgs {
+                    owner_id: owner.to_string(),
+                    ttl_ms,
+                    requests: vec![LockReq {
+                        path: path.to_string(),
+                        mode: Mode::Write,
+                        state,
+                        permits: 0,
+                    }],
+                    fencing_token: token,
+                    release_requests: releases
+                        .iter()
+                        .map(|p| RelReq {
+                            path: p.to_string(),
+                            mode: Mode::Write,
+                        })
+                        .collect(),
+                    queue_ttl_ms: 0,
+                },
+            },
+        }
+    }
+
+    /// A not-alive owner re-acquiring (which makes the engine free its stale
+    /// holds owner-wide) while also carrying an explicit release must still
+    /// grant the waiters parked on those owner-wide-freed paths. The explicit
+    /// release's *targeted* sweep alone would miss them, so the not-alive case
+    /// must take precedence and run a full sweep.
+    #[test]
+    fn reacquire_by_dead_owner_with_release_grants_owner_wide_freed_waiters() {
+        let (db, _dir) = open_temp_db();
+        let group = 0u32;
+
+        // Owner A holds h:/p with a short lease (its liveness expires at 2000).
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("A", "h:/p", State::New, 1, 1_000, &[], 1_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            resp,
+            ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+        ));
+
+        // Owner B queues behind A for that same path.
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("B", "h:/p", State::New, 2, 10_000, &[], 1_100),
+        )
+        .unwrap();
+        assert!(matches!(
+            resp,
+            ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+        ));
+
+        // Past 2000 A's lease has expired. A re-acquires a *different* path and
+        // also releases an unrelated one. The engine frees A's stale hold on
+        // h:/p owner-wide; B (parked on h:/p, not on the released path) must be
+        // granted in place rather than left queued until the next GC sweep.
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("A", "h:/q", State::New, 5, 10_000, &["h:/r"], 3_000),
+        )
+        .unwrap();
+        let granted = match resp {
+            ApplyResponse::AcquireGranted { granted, .. } => granted,
+            other => panic!("expected AcquireGranted granting B, got {other:?}"),
+        };
+        assert!(
+            granted.contains(&"B".to_string()),
+            "B must be granted h:/p owner-wide, got {granted:?}"
+        );
     }
 }

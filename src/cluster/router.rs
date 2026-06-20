@@ -165,6 +165,27 @@ struct NamespaceRoute {
     policy: LockPolicy,
 }
 
+/// RAII guard over the in-flight write counter behind the
+/// `pathlockd.writer.queue_depth` gauge. Incremented on entry, decremented on
+/// drop — including when an in-flight write's future is *cancelled* (client
+/// disconnect, request-timeout load-shed, a fan-out bailing on a sibling
+/// error) rather than run to completion. A bare add/sub leaked the gauge upward
+/// on every such cancellation until it read permanently saturated.
+struct InflightGauge(Arc<AtomicUsize>);
+
+impl InflightGauge {
+    fn enter(counter: &Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter.clone())
+    }
+}
+
+impl Drop for InflightGauge {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct Router {
     groups: Arc<RaftGroups>,
     routing: RoutingOptions,
@@ -704,10 +725,10 @@ impl Router {
         let Ok(_permit) = semaphore.try_acquire_owned() else {
             return Err(WriteQueueFull.into());
         };
-        self.inflight_total.fetch_add(1, Ordering::Relaxed);
-        let result = self.apply_inner(group, cmd).await;
-        self.inflight_total.fetch_sub(1, Ordering::Relaxed);
-        match result? {
+        // RAII so the gauge is decremented even if this future is cancelled at
+        // the await below (timeout, disconnect, fan-out abort).
+        let _depth = InflightGauge::enter(&self.inflight_total);
+        match self.apply_inner(group, cmd).await? {
             // Deterministic refusals (scan limits, idempotency-key misuse)
             // surface as request errors, never as raw responses callers would
             // misread as "unexpected response type".
@@ -2081,6 +2102,21 @@ mod tests {
             path: path.into(),
             mode: Mode::Write,
         }
+    }
+
+    #[test]
+    fn inflight_gauge_decrements_on_drop() {
+        // Models the cancellation path: a guard dropped without its future
+        // running to completion must still release its slot, so the gauge
+        // returns to zero rather than leaking upward.
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let _g1 = InflightGauge::enter(&counter);
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+            let _g2 = InflightGauge::enter(&counter);
+            assert_eq!(counter.load(Ordering::Relaxed), 2);
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
