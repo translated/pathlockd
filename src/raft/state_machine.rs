@@ -278,6 +278,20 @@ fn sweep_grants(txn: &mut WriteTxn) -> anyhow::Result<Vec<String>> {
     })
 }
 
+/// Targeted grant sweep: only re-try waiters whose paths intersect the scoped
+/// paths just freed (`freed_scoped`), via the queue path indexes. Used on the
+/// hot acquire path and on releases so a no-op acquire (one that frees nothing)
+/// never scans the whole queue, and a release only touches waiters it could have
+/// unblocked.
+fn sweep_grants_for_paths(
+    txn: &mut WriteTxn,
+    freed_scoped: &[String],
+) -> anyhow::Result<Vec<String>> {
+    crate::queue::grant_sweep_for_paths(txn, freed_scoped, |txn, namespace, args, policy| {
+        engine::acquire_inner_in_namespace(txn, args, policy, namespace)
+    })
+}
+
 /// `Granted(..)` only when the sweep actually granted someone; otherwise `Unit`,
 /// so grant-less releases keep their existing response shape.
 fn granted_response(granted: Vec<String>) -> ApplyResponse {
@@ -288,6 +302,20 @@ fn granted_response(granted: Vec<String>) -> ApplyResponse {
     }
 }
 
+/// Scoped paths that a set of release requests frees, for a targeted grant
+/// sweep. Duplicates are removed so the sweep's candidate index lookups don't
+/// repeat work.
+fn scoped_freed_paths(namespace: &str, reqs: &[engine::RelReq]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        let scoped = engine::scoped_path(namespace, &req.path);
+        if !out.contains(&scoped) {
+            out.push(scoped);
+        }
+    }
+    out
+}
+
 fn execute_acquire(
     txn: &mut WriteTxn,
     namespace: &str,
@@ -295,6 +323,18 @@ fn execute_acquire(
     policy: LockPolicy,
 ) -> anyhow::Result<ApplyResponse> {
     let args = mint_fence_if_needed(txn, namespace, args, policy.algorithm)?;
+    // Whether the owner is already alive before the acquire: a not-alive
+    // owner's acquire first calls `release_owner_wide` inside the engine,
+    // freeing any stale holds it still has on record beyond the explicit
+    // `release_requests`. Those freed paths are not in `release_requests`, so
+    // the targeted sweep below would miss them; remember to fall back to a
+    // full sweep in that case so waiters on those paths are still granted.
+    let was_alive = txn
+        .get_str(
+            store_keys::CF_OWNER_ALIVE,
+            &store_keys::alive_key(&args.owner_id),
+        )?
+        .is_some();
     // FIFO admission: a newcomer yields to any earlier waiter it
     // conflicts with, queueing behind them instead of barging ahead.
     if let Some((owner, path, reason)) =
@@ -313,9 +353,25 @@ fn execute_acquire(
         match engine::acquire_inner_in_namespace(txn, &args, policy, namespace)? {
             AcquireOutcome::Ok { fencing_token } => {
                 // No longer waiting; inline releases may free paths and
-                // grant queued waiters — surface them so a GRANT fires.
+                // grant queued waiters — surface them so a GRANT fires. Only
+                // sweep when the acquire actually freed state: it carried
+                // `release_requests`, or the owner was not alive and the
+                // engine freed its stale holds owner-wide. A pure acquire by
+                // an already-alive owner adds locks and frees nothing, so a
+                // full queue scan would be wasted work that scales with
+                // queue size. The targeted sweep consults the per-path
+                // indexes and only re-tries waiters it could have unblocked;
+                // the owner-wide case falls back to a full sweep because the
+                // freed path set is not known here.
                 crate::queue::dequeue(txn, &args.owner_id)?;
-                let granted = sweep_grants(txn)?;
+                let freed = scoped_freed_paths(namespace, &args.release_requests);
+                let granted = if !freed.is_empty() {
+                    sweep_grants_for_paths(txn, &freed)?
+                } else if !was_alive && !args.requests.is_empty() {
+                    sweep_grants(txn)?
+                } else {
+                    Vec::new()
+                };
                 let outcome = AcquireOutcome::Ok { fencing_token };
                 if granted.is_empty() {
                     ApplyResponse::Acquire(outcome)
@@ -491,7 +547,8 @@ fn execute_op(
             del_wait,
         } => {
             engine::release_inner_in_namespace(txn, namespace, owner, reqs, *del_wait)?;
-            granted_response(sweep_grants(txn)?)
+            let freed = scoped_freed_paths(namespace, reqs);
+            granted_response(sweep_grants_for_paths(txn, &freed)?)
         }
         Op::ReleaseAll { owner, del_wait } => {
             engine::release_all_inner(txn, owner, *del_wait)?;

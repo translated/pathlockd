@@ -69,6 +69,7 @@ fn spawn_node(
     ordinal: u32,
     ports: &NodePorts,
     bootstrap: bool,
+    force_bootstrap: bool,
     seeds: &[u16],
 ) -> Node {
     let data_dir = dir.join(format!("n{ordinal}"));
@@ -91,6 +92,7 @@ internal_auth_token = "cluster-test-internal-auth-token"
 group_count = 4
 replication_factor = 3
 bootstrap = {bootstrap}
+force_bootstrap = {force_bootstrap}
 seed_nodes = [{seed_list}]
 stability_window_secs = 2
 eviction_window_secs = 4
@@ -218,10 +220,10 @@ async fn three_node_lifecycle() {
     let seeds = [p0.gossip, p1.gossip, p2.gossip];
 
     // Formation: node 0 bootstraps; 1 and 2 join via gossip seeds.
-    let n0 = spawn_node(dir.path(), 0, &p0, true, &seeds);
+    let n0 = spawn_node(dir.path(), 0, &p0, true, true, &seeds);
     wait_healthy(&n0.public_addr, Duration::from_secs(15)).await;
-    let n1 = spawn_node(dir.path(), 1, &p1, false, &seeds);
-    let n2 = spawn_node(dir.path(), 2, &p2, false, &seeds);
+    let n1 = spawn_node(dir.path(), 1, &p1, false, false, &seeds);
+    let n2 = spawn_node(dir.path(), 2, &p2, false, false, &seeds);
     // Fresh joiners turn healthy via peer-proxy routing well before adoption.
     wait_healthy(&n1.public_addr, Duration::from_secs(20)).await;
     wait_healthy(&n2.public_addr, Duration::from_secs(20)).await;
@@ -393,7 +395,7 @@ async fn three_node_lifecycle() {
     );
 
     // Node 0 rejoins from its surviving disk and becomes useful again.
-    let n0b = spawn_node(dir.path(), 0, &p0, true, &seeds);
+    let n0b = spawn_node(dir.path(), 0, &p0, true, false, &seeds);
     wait_healthy(&n0b.public_addr, Duration::from_secs(30)).await;
     let c0b = try_client(&n0b.public_addr).await.unwrap();
     // The cluster is re-placing groups around the returned node; poll
@@ -432,10 +434,10 @@ async fn bootstrap_guard_refuses_second_cluster() {
     let p2 = alloc_node_ports();
     let seeds = [p0.gossip, p1.gossip, p2.gossip];
 
-    let n0 = spawn_node(dir.path(), 0, &p0, true, &seeds);
+    let n0 = spawn_node(dir.path(), 0, &p0, true, true, &seeds);
     wait_healthy(&n0.public_addr, Duration::from_secs(15)).await;
-    let n1 = spawn_node(dir.path(), 1, &p1, false, &seeds);
-    let n2 = spawn_node(dir.path(), 2, &p2, false, &seeds);
+    let n1 = spawn_node(dir.path(), 1, &p1, false, false, &seeds);
+    let n2 = spawn_node(dir.path(), 2, &p2, false, false, &seeds);
     wait_healthy(&n1.public_addr, Duration::from_secs(20)).await;
     wait_healthy(&n2.public_addr, Duration::from_secs(20)).await;
 
@@ -465,7 +467,7 @@ async fn bootstrap_guard_refuses_second_cluster() {
     std::fs::remove_dir_all(&n0_data).unwrap();
 
     // Restart with bootstrap=true still set (as a static config would be).
-    let n0b = spawn_node(dir.path(), 0, &p0, true, &seeds);
+    let n0b = spawn_node(dir.path(), 0, &p0, true, false, &seeds);
     wait_healthy(&n0b.public_addr, Duration::from_secs(30)).await;
 
     // The guard must have logged the refusal...

@@ -123,6 +123,13 @@ pub struct Config {
     /// every group. Exactly one node bootstraps, exactly once; all others
     /// join by announcing to `seed_nodes` and being adopted by reconcilers.
     pub bootstrap: bool,
+    /// Allow bootstrap on an empty disk even when `seed_nodes` are configured
+    /// but none can be reached. Without this, a bootstrap-configured node
+    /// that cannot confirm its cluster is absent refuses to initialize (fail
+    /// closed), so a transient partition cannot found a second lock authority.
+    /// Set only when intentionally standing up the very first node of a new
+    /// cluster that has no reachable peers yet.
+    pub force_bootstrap: bool,
     /// Raft snapshot interval (entries).
     pub raft_snapshot_interval_entries: u64,
     /// Raft minimum log entries before snapshot.
@@ -235,6 +242,7 @@ impl Default for Config {
             request_timeout_ms: 30_000,
             max_concurrent_requests_per_connection: 256,
             bootstrap: false,
+            force_bootstrap: false,
             raft_snapshot_interval_entries: 10_000,
             raft_snapshot_min_log_entries: 5_000,
             raft_snapshot_max_bytes: 512 * 1024 * 1024,
@@ -299,6 +307,7 @@ struct FileConfig {
     request_timeout_ms: Option<u64>,
     max_concurrent_requests_per_connection: Option<usize>,
     bootstrap: Option<bool>,
+    force_bootstrap: Option<bool>,
     raft_snapshot_interval_entries: Option<u64>,
     raft_snapshot_min_log_entries: Option<u64>,
     raft_snapshot_max_bytes: Option<u64>,
@@ -603,6 +612,7 @@ fn apply_file(cfg: &mut Config, file: FileConfig) {
     apply!(request_timeout_ms);
     apply!(max_concurrent_requests_per_connection);
     apply!(bootstrap);
+    apply!(force_bootstrap);
     apply!(raft_snapshot_interval_entries);
     apply!(raft_snapshot_min_log_entries);
     apply!(raft_snapshot_max_bytes);
@@ -719,6 +729,9 @@ fn apply_env(cfg: &mut Config) -> anyhow::Result<()> {
     }
     if let Some(v) = env_parse::<bool>("PATHLOCKD_BOOTSTRAP")? {
         cfg.bootstrap = v;
+    }
+    if let Some(v) = env_parse::<bool>("PATHLOCKD_FORCE_BOOTSTRAP")? {
+        cfg.force_bootstrap = v;
     }
     if let Some(v) = env_parse::<u64>("PATHLOCKD_RAFT_SNAPSHOT_INTERVAL_ENTRIES")? {
         cfg.raft_snapshot_interval_entries = v;

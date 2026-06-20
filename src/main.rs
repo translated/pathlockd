@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -151,8 +152,10 @@ async fn main() -> anyhow::Result<()> {
                 .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
                 .tcp_keepalive(Some(TCP_KEEPALIVE))
-                .add_service(RaftTransportServer::with_interceptor(
-                    transport,
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    RaftTransportServer::new(transport).max_decoding_message_size(
+                        pathlockd::raft::network::MAX_INTERNAL_MESSAGE_BYTES,
+                    ),
                     move |request: Request<()>| {
                         pathlockd::raft::network::authenticate_internal_request(
                             &request,
@@ -233,6 +236,19 @@ async fn main() -> anyhow::Result<()> {
                 "bootstrap requested on an empty disk, but an existing cluster \
                  answered through the seeds — refusing to initialize a second \
                  cluster; joining the existing one instead"
+            );
+        } else if !cfg.seed_nodes.is_empty() && !cfg.force_bootstrap {
+            // Fail closed: an empty-disk bootstrap node that cannot reach any
+            // seed must not initialize a new cluster, since a transient
+            // partition (not a truly absent cluster) would otherwise create a
+            // second lock authority. An operator who genuinely intends to
+            // found a new cluster despite configured seeds sets
+            // `force_bootstrap = true`.
+            anyhow::bail!(
+                "bootstrap requested on an empty disk, but no seed node \
+                 answered; refusing to initialize a second cluster. Set \
+                 force_bootstrap=true only if you are intentionally founding \
+                 the first node of a brand-new cluster with no reachable peers"
             );
         } else {
             let voters = std::collections::BTreeMap::from([(node_id, node_meta.clone())]);
@@ -424,6 +440,11 @@ fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembe
 /// spent, so GC throughput adapts to the write rate.
 const GC_PASS_BUDGET: Duration = Duration::from_millis(250);
 
+/// Round-robin cursor so a perpetually backlogged first group cannot starve
+/// every later group's queue-expiry grants and physical cleanup. Each pass
+/// starts where the previous one stopped.
+static GC_START_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
 fn spawn_group_gc(router: Arc<Router>, broadcaster: Broadcaster, interval_secs: u64, batch: u32) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -445,8 +466,18 @@ async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32
     let mut total_scanned = 0u64;
     let mut total_reclaimed = 0u64;
     // Only the groups this node currently leads: the leader proposes the
-    // sweep; every replica applies it identically.
-    'groups: for group in router.led_groups() {
+    // sweep; every replica applies it identically. Rotate the starting point
+    // each pass so one chronically backlogged group cannot consume the whole
+    // budget and stall cleanup elsewhere.
+    let mut led = router.led_groups();
+    if led.is_empty() {
+        otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), true);
+        return;
+    }
+    let offset = GC_START_OFFSET.load(Ordering::Relaxed) % led.len();
+    led.rotate_left(offset);
+    let mut next_offset = offset;
+    'groups: for (i, group) in led.iter().copied().enumerate() {
         loop {
             match router.gc_sweep(group, batch).await {
                 Ok((scanned, reclaimed, granted)) => {
@@ -456,6 +487,9 @@ async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32
                     total_scanned += u64::from(scanned);
                     total_reclaimed += reclaimed;
                     if scanned < batch {
+                        // This group is caught up; advance the round-robin
+                        // cursor past it for the next pass.
+                        next_offset = (offset + i + 1) % led.len();
                         break;
                     }
                     if started.elapsed() >= GC_PASS_BUDGET {
@@ -466,11 +500,13 @@ async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32
                     otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), false);
                     // Lost leadership mid-pass or backpressure: retry next tick.
                     warn!(error = %e, group, "group gc sweep failed; retrying next tick");
+                    GC_START_OFFSET.store(next_offset, Ordering::Relaxed);
                     return;
                 }
             }
         }
     }
+    GC_START_OFFSET.store(next_offset, Ordering::Relaxed);
     otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), true);
 }
 

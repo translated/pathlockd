@@ -608,7 +608,69 @@ pub fn grant_sweep<F>(tx: &mut WriteTxn, mut try_acquire: F) -> anyhow::Result<V
 where
     F: FnMut(&mut WriteTxn, &str, &AcquireArgs, LockPolicy) -> anyhow::Result<AcquireOutcome>,
 {
-    let entries = scan(tx)?;
+    run_grant_sweep(scan(tx)?, tx, &mut try_acquire)
+}
+
+/// Targeted variant of [`grant_sweep`]: instead of scanning the whole queue,
+/// only consider waiters whose NEW paths intersect `freed_scoped` (the scoped
+/// paths just freed by a release / inline release / expiry), located via the
+/// per-path queue indexes. A waiter that could now be granted always conflicts
+/// with at least one freed path (its former blocker), so it is in this
+/// candidate set; earlier waiters that do not intersect `freed_scoped` were not
+/// unblocked and stay queued without being re-tried. FIFO ordering and the
+/// reservation that prevents barging are preserved because the candidate set is
+/// processed in ascending-seq order with the same reservation as the full
+/// sweep.
+///
+/// `freed_scoped` are namespaced (`scoped_path`) strings.
+pub fn grant_sweep_for_paths<F>(
+    tx: &mut WriteTxn,
+    freed_scoped: &[String],
+    try_acquire: F,
+) -> anyhow::Result<Vec<String>>
+where
+    F: FnMut(&mut WriteTxn, &str, &AcquireArgs, LockPolicy) -> anyhow::Result<AcquireOutcome>,
+{
+    if freed_scoped.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut candidate_seqs: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for path in freed_scoped {
+        collect_exact_path_seqs(tx, path, &mut candidate_seqs)?;
+        for ancestor in get_ancestors(path) {
+            collect_exact_path_seqs(tx, &ancestor, &mut candidate_seqs)?;
+        }
+        collect_prefixed_path_seqs(tx, &descendant_index_prefix(path), &mut candidate_seqs)?;
+    }
+    if candidate_seqs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut entries = Vec::new();
+    for seq in candidate_seqs {
+        if let Some(entry) = read_entry(tx, seq)? {
+            entries.push(entry);
+        }
+    }
+    run_grant_sweep(entries, tx, &mut { try_acquire })
+}
+
+/// Shared try/reserve loop for both the full and targeted sweeps. `entries`
+/// are already collected and ordered by the caller (ascending seq).
+///
+/// A waiter whose `try_acquire` returns a conflict reason that is neither
+/// queueable nor a stale-fence wake is *permanently ungrantable* (e.g.
+/// `InvalidPermits`, `ReadLocksDisabled`, `MissingSemaphore` — a malformed or
+/// mode-forbidden request that admission parked before engine validation). It
+/// is dropped from the queue rather than reserved, so it cannot wedge the FIFO
+/// path behind it until its TTL expires.
+fn run_grant_sweep<F>(
+    entries: Vec<QueueEntry>,
+    tx: &mut WriteTxn,
+    try_acquire: &mut F,
+) -> anyhow::Result<Vec<String>>
+where
+    F: FnMut(&mut WriteTxn, &str, &AcquireArgs, LockPolicy) -> anyhow::Result<AcquireOutcome>,
+{
     let mut notify = Vec::new();
     let mut reserved = ReservedPaths::default();
     for entry in entries {
@@ -625,10 +687,17 @@ where
                 reason: Reason::StaleFencingToken,
                 ..
             } => {
-                // Wake to refresh-and-retry; stays queued and reserved so later
-                // waiters keep their place behind it.
                 reserved.insert(&entry.namespace, &entry.args, entry.policy.algorithm);
                 notify.push(entry.owner);
+            }
+            AcquireOutcome::Conflict { reason, .. } if !reason.is_queueable() => {
+                dequeue(tx, &entry.owner)?;
+            }
+            AcquireOutcome::Lost { .. } => {
+                // A waiter whose retried acquire is now `Lost` (e.g. its held
+                // re-validation target is gone) can never be granted; drop it
+                // so it does not reserve paths and wedge later waiters.
+                dequeue(tx, &entry.owner)?;
             }
             _ => {
                 reserved.insert(&entry.namespace, &entry.args, entry.policy.algorithm);

@@ -40,9 +40,25 @@ pub struct EventLog {
     broadcaster: Broadcaster,
     capacity: usize,
     retention: Duration,
-    owners: Mutex<HashMap<String, Arc<OwnerLog>>>,
+    owners: Mutex<HashMap<String, OwnerEntry>>,
     last_evict: Mutex<Instant>,
 }
+
+/// One owner's retained log plus its persistent id counter. The counter is
+/// kept across evictions (the log is dropped after the retention window, the
+/// counter is not) so a reconnecting client's `Last-Event-ID` from a previous
+/// incarnation never exceeds the ids a fresh log issues — which would otherwise
+/// suppress new events until the counter caught up.
+struct OwnerEntry {
+    log: Option<Arc<OwnerLog>>,
+    seq: Arc<AtomicU64>,
+}
+
+/// Soft cap on remembered per-owner id counters. Each is one `AtomicU64`, so
+/// retained counters are cheap; beyond this bound idle entries (no live log)
+/// are dropped entirely, which only re-introduces id reset for owners unseen
+/// in a long time under extreme churn.
+const MAX_REMEMBERED_OWNERS: usize = 65_536;
 
 impl EventLog {
     pub fn new(broadcaster: Broadcaster, capacity: usize, retention: Duration) -> Arc<Self> {
@@ -69,7 +85,7 @@ impl EventLog {
         log
     }
 
-    fn owners(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<OwnerLog>>> {
+    fn owners(&self) -> std::sync::MutexGuard<'_, HashMap<String, OwnerEntry>> {
         self.owners.lock().unwrap_or_else(|p| p.into_inner())
     }
 
@@ -79,16 +95,23 @@ impl EventLog {
     pub fn attach(self: &Arc<Self>, owner: &str) -> Attach {
         self.evict_expired();
         let mut owners = self.owners();
-        let log = owners
+        let entry = owners
             .entry(owner.to_string())
-            .or_insert_with(|| OwnerLog::spawn(self, owner))
-            .clone();
+            .or_insert_with(|| OwnerEntry {
+                log: None,
+                seq: Arc::new(AtomicU64::new(0)),
+            });
+        if entry.log.is_none() {
+            entry.log = Some(OwnerLog::spawn(self, owner, entry.seq.clone()));
+        }
+        let log = entry.log.clone().expect("log just spawned");
         log.refs.fetch_add(1, Ordering::AcqRel);
         Attach { log }
     }
 
     /// Drop owner logs whose last client detached longer ago than the retention
-    /// window. Cheap and lazy: runs on every attach.
+    /// window. Cheap and lazy: runs on every attach. The per-owner id counter
+    /// is retained so reconnects resume correctly.
     fn evict_expired(&self) {
         let mut last = self.last_evict.lock().unwrap_or_else(|p| p.into_inner());
         if last.elapsed() < Duration::from_secs(1) {
@@ -97,27 +120,50 @@ impl EventLog {
         *last = Instant::now();
         drop(last);
         let mut owners = self.owners();
-        owners.retain(|_, log| {
-            if log.refs.load(Ordering::Acquire) > 0 {
+        owners.retain(|_, entry| {
+            if let Some(log) = &entry.log {
+                if log.refs.load(Ordering::Acquire) > 0 {
+                    return true;
+                }
+                let keep = log
+                    .idle_since
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .map(|t| t.elapsed() < self.retention)
+                    .unwrap_or(true);
+                if !keep {
+                    log.shutdown.notify_waiters();
+                    entry.log = None;
+                }
                 return true;
             }
-            let keep = log
-                .idle_since
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .map(|t| t.elapsed() < self.retention)
-                .unwrap_or(true);
-            if !keep {
-                log.shutdown.notify_waiters();
-            }
-            keep
+            true
         });
+        if owners.len() > MAX_REMEMBERED_OWNERS {
+            // Over budget: drop the cheapest remembered counters (those with
+            // no live log) to bound memory under owner churn.
+            let excess = owners.len() - MAX_REMEMBERED_OWNERS;
+            let mut to_drop: Vec<String> = owners
+                .iter()
+                .filter(|(_, e)| e.log.is_none())
+                .take(excess)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in to_drop.drain(..) {
+                owners.remove(&k);
+            }
+        }
     }
 }
 
 /// One owner's ring plus the synchronization a reader needs to wait for more.
 pub struct OwnerLog {
     capacity: usize,
+    /// Per-owner monotonic id source, shared with the registry so it survives
+    /// eviction of this log. Ids never restart at zero for an owner the
+    /// registry remembers, so a reconnecting `Last-Event-ID` always stays
+    /// below the next issued id.
+    seq: Arc<AtomicU64>,
     last_id: AtomicU64,
     ring: Mutex<VecDeque<StoredEvent>>,
     /// Woken whenever a new event is appended.
@@ -129,9 +175,10 @@ pub struct OwnerLog {
 }
 
 impl OwnerLog {
-    fn spawn(log: &Arc<EventLog>, owner: &str) -> Arc<OwnerLog> {
+    fn spawn(log: &Arc<EventLog>, owner: &str, seq: Arc<AtomicU64>) -> Arc<OwnerLog> {
         let owner_log = Arc::new(OwnerLog {
             capacity: log.capacity,
+            seq,
             last_id: AtomicU64::new(0),
             ring: Mutex::new(VecDeque::new()),
             notify: Notify::new(),
@@ -149,7 +196,8 @@ impl OwnerLog {
     }
 
     fn push(&self, event: Event) {
-        let id = self.last_id.fetch_add(1, Ordering::AcqRel) + 1;
+        let id = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        self.last_id.store(id, Ordering::Release);
         let mut ring = self.ring.lock().unwrap_or_else(|p| p.into_inner());
         ring.push_back(StoredEvent { id, event });
         while ring.len() > self.capacity {

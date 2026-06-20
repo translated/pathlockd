@@ -10,11 +10,13 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::Router;
 use bytes::{Buf, Bytes, BytesMut};
 use http_body_util::BodyExt;
+use tokio::sync::Semaphore;
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
@@ -25,6 +27,19 @@ const MAX_REQUESTS_PER_CONNECTION: usize = 256;
 
 type H3Stream = h3::server::RequestStream<h3_quinn::BidiStream<Bytes>, Bytes>;
 
+/// Global budgets shared with the TCP facade so HTTP/3 cannot consume
+/// unbounded connections, streams, or body bytes while the gated router is
+/// unreachable. The connection permit is held for the QUIC connection's
+/// lifetime; the stream permit is held for the whole request (including a
+/// streaming SSE response), so active SSE-over-h3 streams count against the
+/// global active-stream budget.
+#[derive(Clone)]
+pub struct H3Limits {
+    pub connections: Arc<Semaphore>,
+    pub streams: Arc<Semaphore>,
+    pub body_timeout: Duration,
+}
+
 /// Bind the QUIC endpoint (surfacing bind errors synchronously) and spawn the
 /// accept loop.
 pub fn spawn(
@@ -32,17 +47,29 @@ pub fn spawn(
     server_config: quinn::ServerConfig,
     app: Router,
     zero_rtt: bool,
+    limits: H3Limits,
 ) -> anyhow::Result<()> {
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
-    tokio::spawn(accept_loop(endpoint, app, zero_rtt));
+    tokio::spawn(accept_loop(endpoint, app, zero_rtt, limits));
     Ok(())
 }
 
-async fn accept_loop(endpoint: quinn::Endpoint, app: Router, zero_rtt: bool) {
-    while let Some(incoming) = endpoint.accept().await {
+async fn accept_loop(endpoint: quinn::Endpoint, app: Router, zero_rtt: bool, limits: H3Limits) {
+    loop {
+        // Global connection budget: a permit per QUIC connection, held until
+        // the connection ends. Without this, an unbounded number of HTTP/3
+        // connections could be accepted.
+        let Ok(conn_permit) = limits.connections.clone().acquire_owned().await else {
+            continue;
+        };
+        let Some(incoming) = endpoint.accept().await else {
+            break;
+        };
         let app = app.clone();
+        let limits = limits.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(incoming, app, zero_rtt).await {
+            let _conn_permit = conn_permit;
+            if let Err(e) = handle_connection(incoming, app, zero_rtt, limits).await {
                 debug!(error = %e, "h3 connection ended");
             }
         });
@@ -53,6 +80,7 @@ async fn handle_connection(
     incoming: quinn::Incoming,
     app: Router,
     zero_rtt: bool,
+    limits: H3Limits,
 ) -> anyhow::Result<()> {
     let connecting = incoming.accept()?;
 
@@ -83,19 +111,45 @@ async fn handle_connection(
     loop {
         match h3_conn.accept().await {
             Ok(Some(resolver)) => {
-                let (req, stream) = match resolver.resolve_request().await {
+                let (req, mut stream) = match resolver.resolve_request().await {
                     Ok(pair) => pair,
                     Err(e) => {
                         debug!(error = %e, "h3 request resolve failed");
                         continue;
                     }
                 };
+                // Tag replayability at the moment the stream was accepted
+                // (i.e. when its early data arrived), not when the request
+                // task finally runs. A request delayed behind the
+                // per-connection semaphore would otherwise see
+                // `handshake_done` flip true mid-flight and run a replayed
+                // mutation. Once the handshake completes no further streams
+                // are early-data, so a stream accepted before that point is
+                // reliably replayable; a stream accepted after is reliably
+                // not (a delayed flag flip can only cause a safe false
+                // positive — a 425 the client retries on the established
+                // connection).
+                let early_data = !handshake_done.load(Ordering::SeqCst);
                 let app = app.clone();
-                let flag = handshake_done.clone();
                 let permit = requests.clone().acquire_owned().await?;
+                // Global active-stream budget: held for the whole request,
+                // including a streaming SSE response, so HTTP/3 SSE streams
+                // count against the same budget as TCP requests.
+                let stream_permit = limits.streams.clone().acquire_owned().await;
+                if stream_permit.is_err() {
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                        .body(())?;
+                    stream.send_response(resp).await?;
+                    stream.finish().await?;
+                    continue;
+                }
+                let body_timeout = limits.body_timeout;
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_request(req, stream, app, flag).await {
+                    let _stream_permit = stream_permit;
+                    if let Err(e) = handle_request(req, stream, app, early_data, body_timeout).await
+                    {
                         debug!(error = %e, "h3 request failed");
                     }
                 });
@@ -114,14 +168,15 @@ async fn handle_request(
     req: http::Request<()>,
     mut stream: H3Stream,
     app: Router,
-    handshake_done: Arc<AtomicBool>,
+    early_data: bool,
+    body_timeout: Duration,
 ) -> anyhow::Result<()> {
     let (parts, _) = req.into_parts();
 
     // 0-RTT safety gate: never run a mutation from replayable early data.
-    if !handshake_done.load(Ordering::SeqCst)
-        && !rest::is_read_only_path(&parts.method, parts.uri.path())
-    {
+    // `early_data` was captured when the stream was accepted (above), so a
+    // replayed mutation cannot sneak through after the handshake completes.
+    if early_data && !rest::is_read_only_path(&parts.method, parts.uri.path()) {
         let resp = http::Response::builder()
             .status(http::StatusCode::TOO_EARLY)
             .body(())
@@ -131,23 +186,35 @@ async fn handle_request(
         return Ok(());
     }
 
-    // Collect the request body (JSON bodies are small).
+    // Collect the request body (JSON bodies are small), bounded by a
+    // wall-clock timeout so a trickle client cannot hold a stream slot open.
     let mut body = BytesMut::new();
-    while let Some(mut chunk) = stream.recv_data().await? {
-        while chunk.has_remaining() {
-            let slice = chunk.chunk();
-            if body.len().saturating_add(slice.len()) > MAX_REQUEST_BODY_BYTES {
-                let resp = http::Response::builder()
-                    .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                    .body(())?;
-                stream.send_response(resp).await?;
-                stream.finish().await?;
-                return Ok(());
+    let body_read = async {
+        while let Some(mut chunk) = stream.recv_data().await? {
+            while chunk.has_remaining() {
+                let slice = chunk.chunk();
+                if body.len().saturating_add(slice.len()) > MAX_REQUEST_BODY_BYTES {
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::PAYLOAD_TOO_LARGE)
+                        .body(())?;
+                    stream.send_response(resp).await?;
+                    stream.finish().await?;
+                    return Ok(());
+                }
+                body.extend_from_slice(slice);
+                let n = slice.len();
+                chunk.advance(n);
             }
-            body.extend_from_slice(slice);
-            let n = slice.len();
-            chunk.advance(n);
         }
+        Ok::<(), anyhow::Error>(())
+    };
+    if tokio::time::timeout(body_timeout, body_read).await.is_err() {
+        let resp = http::Response::builder()
+            .status(http::StatusCode::REQUEST_TIMEOUT)
+            .body(())?;
+        stream.send_response(resp).await?;
+        stream.finish().await?;
+        return Ok(());
     }
 
     // Rebuild as an axum request and run it through the shared router.

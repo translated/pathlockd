@@ -62,15 +62,17 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
         retention,
     );
     let state = AppState { svc, log };
+    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
+    let request_permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_REQUESTS));
     let request_gate = WebRequestGate {
-        permits: std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_REQUESTS)),
+        permits: request_permits.clone(),
         timeout: Duration::from_millis(cfg.request_timeout_ms),
     };
     let app: Router = rest::routes()
         .merge(sse::routes())
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
-            request_gate,
+            request_gate.clone(),
             limit_web_request,
         ))
         .with_state(state);
@@ -82,12 +84,22 @@ pub async fn spawn(cfg: &Config, svc: PathLockService) -> anyhow::Result<()> {
         .with_context(|| format!("binding web_listen {tcp_addr}"))?;
     let acceptor = TlsAcceptor::from(web_tls.tcp.clone());
     info!(%tcp_addr, "web facade listening (HTTP/1.1 + HTTP/2)");
-    tokio::spawn(serve_tcp(listener, acceptor, app.clone()));
+    tokio::spawn(serve_tcp(
+        listener,
+        acceptor,
+        app.clone(),
+        connections.clone(),
+    ));
 
     // --- QUIC: HTTP/3 ---
     if cfg.h3_enabled() {
         let h3_addr: SocketAddr = cfg.h3_listen.parse()?;
-        h3::spawn(h3_addr, web_tls.quic, app, cfg.web_zero_rtt)
+        let limits = h3::H3Limits {
+            connections,
+            streams: request_permits,
+            body_timeout: Duration::from_millis(cfg.request_timeout_ms),
+        };
+        h3::spawn(h3_addr, web_tls.quic, app, cfg.web_zero_rtt, limits)
             .with_context(|| format!("binding h3_listen {h3_addr}"))?;
         info!(%h3_addr, "web facade listening (HTTP/3)");
     }
@@ -108,6 +120,11 @@ async fn limit_web_request(
     let Ok(permit) = gate.permits.try_acquire_owned() else {
         return axum::http::StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    // The permit bounds in-flight *processing*. A streaming SSE response
+    // returns immediately and streams indefinitely, so the permit is released
+    // here; active SSE connections are bounded separately by the shared
+    // connection budget (`MAX_WEB_CONNECTIONS`) on TCP and by the per-stream
+    // permit held in the HTTP/3 request task, which covers the whole stream.
     let response = tokio::time::timeout(gate.timeout, next.run(request)).await;
     drop(permit);
     match response {
@@ -116,8 +133,12 @@ async fn limit_web_request(
     }
 }
 
-async fn serve_tcp(listener: TcpListener, acceptor: TlsAcceptor, app: Router) {
-    let connections = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_WEB_CONNECTIONS));
+async fn serve_tcp(
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    app: Router,
+    connections: std::sync::Arc<tokio::sync::Semaphore>,
+) {
     loop {
         let (stream, _peer) = match listener.accept().await {
             Ok(pair) => pair,

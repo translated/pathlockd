@@ -102,6 +102,7 @@ fn spawn_node(
     ordinal: u32,
     ports: &NodePorts,
     bootstrap: bool,
+    force_bootstrap: bool,
     seeds: &[u16],
     replication_factor: u32,
 ) -> Node {
@@ -125,6 +126,7 @@ internal_auth_token = "load-test-internal-auth-token-32"
 group_count = {groups}
 replication_factor = {rf}
 bootstrap = {bootstrap}
+force_bootstrap = {force_bootstrap}
 seed_nodes = [{seed_list}]
 stability_window_secs = 2
 eviction_window_secs = 4
@@ -932,7 +934,7 @@ async fn single_node_load() {
     let _serial = serial_guard().await;
     let dir = tempfile::tempdir().unwrap();
     let p = alloc_node_ports();
-    let n = spawn_node(dir.path(), 0, &p, true, &[], 1);
+    let n = spawn_node(dir.path(), 0, &p, true, false, &[], 1);
     wait_healthy(&n.public_addr, Duration::from_secs(20)).await;
 
     let m = run_load(vec![n.public_addr.clone()], "single-node").await;
@@ -959,10 +961,10 @@ async fn three_node_load() {
     let p2 = alloc_node_ports();
     let seeds = [p0.gossip, p1.gossip, p2.gossip];
 
-    let n0 = spawn_node(dir.path(), 0, &p0, true, &seeds, 3);
+    let n0 = spawn_node(dir.path(), 0, &p0, true, true, &seeds, 3);
     wait_healthy(&n0.public_addr, Duration::from_secs(30)).await;
-    let n1 = spawn_node(dir.path(), 1, &p1, false, &seeds, 3);
-    let n2 = spawn_node(dir.path(), 2, &p2, false, &seeds, 3);
+    let n1 = spawn_node(dir.path(), 1, &p1, false, false, &seeds, 3);
+    let n2 = spawn_node(dir.path(), 2, &p2, false, false, &seeds, 3);
     wait_healthy(&n1.public_addr, Duration::from_secs(30)).await;
     wait_healthy(&n2.public_addr, Duration::from_secs(30)).await;
 

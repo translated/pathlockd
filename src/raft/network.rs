@@ -36,6 +36,15 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_SNAPSHOT_CHUNK: usize = 1 << 20;
 pub const INTERNAL_AUTH_HEADER: &str = "x-pathlockd-cluster-token";
 
+/// Maximum encoded bytes accepted on the internal node-to-node transport.
+/// The public `AcquireStream` merges up to 4 MiB of encoded request before
+/// wrapping it in a bincode `Command` inside a `ForwardRequest`/`RaftFrame`, so
+/// the internal transport must accept comfortably more than the public 4 MiB
+/// limit or a large request that the leader accepts can fail when forwarded
+/// or replicated. Generous headroom keeps the internal cap from becoming the
+/// de facto public cap.
+pub const MAX_INTERNAL_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
 pub fn authorize_internal_request<T>(
     request: &mut tonic::Request<T>,
     token: &str,
@@ -174,7 +183,9 @@ impl RaftClientConn {
             .pool
             .channel(self.target, &self.node.raft_addr)
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
-        Ok(RaftTransportClient::new(channel))
+        Ok(RaftTransportClient::new(channel)
+            .max_decoding_message_size(MAX_INTERNAL_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_INTERNAL_MESSAGE_BYTES))
     }
 
     fn frame<T: serde::Serialize>(&self, payload: &T) -> Result<RaftFrame, RPCError> {

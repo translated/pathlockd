@@ -34,6 +34,13 @@ gossip_send_queue_depth = 1024
 # adopted by the membership reconcilers (learner -> voter, automatically).
 bootstrap = true
 
+# Allow bootstrap on an empty disk even when seed_nodes are configured but
+# none can be reached. Without this, a bootstrap node that cannot confirm its
+# cluster is absent refuses to initialize (so a transient partition cannot
+# found a second lock authority). Set true only when intentionally standing
+# up the very first node of a new cluster with no reachable peers yet.
+force_bootstrap = false
+
 # Gossip addresses of existing members (required unless bootstrap = true).
 # seed_nodes = ["pathlockd-0.pathlockd:7946"]
 

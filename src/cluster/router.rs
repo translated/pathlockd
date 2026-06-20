@@ -79,6 +79,18 @@ pub struct NamespaceNotDrained {
     pub namespace: String,
 }
 
+/// A namespace-policy fan-out applied on some groups but not all. The owners
+/// whose locks were cleared (`cleared`) have already been force-released and
+/// must receive a KILLED event; the listed groups still hold the old policy
+/// and must be retried (the command is idempotent, so re-issuing converges
+/// without double-clearing the already-changed groups).
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("namespace policy partially applied; retry to converge failed groups {failed_groups:?}")]
+pub struct NamespacePolicyPartial {
+    pub cleared: Vec<String>,
+    pub failed_groups: Vec<GroupId>,
+}
+
 /// A command the state machine deterministically refused (none of its writes
 /// committed). A client/request fault, not a server fault.
 #[derive(Debug, Clone, thiserror::Error)]
@@ -727,6 +739,58 @@ impl Router {
         Ok(responses)
     }
 
+    /// Apply one command per group, never bailing on a per-group error: every
+    /// group is attempted, and failures are retried a bounded number of times
+    /// before being reported. Returns the successful responses plus the groups
+    /// that still failed. Used by namespace-policy fan-outs, where bailing
+    /// after the first error would cancel the remaining groups and leave a
+    /// partially-committed policy with no consistent retry point.
+    async fn fanout_apply_resilient<F>(
+        &self,
+        groups: Vec<GroupId>,
+        build: F,
+    ) -> anyhow::Result<(Vec<ApplyResponse>, Vec<GroupId>)>
+    where
+        F: Fn(&Self, GroupId) -> Command + Send + Sync,
+    {
+        use futures::StreamExt;
+        const MAX_RETRIES: usize = 3;
+        let build = Arc::new(build);
+        let mut remaining = groups;
+        let mut responses: Vec<ApplyResponse> = Vec::new();
+        for attempt in 0..=MAX_RETRIES {
+            if remaining.is_empty() {
+                break;
+            }
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let build = build.clone();
+            let results: Vec<Result<(GroupId, ApplyResponse), GroupId>> =
+                futures::stream::iter(remaining.iter().copied())
+                    .map(|group| {
+                        let build = build.clone();
+                        async move {
+                            self.apply_to(group, build(self, group))
+                                .await
+                                .map(|resp| (group, resp))
+                                .map_err(|_| group)
+                        }
+                    })
+                    .buffer_unordered(FANOUT_CONCURRENCY)
+                    .collect()
+                    .await;
+            remaining = Vec::new();
+            for r in results {
+                match r {
+                    Ok((_, resp)) => responses.push(resp),
+                    Err(g) => remaining.push(g),
+                }
+            }
+        }
+        Ok((responses, remaining))
+    }
+
     async fn apply_inner(&self, group: GroupId, cmd: Command) -> anyhow::Result<ApplyResponse> {
         for _hop in 0..MAX_FORWARD_HOPS {
             // Fast path: this node hosts the group and may be its leader.
@@ -799,7 +863,9 @@ impl Router {
             .pool
             .channel(*leader_id, &leader.raft_addr)
             .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
-        let mut client = RaftTransportClient::new(channel);
+        let mut client = RaftTransportClient::new(channel)
+            .max_decoding_message_size(crate::raft::network::MAX_INTERNAL_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::raft::network::MAX_INTERNAL_MESSAGE_BYTES);
         let command = bincode::serde::encode_to_vec(cmd, bincode::config::standard())
             .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
         let mut request = tonic::Request::new(ForwardRequest { group, command });
@@ -922,7 +988,9 @@ impl Router {
             .pool
             .channel(*target_id, &target.raft_addr)
             .map_err(|e| ForwardError::Unreachable(e.to_string()))?;
-        let mut client = RaftTransportClient::new(channel);
+        let mut client = RaftTransportClient::new(channel)
+            .max_decoding_message_size(crate::raft::network::MAX_INTERNAL_MESSAGE_BYTES)
+            .max_encoding_message_size(crate::raft::network::MAX_INTERNAL_MESSAGE_BYTES);
         let read_op = bincode::serde::encode_to_vec(op, bincode::config::standard())
             .map_err(|e| ForwardError::Other(format!("encode: {e}")))?;
         let mut request = tonic::Request::new(ForwardReadRequest { group, read_op });
@@ -1262,15 +1330,42 @@ impl Router {
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<RenewOutcome> {
         let declared = !domains.is_empty();
+        // Resolve declared domains to the groups their leases actually live in.
+        // A namespaced domain (explicit root or fallback like `h:/a`) is placed
+        // directly: the client echoes the resolved namespace from Acquire, so
+        // hashing that string is the same placement Acquire used. A bare
+        // handler is only single-group when routing does not shard it
+        // (`routing_prefix_segments == 0`) or when an explicit namespace root
+        // covers the whole handler; otherwise the handler spans every shard
+        // group and a handler-wide renew must broadcast to all of them —
+        // hashing the bare handler would target the wrong group and report
+        // `Lost` while the real lease stays unrenewed and expires.
+        let mut broadcast = !declared;
         let groups: Vec<GroupId> = if declared {
+            self.refresh_namespace_cache_if_stale().await.ok();
             let mut set: std::collections::BTreeSet<GroupId> = std::collections::BTreeSet::new();
             let mut seen = std::collections::HashSet::new();
             for domain in domains {
-                if seen.insert(domain) {
+                if !seen.insert(domain) {
+                    continue;
+                }
+                if domain.contains(':') || self.routing.routing_prefix_segments == 0 {
                     set.insert(place_domain(domain, self.routing.group_count));
+                } else {
+                    let route = self.resolve_namespace_cached(&format!("{domain}:/"));
+                    if route.explicit && route.namespace == domain.as_str() {
+                        set.insert(place_domain(domain, self.routing.group_count));
+                    } else {
+                        broadcast = true;
+                        break;
+                    }
                 }
             }
-            set.into_iter().collect()
+            if broadcast {
+                self.lock_groups().collect()
+            } else {
+                set.into_iter().collect()
+            }
         } else {
             self.lock_groups().collect()
         };
@@ -1308,8 +1403,11 @@ impl Router {
                     // group. In a broadcast renew that is mere absence; in a
                     // group the client *declared* it holds a lease in, the
                     // lease expired wholesale — that is loss, and reporting
-                    // Ok would hide it behind another domain's renewal.
-                    if !path.is_empty() || declared {
+                    // Ok would hide it behind another domain's renewal. A
+                    // broadcast triggered by an ambiguous bare-handler domain
+                    // is treated like the no-domains broadcast: empty-path
+                    // results are absence, not loss.
+                    if !path.is_empty() || (declared && !broadcast) {
                         return Ok(RenewOutcome::Lost { path, reason });
                     }
                 }
@@ -1477,24 +1575,36 @@ impl Router {
                 .await?;
         }
 
-        let lock_cmds: Vec<(GroupId, Command)> = self
-            .lock_groups()
-            .map(|group| {
-                (
-                    group,
-                    self.command_with_idempotency(
-                        Op::SetNamespacePolicy {
-                            namespace: namespace.to_string(),
-                            algorithm,
-                        },
-                        idempotency_key,
-                    ),
+        let lock_groups: Vec<GroupId> = self.lock_groups().collect();
+        let namespace_owned = namespace.to_string();
+        let (responses, failed) = self
+            .fanout_apply_resilient(lock_groups, |router, _group| {
+                router.command_with_idempotency(
+                    Op::SetNamespacePolicy {
+                        namespace: namespace_owned.clone(),
+                        algorithm,
+                    },
+                    idempotency_key,
                 )
             })
-            .collect();
+            .await?;
         let mut cleared: BTreeSet<String> = BTreeSet::new();
-        for resp in self.fanout_apply(lock_cmds).await? {
+        for resp in responses {
             collect_cleared(resp, &mut cleared)?;
+        }
+        // Only commit the authoritative system-group policy once every lock
+        // group applied, so the routing table and the per-group policy epochs
+        // converge together. On partial failure the command is idempotent: an
+        // operator retry re-applies on the failed groups and is a cached no-op
+        // on the already-changed ones, then reaches here and commits the sys
+        // group. The owners already cleared still receive KILLED (carried by
+        // the partial error) so they are not silently dropped.
+        if !failed.is_empty() {
+            return Err(NamespacePolicyPartial {
+                cleared: cleared.into_iter().collect(),
+                failed_groups: failed,
+            }
+            .into());
         }
         collect_cleared(
             self.apply_to(
@@ -1539,23 +1649,28 @@ impl Router {
                 .await?;
         }
 
-        let lock_cmds: Vec<(GroupId, Command)> = self
-            .lock_groups()
-            .map(|group| {
-                (
-                    group,
-                    self.command_with_idempotency(
-                        Op::DeleteNamespacePolicy {
-                            namespace: namespace.to_string(),
-                        },
-                        idempotency_key,
-                    ),
+        let lock_groups: Vec<GroupId> = self.lock_groups().collect();
+        let namespace_owned = namespace.to_string();
+        let (responses, failed) = self
+            .fanout_apply_resilient(lock_groups, |router, _group| {
+                router.command_with_idempotency(
+                    Op::DeleteNamespacePolicy {
+                        namespace: namespace_owned.clone(),
+                    },
+                    idempotency_key,
                 )
             })
-            .collect();
+            .await?;
         let mut cleared: BTreeSet<String> = BTreeSet::new();
-        for resp in self.fanout_apply(lock_cmds).await? {
+        for resp in responses {
             collect_cleared(resp, &mut cleared)?;
+        }
+        if !failed.is_empty() {
+            return Err(NamespacePolicyPartial {
+                cleared: cleared.into_iter().collect(),
+                failed_groups: failed,
+            }
+            .into());
         }
         collect_cleared(
             self.apply_to(

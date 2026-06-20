@@ -9,6 +9,7 @@ use futures::StreamExt;
 use prost::Message as _;
 use tonic::{Request, Response, Status};
 
+use crate::cluster::router::NamespacePolicyPartial;
 use crate::cluster::router::Router;
 use crate::engine::{
     self, AcquireArgs, AcquireOutcome, AssertOutcome, CycleOutcome, LockAlgorithm, LockReq, Reason,
@@ -59,6 +60,12 @@ fn engine_err(e: anyhow::Error) -> Status {
         Status::unavailable(err.to_string())
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::NamespaceNotDrained>() {
         Status::failed_precondition(err.to_string())
+    } else if let Some(err) = e.downcast_ref::<crate::cluster::router::NamespacePolicyPartial>() {
+        // The policy fan-out partially committed: some groups cleared locks
+        // and need KILLED events (emitted by the caller, which still has the
+        // cleared list), while others need an operator retry. Surface as
+        // unavailable so the client retries the idempotent command.
+        Status::unavailable(err.to_string())
     } else if let Some(err) = e.downcast_ref::<crate::cluster::router::WriteQueueFull>() {
         // Honest backpressure: the writer is saturated; the client should
         // back off and retry rather than queue behind a 30s deadline.
@@ -633,8 +640,18 @@ impl PathLock for PathLockService {
                 let killed = self
                     .router
                     .set_namespace_policy(&req.namespace, algorithm, idempotency_key.as_deref())
-                    .await
-                    .map_err(engine_err)?;
+                    .await;
+                // A partial fan-out still force-cleared locks on the groups
+                // that succeeded; those owners must be KILLED even though the
+                // RPC returns an error so the operator can retry the rest.
+                if let Err(e) = &killed {
+                    if let Some(partial) = e.downcast_ref::<NamespacePolicyPartial>() {
+                        for owner in &partial.cleared {
+                            self.broadcaster.killed(owner);
+                        }
+                    }
+                }
+                let killed = killed.map_err(engine_err)?;
                 // The algorithm change dropped these owners' locks (held and/or
                 // queued); tell them to re-establish under the new policy.
                 for owner in &killed {
@@ -686,8 +703,15 @@ impl PathLock for PathLockService {
                 let killed = self
                     .router
                     .delete_namespace_policy(&req.namespace, idempotency_key.as_deref())
-                    .await
-                    .map_err(engine_err)?;
+                    .await;
+                if let Err(e) = &killed {
+                    if let Some(partial) = e.downcast_ref::<NamespacePolicyPartial>() {
+                        for owner in &partial.cleared {
+                            self.broadcaster.killed(owner);
+                        }
+                    }
+                }
+                let killed = killed.map_err(engine_err)?;
                 // Reverting to the default algorithm dropped these owners'
                 // locks; tell them to re-establish under the new policy.
                 for owner in &killed {

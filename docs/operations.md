@@ -32,6 +32,7 @@ Configuration is loaded from lowest to highest precedence:
 | `replication_factor` | `3` | Voters per Raft group (odd; auto-degrades to the node count and upgrades as nodes join) |
 | `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
 | `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
+| `force_bootstrap` | `false` | Allow `bootstrap` to initialize when `seed_nodes` are configured but unreachable. Fail-closed by default so a transient partition cannot found a second cluster; set `true` only for the first node of a brand-new cluster with no reachable peers |
 | `public_addr` / `raft_addr` | localhost | Addresses advertised to peers — must be reachable cluster-wide |
 | `internal_auth_token` | required | Shared secret for the internal Raft transport; use the same random value on every node (minimum 32 bytes) |
 | `gossip_addr` | `0.0.0.0:7946` | SWIM UDP bind; `gossip_advertise_addr` overrides the advertised ip:port |

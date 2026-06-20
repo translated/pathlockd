@@ -338,6 +338,51 @@ This release is **not** backward compatible:
   `CF_NAMESPACE_SETTINGS`, new per-path index on `CF_QUEUE`, and the new
   snapshot image format. **Start on a fresh `data_dir`**; an existing
   0.8.x volume will not open.
+- **Bootstrap is fail-closed when `seed_nodes` are configured** — a node
+  with `bootstrap = true` on an empty disk no longer initializes a new
+  cluster if its `seed_nodes` are configured but none can be reached,
+  preventing a transient partition from founding a second lock authority.
+  Operators standing up the very first node of a brand-new cluster with
+  preconfigured (but not-yet-running) seeds must set `force_bootstrap = true`
+  (env: `PATHLOCKD_FORCE_BOOTSTRAP=true`). A bootstrap node that *can* reach
+  an existing cluster still joins it, as before.
+- **HTTP/3 0-RTT replay gating hardened** — replayability is now tagged at
+  stream-acceptance time, closing a race where a mutation delayed behind the
+  per-connection semaphore could execute after the handshake completed.
+- **Internal transport message limit raised to 16 MiB** — large streamed
+  `Acquire` requests (up to the 4 MiB public cap) no longer fail when
+  forwarded or replicated. No client action required.
+
+## Fixes (this patch)
+
+- **Invalid requests can no longer wedge the FIFO queue** — a queued waiter
+  that the engine can never grant (e.g. a semaphore request with
+  zero/mismatched permits, or a read against a write-only namespace) is now
+  dropped from the queue on the next grant sweep instead of being reserved
+  indefinitely until its TTL expires.
+- **Grant sweeps are targeted, not full-queue** — a successful acquire that
+  frees nothing no longer scans the whole wait queue; releases and inline
+  releases only re-try waiters whose paths intersect the freed paths, via the
+  existing per-path indexes. This keeps acquire throughput from collapsing as
+  the queue grows.
+- **Legacy handler-targeted `Renew` no longer misses the lease's group** — a
+  bare-handler `domains` entry under sharded routing (`routing_prefix_segments
+  > 0`) now broadcasts instead of hashing the bare handler, so it cannot
+  report `LOST` while the real lease stays unrenewed and expires.
+- **Namespace policy changes no longer partially commit silently** — the
+  fan-out attempts every group (with retries) instead of bailing on the first
+  error, commits the system-group policy only once all lock groups applied,
+  and emits `KILLED` for owners cleared on the groups that succeeded even
+  when the RPC returns an error for the operator to retry.
+- **SSE resume no longer suppresses events after eviction** — per-owner event
+  ids are now retained across log evictions, so a reconnecting `Last-Event-ID`
+  from a previous incarnation never exceeds the ids a fresh log issues.
+- **GC no longer starves later Raft groups** — the per-pass budget now starts
+  from a round-robin cursor, so a chronically backlogged first group cannot
+  block queue-expiry grants and cleanup elsewhere.
+- **HTTP/3 connection/stream/body budgets added** — global connection and
+  active-stream semaphores and a body-read timeout bound HTTP/3 resource use
+  (including SSE-over-HTTP/3), shared with the TCP facade.
 
 ## Artifacts (Linux amd64 and arm64)
 
