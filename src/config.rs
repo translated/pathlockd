@@ -83,8 +83,18 @@ pub struct Config {
     pub gossip_send_queue_depth: usize,
     /// Seed nodes for initial cluster bootstrap.
     pub seed_nodes: Vec<String>,
-    /// Number of Raft groups (fixed at cluster birth; changing it remaps
-    /// every routing namespace).
+    /// Number of Raft groups, i.e. the number of shards lock state is striped
+    /// across (fixed at cluster birth — it is part of the data-directory
+    /// fingerprint, so changing it means a new cluster, not an online reshard).
+    ///
+    /// This is the ceiling on write parallelism: distinct routing namespaces
+    /// spread across the groups by HRW, and each group's writes funnel through
+    /// one leader, so a workload can use at most `group_count` write leaders.
+    /// Size it for the *target maximum* cluster, not today's — generous
+    /// over-provisioning (many small shards) is the supported way to scale out,
+    /// since shards cannot be added later. Each group also has a fixed
+    /// per-replica cost (a Raft core, heartbeats), so the sweet spot trades
+    /// parallelism headroom against that overhead.
     pub group_count: u32,
     /// Path segments (beyond the handler) included in the fallback routing
     /// namespace when no explicit namespace root exists. The default, 1,

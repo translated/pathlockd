@@ -634,25 +634,6 @@ impl Router {
         }
     }
 
-    async fn mint_acquire_fence(&self, idempotency_key: Option<&str>) -> anyhow::Result<i64> {
-        let request_id = match idempotency_key {
-            Some(key) => RequestId {
-                client_id: format!("acquire-fence:{key}"),
-                seq: 0,
-            },
-            None => self.next_request_id(),
-        };
-        let cmd = Command {
-            request_id: Some(request_id),
-            now_ms: crate::store_keys::now_ms(),
-            op: Op::IncrFence,
-        };
-        match self.apply_to(SYS_GROUP, cmd).await? {
-            ApplyResponse::IncrFence(token) => Ok(token),
-            _ => anyhow::bail!("unexpected response type"),
-        }
-    }
-
     fn note_leader(&self, group: GroupId, leader: Option<(u64, NodeMeta)>) {
         let mut hints = self
             .leader_hints
@@ -1137,7 +1118,6 @@ impl Router {
         args: AcquireArgs,
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<(AcquireOutcome, Vec<String>, Option<String>)> {
-        let mut effective_args = args.clone();
         for attempt in 0..2 {
             self.refresh_namespace_cache_if_stale().await?;
             let mut routes: HashMap<String, NamespaceRoute> = HashMap::new();
@@ -1163,15 +1143,16 @@ impl Router {
             // so the client's Renew.domains map to the identical group.
             let namespace = route.namespace.clone();
             let group = self.group_of_domain(&route.namespace);
-            if effective_args.fencing_token <= 0
-                && !route.policy.algorithm.is_semaphore()
-                && effective_args
-                    .requests
-                    .iter()
-                    .any(|req| req.mode == crate::engine::Mode::Write)
-            {
-                effective_args.fencing_token = self.mint_acquire_fence(idempotency_key).await?;
-            }
+            // Fencing tokens are minted *inside the owning group's apply*
+            // (`engine`/`state_machine::mint_fence_if_needed`), not pre-minted
+            // from the global sys-group counter. A write acquire is therefore a
+            // single group Raft write with no sys-group round trip, so
+            // write-acquire throughput scales with the number of lock groups
+            // instead of funnelling through one global leader. Tokens remain
+            // monotonic *per path* — the path's stored fence is the floor and
+            // only increases — which is the documented contract; they are no
+            // longer one cluster-global sequence (`IncrFencingToken` still
+            // offers a global sequence for clients that want one).
             let response = self
                 .apply_to(
                     group,
@@ -1179,7 +1160,7 @@ impl Router {
                         Op::AcquireInNamespace {
                             namespace: route.namespace,
                             policy: route.policy,
-                            args: effective_args.clone(),
+                            args: args.clone(),
                         },
                         idempotency_key,
                     ),
@@ -1284,8 +1265,49 @@ impl Router {
     }
 
     /// Release everything an owner holds, in every group.
-    pub async fn release_all(&self, owner: &str, del_wait: bool) -> anyhow::Result<Vec<String>> {
-        self.release_all_with_idempotency(owner, del_wait, None)
+    /// Resolve a client-declared `domains` hint (shared by renew, release-all
+    /// and the owner reads) to the lock groups whose state it covers. Returns
+    /// `(groups, broadcast)`: `broadcast` is true when the hint was empty, or a
+    /// declared domain could not be pinned to a single group (a sharded bare
+    /// handler with no covering explicit root), in which case `groups` is every
+    /// lock group. A namespaced domain (`h:/a`, or an explicit root) hashes to
+    /// the exact group Acquire placed it under, so a client can replay the
+    /// namespace Acquire echoed back.
+    async fn resolve_domains_to_groups(&self, domains: &[String]) -> (Vec<GroupId>, bool) {
+        if domains.is_empty() {
+            return (self.lock_groups().collect(), true);
+        }
+        self.refresh_namespace_cache_if_stale().await.ok();
+        let mut set: BTreeSet<GroupId> = BTreeSet::new();
+        let mut seen = std::collections::HashSet::new();
+        for domain in domains {
+            if !seen.insert(domain) {
+                continue;
+            }
+            if domain.contains(':') || self.routing.routing_prefix_segments == 0 {
+                set.insert(place_domain(domain, self.routing.group_count));
+            } else {
+                let route = self.resolve_namespace_cached(&format!("{domain}:/"));
+                if route.explicit && route.namespace == domain.as_str() {
+                    set.insert(place_domain(domain, self.routing.group_count));
+                } else {
+                    // A sharded bare handler spans every shard group; targeting
+                    // a single hashed group would miss most of the owner's
+                    // state, so fall back to a full broadcast.
+                    return (self.lock_groups().collect(), true);
+                }
+            }
+        }
+        (set.into_iter().collect(), false)
+    }
+
+    pub async fn release_all(
+        &self,
+        owner: &str,
+        del_wait: bool,
+        domains: &[String],
+    ) -> anyhow::Result<Vec<String>> {
+        self.release_all_with_idempotency(owner, del_wait, domains, None)
             .await
     }
 
@@ -1293,10 +1315,14 @@ impl Router {
         &self,
         owner: &str,
         del_wait: bool,
+        domains: &[String],
         idempotency_key: Option<&str>,
     ) -> anyhow::Result<Vec<String>> {
-        let cmds: Vec<(GroupId, Command)> = self
-            .lock_groups()
+        // With a `domains` hint, release only the declared groups; otherwise
+        // sweep every lock group (the safe default for "release everything").
+        let (groups, _broadcast) = self.resolve_domains_to_groups(domains).await;
+        let cmds: Vec<(GroupId, Command)> = groups
+            .into_iter()
             .map(|group| {
                 (
                     group,
@@ -1352,44 +1378,10 @@ impl Router {
     ) -> anyhow::Result<RenewOutcome> {
         let declared = !domains.is_empty();
         // Resolve declared domains to the groups their leases actually live in.
-        // A namespaced domain (explicit root or fallback like `h:/a`) is placed
-        // directly: the client echoes the resolved namespace from Acquire, so
-        // hashing that string is the same placement Acquire used. A bare
-        // handler is only single-group when routing does not shard it
-        // (`routing_prefix_segments == 0`) or when an explicit namespace root
-        // covers the whole handler; otherwise the handler spans every shard
-        // group and a handler-wide renew must broadcast to all of them —
-        // hashing the bare handler would target the wrong group and report
-        // `Lost` while the real lease stays unrenewed and expires.
-        let mut broadcast = !declared;
-        let groups: Vec<GroupId> = if declared {
-            self.refresh_namespace_cache_if_stale().await.ok();
-            let mut set: std::collections::BTreeSet<GroupId> = std::collections::BTreeSet::new();
-            let mut seen = std::collections::HashSet::new();
-            for domain in domains {
-                if !seen.insert(domain) {
-                    continue;
-                }
-                if domain.contains(':') || self.routing.routing_prefix_segments == 0 {
-                    set.insert(place_domain(domain, self.routing.group_count));
-                } else {
-                    let route = self.resolve_namespace_cached(&format!("{domain}:/"));
-                    if route.explicit && route.namespace == domain.as_str() {
-                        set.insert(place_domain(domain, self.routing.group_count));
-                    } else {
-                        broadcast = true;
-                        break;
-                    }
-                }
-            }
-            if broadcast {
-                self.lock_groups().collect()
-            } else {
-                set.into_iter().collect()
-            }
-        } else {
-            self.lock_groups().collect()
-        };
+        // `broadcast` is true for an empty hint or a domain that could not be
+        // pinned to one group; in that case a per-group "absence" is mere
+        // absence, not a wholesale lease loss (see the Lost handling below).
+        let (groups, broadcast) = self.resolve_domains_to_groups(domains).await;
 
         let cmds: Vec<(GroupId, Command)> = groups
             .into_iter()
@@ -1849,7 +1841,7 @@ impl Router {
                 // Legacy edge without metadata: liveness is the only
                 // staleness signal available.
                 None => {
-                    if !self.is_owner_alive(&next).await? {
+                    if !self.is_owner_alive(&next, &[]).await? {
                         let _ = self.clear_wait_edge(&current).await;
                         let _ = self.clear_wait_edge(&next).await;
                         return Ok(CycleOutcome::None);
@@ -1888,10 +1880,14 @@ impl Router {
         }
     }
 
-    /// An owner is alive if it holds a live lease in any group.
-    pub async fn is_owner_alive(&self, owner: &str) -> anyhow::Result<bool> {
+    /// An owner is alive if it holds a live lease in any probed group. A
+    /// `domains` hint narrows the probe to those groups (an under-declared hint
+    /// can therefore report a false negative); an empty hint probes every
+    /// lock group.
+    pub async fn is_owner_alive(&self, owner: &str, domains: &[String]) -> anyhow::Result<bool> {
         use futures::StreamExt;
-        let mut stream = futures::stream::iter(self.lock_groups().map(|group| {
+        let (groups, _broadcast) = self.resolve_domains_to_groups(domains).await;
+        let mut stream = futures::stream::iter(groups.into_iter().map(|group| {
             self.read_on(
                 group,
                 ReadOp::IsOwnerAlive {
@@ -1924,10 +1920,17 @@ impl Router {
         }
     }
 
-    /// Union of the owner's locks across all groups.
-    pub async fn list_owner_locks(&self, owner: &str) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
+    /// Union of the owner's locks across the probed groups. A `domains` hint
+    /// narrows the probe to those groups (locks in unlisted groups are then
+    /// omitted); an empty hint lists every lock group.
+    pub async fn list_owner_locks(
+        &self,
+        owner: &str,
+        domains: &[String],
+    ) -> anyhow::Result<(bool, Vec<OwnedLock>)> {
         use futures::StreamExt;
-        let mut stream = futures::stream::iter(self.lock_groups().map(|group| {
+        let (groups, _broadcast) = self.resolve_domains_to_groups(domains).await;
+        let mut stream = futures::stream::iter(groups.into_iter().map(|group| {
             self.read_on(
                 group,
                 ReadOp::ListOwnerLocks {
@@ -2215,7 +2218,7 @@ mod tests {
             .force_release_with_idempotency("victim", Some("force-retry-1"))
             .await
             .unwrap();
-        assert!(!router.is_owner_alive("victim").await.unwrap());
+        assert!(!router.is_owner_alive("victim", &[]).await.unwrap());
         shutdown_test_router(router, dir).await;
     }
 
@@ -2617,8 +2620,8 @@ mod tests {
             }
         );
         // Liveness and lock listing aggregate across groups.
-        assert!(router.is_owner_alive("spanner").await.unwrap());
-        let (alive, locks) = router.list_owner_locks("spanner").await.unwrap();
+        assert!(router.is_owner_alive("spanner", &[]).await.unwrap());
+        let (alive, locks) = router.list_owner_locks("spanner", &[]).await.unwrap();
         assert!(alive);
         assert_eq!(locks.len(), 2);
 
@@ -2630,11 +2633,78 @@ mod tests {
 
         // Force-release cleans both groups.
         router.force_release("spanner").await.unwrap();
-        assert!(!router.is_owner_alive("spanner").await.unwrap());
+        assert!(!router.is_owner_alive("spanner", &[]).await.unwrap());
         let info = router.inspect_path("alpha:/a").await.unwrap();
         assert_eq!(info.write_owner, None);
         let info = router.inspect_path("beta:/b").await.unwrap();
         assert_eq!(info.write_owner, None);
+        shutdown_test_router(router, dir).await;
+    }
+
+    #[tokio::test]
+    async fn owner_wide_ops_honor_domains_hint() {
+        let (router, dir) = test_router().await;
+        for path in ["alpha:/a", "beta:/b"] {
+            let (outcome, _granted) = router
+                .acquire(AcquireArgs {
+                    owner_id: "scoped".into(),
+                    ttl_ms: 30_000,
+                    requests: vec![wr_req(path)],
+                    fencing_token: 1,
+                    release_requests: vec![],
+                    queue_ttl_ms: 0,
+                })
+                .await
+                .unwrap();
+            assert!(matches!(outcome, AcquireOutcome::Ok { .. }));
+        }
+        assert_ne!(router.group_of("alpha:/a"), router.group_of("beta:/b"));
+
+        // A domains hint narrows the fan-out to just that domain's group.
+        let (_alive, locks) = router
+            .list_owner_locks("scoped", &["alpha".into()])
+            .await
+            .unwrap();
+        assert_eq!(locks.len(), 1, "hint must list only the alpha group");
+        assert_eq!(locks[0].path, "alpha:/a");
+        // Liveness probe is likewise scoped: present in alpha, absent in a
+        // domain the owner holds nothing in.
+        assert!(router
+            .is_owner_alive("scoped", &["alpha".into()])
+            .await
+            .unwrap());
+        assert!(!router
+            .is_owner_alive("scoped", &["gamma".into()])
+            .await
+            .unwrap());
+        // An empty hint still sees the whole cluster.
+        let (_alive, all) = router.list_owner_locks("scoped", &[]).await.unwrap();
+        assert_eq!(all.len(), 2);
+
+        // A scoped release_all drops only the declared domain; the rest stays.
+        router
+            .release_all("scoped", false, &["alpha".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            router.inspect_path("alpha:/a").await.unwrap().write_owner,
+            None
+        );
+        assert_eq!(
+            router
+                .inspect_path("beta:/b")
+                .await
+                .unwrap()
+                .write_owner
+                .as_deref(),
+            Some("scoped")
+        );
+        // An unscoped release_all sweeps the remainder.
+        router.release_all("scoped", false, &[]).await.unwrap();
+        assert_eq!(
+            router.inspect_path("beta:/b").await.unwrap().write_owner,
+            None
+        );
         shutdown_test_router(router, dir).await;
     }
 
@@ -2668,6 +2738,55 @@ mod tests {
             }
         }
         assert_eq!(total, 4);
+        shutdown_test_router(router, dir).await;
+    }
+
+    #[tokio::test]
+    async fn write_acquire_mints_per_path_monotonic_fence_in_group() {
+        let (router, dir) = test_router().await;
+        // token = 0 → the owning group mints the fence during apply; no
+        // sys-group pre-mint is on the acquire path anymore.
+        let acquire_zero = |owner: &'static str| {
+            let router = router.clone();
+            async move {
+                let (outcome, _granted, _ns) = router
+                    .acquire_with_idempotency(
+                        AcquireArgs {
+                            owner_id: owner.into(),
+                            ttl_ms: 30_000,
+                            requests: vec![wr_req("h:/fence")],
+                            fencing_token: 0,
+                            release_requests: vec![],
+                            queue_ttl_ms: 0,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                match outcome {
+                    AcquireOutcome::Ok { fencing_token } => fencing_token,
+                    other => panic!("expected Ok, got {other:?}"),
+                }
+            }
+        };
+
+        let t1 = acquire_zero("fa").await;
+        assert!(
+            t1 > 0,
+            "in-group mint must assign a positive token, got {t1}"
+        );
+        router
+            .release("fa", &[wr_rel("h:/fence")], false)
+            .await
+            .unwrap();
+        // The same path's fence is the floor for the next mint, so it strictly
+        // increases even across a different owner — per-path monotonicity holds
+        // without a global counter.
+        let t2 = acquire_zero("fb").await;
+        assert!(
+            t2 > t1,
+            "fence must strictly increase per path ({t2} > {t1})"
+        );
         shutdown_test_router(router, dir).await;
     }
 

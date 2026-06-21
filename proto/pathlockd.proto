@@ -207,6 +207,12 @@ message ReleaseAllRequest {
   bool del_wait_key = 2;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 3;
+  // Optional routing namespaces this owner holds locks in (same form as
+  // Renew.domains). When set, the release fan-out targets only those groups
+  // instead of every lock group; an under-declared set leaves locks in
+  // unlisted groups to expire on their TTL. When empty, every group is swept
+  // (the safe default for an unconditional "release everything").
+  repeated string domains = 4;
 }
 
 message ReleaseResponse {}
@@ -363,6 +369,11 @@ message ClearWaitEdgeResponse {}
 
 message IsOwnerAliveRequest {
   string owner_id = 1;
+  // Optional routing namespaces to probe (same form as Renew.domains). When
+  // set, only those groups are queried; an under-declared set can report a
+  // false negative, so omit it when an authoritative answer is needed. When
+  // empty, every lock group is probed.
+  repeated string domains = 2;
 }
 
 message IsOwnerAliveResponse {
@@ -445,6 +456,10 @@ message InspectPathResponse {
 
 message ListOwnerLocksRequest {
   string owner_id = 1;
+  // Optional routing namespaces to list from (same form as Renew.domains).
+  // When set, only those groups are queried; locks in unlisted groups are
+  // omitted. When empty, every lock group is listed.
+  repeated string domains = 2;
 }
 
 message OwnedLock {

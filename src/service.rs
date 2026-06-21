@@ -151,6 +151,22 @@ fn check_queue_ttl(ttl_ms: u64) -> Result<(), Status> {
     Ok(())
 }
 
+/// Validate an optional routing-domain hint (shared by Renew / ReleaseAll /
+/// IsOwnerAlive / ListOwnerLocks). Each entry is a namespace string; the count
+/// is bounded like a path request.
+#[allow(clippy::result_large_err)]
+fn check_domains(domains: &[String]) -> Result<(), Status> {
+    if domains.len() > MAX_RENEW_DOMAINS {
+        return Err(Status::invalid_argument(format!(
+            "too many domains (max {MAX_RENEW_DOMAINS})"
+        )));
+    }
+    for domain in domains {
+        check_namespace(domain)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::result_large_err)]
 fn check_path(path: &str) -> Result<(), Status> {
     if path.is_empty() || path.len() > MAX_PATH_LEN {
@@ -785,6 +801,7 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
+                check_domains(&req.domains)?;
                 let idempotency_key = idempotency_key(&req.idempotency_key)?;
                 let router = self.router.clone();
                 let owner_id = req.owner_id.clone();
@@ -793,6 +810,7 @@ impl PathLock for PathLockService {
                     .release_all_with_idempotency(
                         &owner_id,
                         del_wait_key,
+                        &req.domains,
                         idempotency_key.as_deref(),
                     )
                     .await
@@ -1088,9 +1106,10 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
+                check_domains(&req.domains)?;
                 let alive = self
                     .router
-                    .is_owner_alive(&req.owner_id)
+                    .is_owner_alive(&req.owner_id, &req.domains)
                     .await
                     .map_err(engine_err)?;
                 Ok(Response::new(IsOwnerAliveResponse { alive }))
@@ -1165,9 +1184,10 @@ impl PathLock for PathLockService {
             |request| async move {
                 let req = request.into_inner();
                 check_id("owner_id", &req.owner_id)?;
+                check_domains(&req.domains)?;
                 let (alive, locks) = self
                     .router
-                    .list_owner_locks(&req.owner_id)
+                    .list_owner_locks(&req.owner_id, &req.domains)
                     .await
                     .map_err(engine_err)?;
                 Ok(Response::new(ListOwnerLocksResponse {
