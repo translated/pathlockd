@@ -374,7 +374,13 @@ async fn start_topology(topo: Topology, groups: u32) -> Cluster {
             let p1 = alloc_node_ports();
             let p2 = alloc_node_ports();
             let seeds = [p0.gossip, p1.gossip, p2.gossip];
-            let n0 = spawn_node(dir.path(), 0, &p0, true, &seeds, 3, groups);
+            // The founding node bootstraps with NO seeds: with seeds configured
+            // but no peer answering yet, the daemon's split-brain guard would
+            // refuse to initialize a new cluster (it cannot tell a genuinely new
+            // cluster from a transient partition). Joiners seed off the founder
+            // and are absorbed by elastic membership. This mirrors the
+            // single-node topology, which also founds with an empty seed list.
+            let n0 = spawn_node(dir.path(), 0, &p0, true, &[], 3, groups);
             wait_healthy(&n0.public_addr, Duration::from_secs(30)).await;
             let n1 = spawn_node(dir.path(), 1, &p1, false, &seeds, 3, groups);
             let n2 = spawn_node(dir.path(), 2, &p2, false, &seeds, 3, groups);
@@ -472,6 +478,8 @@ async fn release_all(client: &mut PathLockClient<Channel>, owner: &str) {
             owner_id: owner.into(),
             del_wait_key: true,
             idempotency_key: String::new(),
+            // Empty = sweep every group (the benchmark holds no namespace map).
+            domains: Vec::new(),
         })
         .await;
 }

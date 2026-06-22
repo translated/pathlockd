@@ -156,7 +156,7 @@ async fn detect_cycle_stale_edge_dead_blocker() {
         router.detect_cycle("a", 10).await.unwrap(),
         CycleOutcome::None
     );
-    assert!(!router.is_owner_alive("b").await.unwrap());
+    assert!(!router.is_owner_alive("b", &[]).await.unwrap());
 }
 
 #[tokio::test]

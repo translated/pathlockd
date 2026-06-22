@@ -626,6 +626,7 @@ async fn e2e_list_owner_locks() {
         .client
         .list_owner_locks(ListOwnerLocksRequest {
             owner_id: "lister".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()
@@ -664,6 +665,7 @@ async fn e2e_is_owner_alive() {
         .client
         .is_owner_alive(IsOwnerAliveRequest {
             owner_id: "live-one".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()
@@ -674,6 +676,7 @@ async fn e2e_is_owner_alive() {
         .client
         .is_owner_alive(IsOwnerAliveRequest {
             owner_id: "no-one".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()

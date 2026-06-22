@@ -266,6 +266,7 @@ async fn release_all(client: &mut PathLockClient<Channel>, owner: &str) {
             owner_id: owner.into(),
             del_wait_key: true,
             idempotency_key: String::new(),
+            domains: Vec::new(),
         })
         .await;
 }
