@@ -13,7 +13,7 @@
 
 ---
 
-`pathlockd` gives you a small set of **lock primitives** — point and subtree
+`pathlockd` gives you a set of **lock primitives** for your horizontally distributed applications — point and subtree
 read/write locks, counting semaphores, fencing tokens, TTL leases, and a durable
 wait queue — addressed by hierarchical paths like `tenant:/acme/projects/42`. It
 never stores your data; it coordinates *who may touch what* across processes and
@@ -45,7 +45,7 @@ This is a tree RWLock, not the flat textbook one — the full conflict matrix is
 
 | Algorithm | Modes | Exclusion scope | Fencing |
 | --- | --- | --- | --- |
-| `recursive_rw` *(default)* | read + write | write excludes path **and** descendants | yes |
+| `recursive_rw` *(default)* | read + write | shared point reads; write excludes path **and** descendants | yes |
 | `point_rw` | read + write | write excludes the exact path only | yes |
 | `recursive_write` | write only | write excludes path **and** descendants | yes |
 | `point_write` | write only | write excludes the exact path only | yes |
@@ -285,7 +285,9 @@ discovery and **HRW (rendezvous) hashing** for placement.
   namespace serialize through that group's leader, and *different* namespaces run
   on *different* leaders spread across nodes. Write throughput therefore scales
   with the number of namespaces and nodes — unlike a single-Raft design where all
-  writes funnel through one leader.
+  writes funnel through one leader. A write acquire is a *single-group* Raft write
+  (fencing tokens are minted inside the owning group, not fetched from a global
+  counter), so it never round-trips a central leader.
 - **Routing namespaces.** A namespace is a handler (`google_drive`) or a path
   root (`google_drive:/docs`); `routing_prefix_segments` (default 1) sets the
   fallback depth, and explicit `SetNamespacePolicy` roots carve out hot subtrees
@@ -300,13 +302,17 @@ discovery and **HRW (rendezvous) hashing** for placement.
   learner, then promoted to voter once stable for `stability_window_secs`; a dead
   voter is replaced after `eviction_window_secs`; leadership drifts toward
   HRW-preferred voters for balance. No join flags — presence of `seed_nodes` is
-  enough.
+  enough. Note this reshards *placement* (which nodes host a group), not the
+  *partitioning* (which group a path maps to) — the latter is fixed by
+  `group_count` at birth.
 - **Backpressure & GC.** Per-group in-flight write budgets fail fast with
   `UNAVAILABLE` instead of unbounded queueing; a background GC sweeps expired
   records while lazy expiry remains the correctness backstop.
 
-Deep dives: [docs/operations.md](docs/operations.md) (scaling, recovery, tuning)
-and [llmwiki/01-architecture.md](llmwiki/01-architecture.md).
+Deep dives: **[docs/sharding.md](docs/sharding.md)** (the full partitioning &
+sharding rules — namespace resolution, HRW placement, voter selection, elastic
+membership), [docs/operations.md](docs/operations.md) (scaling, recovery,
+tuning), and [llmwiki/01-architecture.md](llmwiki/01-architecture.md).
 
 ## Configuration
 
@@ -392,6 +398,7 @@ and unmetered, so deploy it behind an mTLS/auth proxy on a trusted network:
 | --- | --- |
 | Conflict rules, fencing, leases, re-entrancy, outcomes | [docs/locking-semantics.md](docs/locking-semantics.md) |
 | VFS usage (end-to-end, copy-pasteable) | [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md) |
+| Partitioning & sharding (routing, HRW, voters, elastic membership) | [docs/sharding.md](docs/sharding.md) |
 | Deployment, recovery, OTel, scaling | [docs/operations.md](docs/operations.md) |
 | Backup / restore | [docs/backup-restore.md](docs/backup-restore.md) |
 | Architecture, data model, engine, events | [llmwiki/](llmwiki/) |
