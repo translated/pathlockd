@@ -67,9 +67,18 @@ The cross-cutting primitives:
 - **Per-owner events.** A `Subscribe`/SSE stream sees only its own owner's
   lifecycle events (`grant` / `revoke` / `killed`); cross-node fan-out is
   automatic via gossip.
-- **Cooperative revoke & deadlock tools.** `RequestRevoke` asks a holder to yield
-  (advisory; surfaced on the next `Renew` as `revokeRequested`), `ForceRelease`
-  preempts it, and `DetectCycle` walks the wait-for graph to find deadlocks.
+- **Conflict resolution.** A contended acquire returns a machine-readable
+  outcome — `CONFLICT` (with the blocking path/owner and a `ReasonCode` such as
+  `ancestor_locked` / `descendant_write_locked`) or `QUEUED` when it joins the
+  FIFO wait queue. `IsBlocking` re-checks whether the blocker still holds the
+  lock, so a waiter can resolve the contention instead of spinning.
+- **Deadlock detection.** Clients record wait-for edges (`SetWaitEdge` /
+  `ClearWaitEdge`), and `DetectCycle` walks that graph to surface a deadlock
+  cycle (returning the members so you can pick a victim) — bounded by `max_depth`.
+- **Preemption.** `RequestRevoke` asks a holder to yield cooperatively (advisory;
+  surfaced on the next `Renew` as `revokeRequested` and as a `REVOKE` event), and
+  `ForceRelease` hard-preempts a stuck or chosen victim, firing a `KILLED` event
+  so the evicted owner stops its backing-store I/O at once.
 
 ## Quick start
 
