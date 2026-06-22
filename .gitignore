@@ -6,3 +6,16 @@ pathlockd.toml
 .claude/
 /dist/
 .vscode/
+node_modules/
+
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+examples/python/generated/
+
+*.php.bak
+composer.lock
+vendor/

@@ -12,8 +12,7 @@ use std::time::Duration;
 use pathlockd::cluster::placement::SYS_GROUP;
 use pathlockd::cluster::router::{Router, RoutingOptions};
 use pathlockd::engine::{
-    AcquireArgs, AcquireOutcome, ClaimOutcome, CycleOutcome, LockReq, Mode, State,
-    WaitEdgeMetadata,
+    AcquireArgs, AcquireOutcome, CycleOutcome, LockReq, Mode, Reason, State, WaitEdgeMetadata,
 };
 use pathlockd::raft::log_store::FsyncBatcher;
 use pathlockd::raft::manager::{raft_config, RaftGroups};
@@ -44,7 +43,8 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
         raft_config(&cfg),
         cfg.raft_snapshot_max_bytes,
         batcher,
-        PeerPool::new(),
+        PeerPool::new("test-internal-auth-token"),
+        cfg.default_lock_algorithm,
     )
     .unwrap();
     let routing = RoutingOptions {
@@ -56,11 +56,16 @@ async fn test_router() -> (Arc<Router>, tempfile::TempDir) {
     for group in (0..routing.group_count).chain([SYS_GROUP]) {
         groups.bootstrap_group(group, voters.clone()).await.unwrap();
     }
-    (Arc::new(Router::new(groups, routing, None)), dir)
+    let router = Arc::new(Router::new(groups, routing, None));
+    router
+        .probe_writer(Duration::from_secs(10))
+        .await
+        .expect("test router sys group must elect a leader");
+    (router, dir)
 }
 
 async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str) {
-    let outcome = router
+    let (outcome, _granted) = router
         .acquire(AcquireArgs {
             owner_id: owner.into(),
             ttl_ms,
@@ -68,14 +73,16 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
                 path: path.into(),
                 mode: Mode::Write,
                 state: State::New,
+                permits: 0,
             }],
             fencing_token: fence,
             release_requests: vec![],
+            queue_ttl_ms: 0,
         })
         .await
         .unwrap();
     assert!(
-        matches!(outcome, AcquireOutcome::Ok),
+        matches!(outcome, AcquireOutcome::Ok { .. }),
         "{owner} locking {path}: {outcome:?}"
     );
 }
@@ -83,42 +90,12 @@ async fn lock(router: &Router, owner: &str, ttl_ms: u64, fence: i64, path: &str)
 async fn edge(router: &Router, owner: &str, blocker: &str, meta: Option<(&str, &str)>) {
     let metadata = meta.map(|(path, reason)| WaitEdgeMetadata {
         conflict_path: path.into(),
-        reason: reason.into(),
+        reason: reason.parse::<Reason>().unwrap(),
     });
     router
         .set_wait_edge(owner, blocker, 60_000, metadata.as_ref())
         .await
         .unwrap();
-}
-
-#[tokio::test]
-async fn cycle_detection_traverses_pure_waiter_claim_edges() {
-    let (router, _dir) = test_router().await;
-
-    // Holder "bob" holds h:/a/b and is blocked by pure-waiter "alice"'s claim
-    // on h:/a (he wants to extend upward). Alice, in turn, waits on Bob's
-    // held descendant lock. Alice holds NOTHING (no ALIVE record): the cycle
-    // walk must still traverse the claim edge via is_blocking instead of
-    // pruning it on the liveness probe.
-    lock(&router, "bob", 60_000, 1, "h:/a/b").await;
-    let claim = router.set_claim("h:/a", "alice", 60_000).await.unwrap();
-    assert!(matches!(claim, ClaimOutcome::Ok));
-
-    edge(
-        &router,
-        "alice",
-        "bob",
-        Some(("h:/a/b", "descendant_write_locked")),
-    )
-    .await;
-    edge(&router, "bob", "alice", Some(("h:/a", "preempt_claimed"))).await;
-
-    match router.detect_cycle("alice", 16).await.unwrap() {
-        CycleOutcome::Cycle(chain) => {
-            assert_eq!(chain, vec!["alice".to_string(), "bob".to_string()])
-        }
-        other => panic!("expected Cycle, got {other:?}"),
-    }
 }
 
 #[tokio::test]
@@ -155,7 +132,10 @@ async fn detect_cycle_truncated_at_max_depth() {
 
     match router.detect_cycle("a", 2).await.unwrap() {
         CycleOutcome::Truncated(chain) => {
-            assert_eq!(chain, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+            assert_eq!(
+                chain,
+                vec!["a".to_string(), "b".to_string(), "c".to_string()]
+            );
         }
         other => panic!("expected Truncated, got {other:?}"),
     }
@@ -176,7 +156,7 @@ async fn detect_cycle_stale_edge_dead_blocker() {
         router.detect_cycle("a", 10).await.unwrap(),
         CycleOutcome::None
     );
-    assert!(!router.is_owner_alive("b").await.unwrap());
+    assert!(!router.is_owner_alive("b", &[]).await.unwrap());
 }
 
 #[tokio::test]

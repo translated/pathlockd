@@ -1,6 +1,6 @@
 //! End-to-end daemon test: starts pathlockd in single-node mode and exercises
 //! the full gRPC API surface — acquire, release, renew, fencing, deadlock
-//! detection, preemption claims, and GC. Verifies correctness end-to-end.
+//! detection, the wait queue + grant events, and GC. Verifies correctness end-to-end.
 
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU16, Ordering};
@@ -9,9 +9,10 @@ use std::time::Duration;
 use pathlockd::proto::path_lock_client::PathLockClient;
 use pathlockd::proto::{
     AcquireRequest, AcquireStatus, AssertFencingRequest, AssertStatus, CycleKind,
-    DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest, IsOwnerAliveRequest,
-    ListOwnerLocksRequest, LockRequest, LockState, Mode, ReleaseLocksRequest, RenewRequest,
-    RenewStatus, SetWaitEdgeRequest,
+    DeleteNamespacePolicyRequest, DetectCycleRequest, DumpLocksRequest, ForceReleaseRequest,
+    GetNamespacePolicyRequest, IsOwnerAliveRequest, ListOwnerLocksRequest,
+    LockAlgorithm as ProtoLockAlgorithm, LockRequest, LockState, Mode, ReasonCode,
+    ReleaseLocksRequest, RenewRequest, RenewStatus, SetNamespacePolicyRequest, SetWaitEdgeRequest,
 };
 use tonic::transport::Channel;
 
@@ -27,6 +28,14 @@ struct Daemon {
     _dir: tempfile::TempDir,
 }
 
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[allow(clippy::zombie_processes)]
 async fn start_daemon() -> Daemon {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
@@ -44,6 +53,7 @@ data_dir = "{}"
 public_addr = "http://127.0.0.1:{port}"
 raft_addr = "http://127.0.0.1:{raft_port}"
 gossip_addr = "127.0.0.1:{gossip_port}"
+internal_auth_token = "e2e-test-internal-auth-token-32x"
 group_count = 4
 replication_factor = 1
 bootstrap = true
@@ -109,9 +119,10 @@ async fn e2e_acquire_and_release() {
                 path: "h:/a".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -145,15 +156,196 @@ async fn e2e_acquire_and_release() {
                 path: "h:/a".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
         .unwrap()
         .into_inner();
     assert_eq!(resp.status(), AcquireStatus::Ok);
+
+    daemon.child.kill().ok();
+}
+
+#[tokio::test]
+async fn e2e_namespace_policy_set_get_and_apply() {
+    let mut daemon = start_daemon().await;
+
+    let policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "policy".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.algorithm(), ProtoLockAlgorithm::RecursiveRw);
+    assert!(!policy.explicit);
+
+    daemon
+        .client
+        .set_namespace_policy(SetNamespacePolicyRequest {
+            namespace: "policy".into(),
+            algorithm: ProtoLockAlgorithm::PointWrite as i32,
+            idempotency_key: "policy-point-write".into(),
+        })
+        .await
+        .unwrap();
+
+    let policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "policy".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(policy.algorithm(), ProtoLockAlgorithm::PointWrite);
+    assert!(policy.explicit);
+
+    let write_req = |owner: &str, fence: i64, path: &str| AcquireRequest {
+        owner_id: owner.into(),
+        ttl_ms: 10000,
+        fencing_token: fence,
+        requests: vec![LockRequest {
+            path: path.into(),
+            mode: Mode::Write as i32,
+            state: LockState::New as i32,
+            permits: 0,
+        }],
+        release_requests: vec![],
+        queue_ttl_ms: 0,
+        idempotency_key: String::new(),
+    };
+
+    assert_eq!(
+        daemon
+            .client
+            .acquire(write_req("alice", 1, "policy:/a"))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok
+    );
+    assert_eq!(
+        daemon
+            .client
+            .acquire(write_req("bob", 2, "policy:/a/b"))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok,
+        "point_write must not recurse into descendants"
+    );
+
+    let read_resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "policy:/read".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(read_resp.status(), AcquireStatus::Conflict);
+    assert_eq!(read_resp.reason, ReasonCode::ReadLocksDisabled as i32);
+
+    daemon
+        .client
+        .set_namespace_policy(SetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+            algorithm: ProtoLockAlgorithm::PointWrite as i32,
+            idempotency_key: "drive-deep-point-write".into(),
+        })
+        .await
+        .unwrap();
+    let path_policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_policy.algorithm(), ProtoLockAlgorithm::PointWrite);
+    assert!(path_policy.explicit);
+
+    let path_read = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "path-reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "drive:/tenant/deep/file".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_read.status(), AcquireStatus::Conflict);
+    assert_eq!(path_read.reason, ReasonCode::ReadLocksDisabled as i32);
+
+    daemon
+        .client
+        .delete_namespace_policy(DeleteNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+            idempotency_key: "drive-deep-delete".into(),
+        })
+        .await
+        .unwrap();
+    let path_policy = daemon
+        .client
+        .get_namespace_policy(GetNamespacePolicyRequest {
+            namespace: "drive:/tenant/deep".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(path_policy.algorithm(), ProtoLockAlgorithm::RecursiveRw);
+    assert!(!path_policy.explicit);
+
+    let fallback_read = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "path-reader".into(),
+            ttl_ms: 10000,
+            fencing_token: 0,
+            requests: vec![LockRequest {
+                path: "drive:/tenant/deep/file".into(),
+                mode: Mode::Read as i32,
+                state: LockState::New as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(fallback_read.status(), AcquireStatus::Ok);
 
     daemon.child.kill().ok();
 }
@@ -167,6 +359,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
             path: format!("h:/bulk/{i}"),
             mode: Mode::Write as i32,
             state: LockState::New as i32,
+            permits: 0,
         })
         .collect::<Vec<_>>();
 
@@ -177,7 +370,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
             fencing_token: 10,
             requests: requests[..600].to_vec(),
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: "bulk-acquire".into(),
         },
         AcquireRequest {
@@ -186,7 +379,7 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
             fencing_token: 0,
             requests: requests[600..].to_vec(),
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         },
     ];
@@ -209,17 +402,18 @@ async fn e2e_streamed_acquire_is_one_logical_acquire_past_unary_cap() {
                 path: "h:/bulk/1099".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
         .unwrap()
         .into_inner();
-    assert_eq!(resp.status(), AcquireStatus::Conflict);
+    assert_eq!(resp.status(), AcquireStatus::Queued);
     assert_eq!(resp.owner, "bulk-owner");
-    assert_eq!(resp.reason, "write_locked");
+    assert_eq!(resp.reason, ReasonCode::WriteLocked as i32);
 }
 
 #[tokio::test]
@@ -237,9 +431,10 @@ async fn e2e_renew_and_lost() {
                 path: "h:/x".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -272,9 +467,10 @@ async fn e2e_renew_and_lost() {
                 path: "h:/x".into(),
                 mode: Mode::Write as i32,
                 state: LockState::Held as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -299,9 +495,10 @@ async fn e2e_force_release() {
                 path: "h:/z".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -328,9 +525,10 @@ async fn e2e_force_release() {
                 path: "h:/z".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -355,9 +553,10 @@ async fn e2e_fencing_assertion() {
                 path: "h:/f".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -404,18 +603,20 @@ async fn e2e_list_owner_locks() {
             fencing_token: 1,
             requests: vec![
                 pathlockd::proto::LockRequest {
-                    path: "h:/a".into(),
+                    path: "h:/root/a".into(),
                     mode: Mode::Write as i32,
                     state: LockState::New as i32,
+                    permits: 0,
                 },
                 pathlockd::proto::LockRequest {
-                    path: "h:/b".into(),
+                    path: "h:/root/b".into(),
                     mode: Mode::Read as i32,
                     state: LockState::New as i32,
+                    permits: 0,
                 },
             ],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -425,6 +626,7 @@ async fn e2e_list_owner_locks() {
         .client
         .list_owner_locks(ListOwnerLocksRequest {
             owner_id: "lister".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()
@@ -450,9 +652,10 @@ async fn e2e_is_owner_alive() {
                 path: "h:/live".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -462,6 +665,7 @@ async fn e2e_is_owner_alive() {
         .client
         .is_owner_alive(IsOwnerAliveRequest {
             owner_id: "live-one".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()
@@ -472,6 +676,7 @@ async fn e2e_is_owner_alive() {
         .client
         .is_owner_alive(IsOwnerAliveRequest {
             owner_id: "no-one".into(),
+            domains: Vec::new(),
         })
         .await
         .unwrap()
@@ -497,9 +702,10 @@ async fn e2e_detect_cycle() {
                 path: "h:/x".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -515,9 +721,10 @@ async fn e2e_detect_cycle() {
                 path: "h:/y".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -531,7 +738,7 @@ async fn e2e_detect_cycle() {
             conflict_owner: "b".into(),
             ttl_ms: 30000,
             conflict_path: "h:/x".into(),
-            reason: "write_locked".into(),
+            reason: ReasonCode::WriteLocked as i32,
             idempotency_key: String::new(),
         })
         .await
@@ -544,7 +751,7 @@ async fn e2e_detect_cycle() {
             conflict_owner: "a".into(),
             ttl_ms: 30000,
             conflict_path: "h:/y".into(),
-            reason: "write_locked".into(),
+            reason: ReasonCode::WriteLocked as i32,
             idempotency_key: String::new(),
         })
         .await
@@ -580,9 +787,10 @@ async fn e2e_dump_locks() {
                 path: "h:/dump-test".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -600,7 +808,7 @@ async fn e2e_dump_locks() {
 
     // DumpLocks may or may not return entries depending on implementation.
     // At minimum, verify the response is well-formed.
-    assert_eq!(resp.done, true);
+    assert!(resp.done);
 
     daemon.child.kill().ok();
 }
@@ -662,6 +870,7 @@ data_dir = "{}"
 public_addr = "http://127.0.0.1:{port}"
 raft_addr = "http://127.0.0.1:{raft_port}"
 gossip_addr = "127.0.0.1:{gossip_port}"
+internal_auth_token = "e2e-test-internal-auth-token-32x"
 group_count = 4
 replication_factor = 1
 bootstrap = true
@@ -700,9 +909,10 @@ async fn e2e_sigkill_restart_preserves_acknowledged_state() {
                 path: "h:/crash".into(),
                 mode: Mode::Write as i32,
                 state: LockState::New as i32,
+                permits: 0,
             }],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -734,4 +944,216 @@ async fn e2e_sigkill_restart_preserves_acknowledged_state() {
 
     child2.kill().ok();
     child2.wait().ok();
+}
+
+#[tokio::test]
+async fn e2e_grant_event_wakes_queued_waiter_on_release() {
+    let mut daemon = start_daemon().await;
+
+    // Alice holds h:/a.
+    daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "alice".into(),
+            ttl_ms: 30_000,
+            fencing_token: 1,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap();
+
+    // Bob opens his per-owner event subscription before contending.
+    let mut sub = daemon
+        .client
+        .clone()
+        .subscribe(pathlockd::proto::SubscribeRequest {
+            owner_id: "bob".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+
+    // Bob's acquire is enqueued (surfaced as a wire conflict for now).
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "bob".into(),
+            ttl_ms: 30_000,
+            fencing_token: 2,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::New as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(resp.status(), AcquireStatus::Queued);
+
+    // Alice releases → Bob is granted in place and a GRANT is pushed to him.
+    daemon
+        .client
+        .release(ReleaseLocksRequest {
+            owner_id: "alice".into(),
+            requests: vec![pathlockd::proto::ReleaseRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+            }],
+            del_wait_key: false,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap();
+
+    let event = tokio::time::timeout(Duration::from_secs(5), sub.message())
+        .await
+        .expect("timed out waiting for GRANT event")
+        .expect("subscription stream error")
+        .expect("subscription ended without an event");
+    assert_eq!(
+        event.r#type,
+        pathlockd::proto::EventType::Grant as i32,
+        "expected a GRANT event"
+    );
+    assert_eq!(event.owner_id, "bob");
+
+    // And Bob now actually holds the lock (held re-validation succeeds).
+    let resp = daemon
+        .client
+        .acquire(AcquireRequest {
+            owner_id: "bob".into(),
+            ttl_ms: 30_000,
+            fencing_token: 2,
+            requests: vec![LockRequest {
+                path: "h:/a".into(),
+                mode: Mode::Write as i32,
+                state: LockState::Held as i32,
+                permits: 0,
+            }],
+            release_requests: vec![],
+            queue_ttl_ms: 0,
+            idempotency_key: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        resp.status(),
+        AcquireStatus::Ok,
+        "Bob should hold h:/a after the grant"
+    );
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
+}
+
+#[tokio::test]
+async fn e2e_convoy_grants_in_fifo_across_releases() {
+    let mut daemon = start_daemon().await;
+
+    // A holds h:/c.
+    let acq = |owner: &str, fence: i64, state: LockState| AcquireRequest {
+        owner_id: owner.into(),
+        ttl_ms: 30_000,
+        fencing_token: fence,
+        requests: vec![LockRequest {
+            path: "h:/c".into(),
+            mode: Mode::Write as i32,
+            state: state as i32,
+            permits: 0,
+        }],
+        release_requests: vec![],
+        queue_ttl_ms: 0,
+        idempotency_key: String::new(),
+    };
+    let rel = |owner: &str| ReleaseLocksRequest {
+        owner_id: owner.into(),
+        requests: vec![pathlockd::proto::ReleaseRequest {
+            path: "h:/c".into(),
+            mode: Mode::Write as i32,
+        }],
+        del_wait_key: false,
+        idempotency_key: String::new(),
+    };
+
+    assert_eq!(
+        daemon
+            .client
+            .acquire(acq("a", 1, LockState::New))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok
+    );
+    // Two waiters queue behind A, in order b then c.
+    for (owner, fence) in [("b", 2), ("c", 3)] {
+        assert_eq!(
+            daemon
+                .client
+                .acquire(acq(owner, fence, LockState::New))
+                .await
+                .unwrap()
+                .into_inner()
+                .status(),
+            AcquireStatus::Queued,
+            "{owner} should be queued behind the holder"
+        );
+    }
+
+    // A releases → B (FIFO head) is granted in place; C stays queued behind B.
+    daemon.client.release(rel("a")).await.unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .acquire(acq("b", 2, LockState::Held))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok,
+        "B (first waiter) must hold h:/c after A releases"
+    );
+    // C is still waiting (B holds it now) — re-issuing C's acquire re-queues it,
+    // and critically does NOT block B's ownership.
+    assert_eq!(
+        daemon
+            .client
+            .acquire(acq("c", 3, LockState::New))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Queued
+    );
+
+    // B releases → C is granted next.
+    daemon.client.release(rel("b")).await.unwrap();
+    assert_eq!(
+        daemon
+            .client
+            .acquire(acq("c", 3, LockState::Held))
+            .await
+            .unwrap()
+            .into_inner()
+            .status(),
+        AcquireStatus::Ok,
+        "C (second waiter) must hold h:/c after B releases"
+    );
+
+    daemon.child.kill().ok();
+    daemon.child.wait().ok();
 }

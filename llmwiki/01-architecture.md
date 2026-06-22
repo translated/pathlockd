@@ -6,20 +6,35 @@
 clients ──gRPC──▶ pathlockd (N replicas)
                      │
                      ├── Multi-Raft (openraft) ── consensus log
-                     ├── RocksDB              ── durable storage (14 CFs)
+                     ├── RocksDB              ── durable storage (15 CFs)
                      └── SWIM gossip (foca)   ── cluster membership
 ```
 
 - **pathlockd** is a single binary. Every node runs its own Raft group
   instances, its own RocksDB database, and its own gossip participant. There are
   no external coordination or storage services.
-- **Multi-Raft** provides consensus. Each lock domain (handler prefix) maps to a
-  Raft group via Rendezvous Hashing (`xxh3_64`). The group leader applies
-  commands through a deterministic state machine backed by RocksDB WriteBatch.
-- **RocksDB** stores all lock metadata across 14 column families with per-key
+- **Multi-Raft** provides consensus. Each routing namespace (first path segment
+  by default, or an explicit namespace root) maps to a Raft group via
+  Rendezvous Hashing (`xxh3_64`). The group leader applies commands through a
+  deterministic state machine backed by RocksDB WriteBatch.
+- **RocksDB** stores all lock metadata across 15 column families with per-key
   TTL, background GC sweeps, and configurable WAL fsync.
 - **SWIM gossip** (via `foca`) discovers cluster nodes from a static `seed_nodes`
   list and propagates membership changes.
+
+## Lock algorithm is a property of the routing namespace
+
+Each routing namespace has a `LockAlgorithm` (`recursive_rw` by default;
+`point_rw`, `recursive_write`, `point_write` opt-ins) that selects the
+conflict rules used inside the group: the scope of a write
+(subtree vs exact path), whether reads are allowed at all, and whether
+the descendant index is consulted. The algorithm is **stamped on the
+held lock** (in `META_CF`) so it survives the namespace policy that
+produced it; `Set` / `Delete` of a namespace policy is forward-only and
+never shrinks a live lease. See
+[08-lock-algorithms.md](08-lock-algorithms.md) for the four conflict
+matrices, the rationale, and the interaction with routing and the
+wait queue.
 
 ## Request lifecycle (e.g. acquire)
 
@@ -27,14 +42,14 @@ clients ──gRPC──▶ pathlockd (N replicas)
    fencing token.
 2. `service.rs` maps the proto request to engine types, validates inputs, and
    calls the router.
-3. The router hashes the handler to a Raft group, builds a `Command`, and sends
-   it to the group leader for apply.
+3. The router resolves the path's routing namespace, hashes it to a Raft group,
+   builds a `Command`, and sends it to the group leader for apply.
 4. The state machine's `apply()` decodes the command, opens a RocksDB
    `WriteBatch`, calls `engine::acquire_inner()` (synchronous, deterministic),
    and commits the batch atomically.
-5. The outcome (OK / CONFLICT / LOST) maps back to a proto response. If an
-   inline release happened and the caller asked for it, a `RELEASED` event is
-   published.
+5. The outcome (OK / QUEUED / CONFLICT / LOST) maps back to a proto response. A
+   waitable conflict is enqueued (QUEUED); any release the command performed runs
+   the grant sweep, and each waiter granted in place gets a `GRANT` event.
 
 ## Concurrency model
 
@@ -46,8 +61,9 @@ clients ──gRPC──▶ pathlockd (N replicas)
   stamped by the leader. All TTL expiry checks use this deterministic clock, not
   wall-clock time. Fencing tokens come from a monotonic counter in the `meta`
   column family.
-- **Parallelism across groups.** Different handler domains map to different Raft
-  groups, so writes on disjoint handlers proceed in parallel without contention.
+- **Parallelism across groups.** Different routing namespaces can map to
+  different Raft groups, so writes on disjoint namespaces proceed in parallel
+  without contention.
 - **Read-only operations** (inspect, list, dump, detect_cycle, is_blocking) use a
   RocksDB snapshot. They skip the Raft apply path and serve locally.
 

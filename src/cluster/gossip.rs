@@ -44,6 +44,7 @@ pub struct NodeIdentity {
     pub node_id: u64,
     pub meta: NodeMeta,
     pub incarnation: u64,
+    pub config_fingerprint: u64,
 }
 
 impl foca::Identity for NodeIdentity {
@@ -62,6 +63,7 @@ impl foca::Identity for NodeIdentity {
             node_id: self.node_id,
             meta: self.meta.clone(),
             incarnation: self.incarnation + 1,
+            config_fingerprint: self.config_fingerprint,
         })
     }
 }
@@ -331,6 +333,7 @@ async fn resolve_seed(seed: &str) -> Option<(SocketAddr, NodeIdentity)> {
                 gossip_addr: addr.to_string(),
             },
             incarnation: 0,
+            config_fingerprint: 0,
         },
     ))
 }
@@ -395,6 +398,7 @@ impl Ord for PendingTimer {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn gossip_loop(
     mut foca: FocaInstance,
     socket: Arc<UdpSocket>,
@@ -730,6 +734,7 @@ mod tests {
                 gossip_addr: format!("10.0.0.{node_id}:7946"),
             },
             incarnation,
+            config_fingerprint: 0,
         }
     }
 

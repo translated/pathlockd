@@ -7,6 +7,8 @@
 //! linearizable read barrier. Both reply with a serialized
 //! `Result<_, ForwardError>` so callers can chase `NotLeader` hints.
 
+#![allow(clippy::items_after_test_module)]
+
 use std::sync::Arc;
 
 use tokio_stream::StreamExt;
@@ -17,8 +19,8 @@ use crate::raft::manager::RaftGroups;
 use crate::raft::types::{ForwardError, ReadOp, ReadResult, TypeConfig};
 use crate::raft_proto::raft_transport_server::RaftTransport;
 use crate::raft_proto::{
-    ForwardReadRequest, ForwardReadResponse, ForwardRequest, ForwardResponse, RaftFrame,
-    SetDrainingRequest, SetDrainingResponse, SnapshotChunk,
+    ForwardReadRequest, ForwardReadResponse, ForwardRequest, ForwardResponse, PublishEventRequest,
+    PublishEventResponse, RaftFrame, SetDrainingRequest, SetDrainingResponse, SnapshotChunk,
 };
 
 fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Status> {
@@ -35,13 +37,19 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, Status> {
 pub struct RaftTransportService {
     groups: Arc<RaftGroups>,
     group_count: u32,
+    broadcaster: crate::events::Broadcaster,
 }
 
 impl RaftTransportService {
-    pub fn new(groups: Arc<RaftGroups>, group_count: u32) -> Self {
+    pub fn new(
+        groups: Arc<RaftGroups>,
+        group_count: u32,
+        broadcaster: crate::events::Broadcaster,
+    ) -> Self {
         Self {
             groups,
             group_count,
+            broadcaster,
         }
     }
 
@@ -143,6 +151,12 @@ impl RaftTransport for RaftTransportService {
         &self,
         request: Request<Streaming<SnapshotChunk>>,
     ) -> Result<Response<RaftFrame>, Status> {
+        static SNAPSHOT_INSTALL_LIMIT: tokio::sync::Semaphore =
+            tokio::sync::Semaphore::const_new(1);
+        let _permit = SNAPSHOT_INSTALL_LIMIT
+            .acquire()
+            .await
+            .map_err(|_| Status::unavailable("snapshot installer closed"))?;
         let mut stream = request.into_inner();
 
         let mut assembler = SnapshotAssembler::new(
@@ -224,6 +238,20 @@ impl RaftTransport for RaftTransportService {
             .await
             .map_err(|e| Status::failed_precondition(e.to_string()))?;
         Ok(Response::new(SetDrainingResponse {}))
+    }
+
+    async fn publish_event(
+        &self,
+        request: Request<PublishEventRequest>,
+    ) -> Result<Response<PublishEventResponse>, Status> {
+        let event = request.into_inner();
+        let event = crate::proto::Event {
+            r#type: event.r#type,
+            owner_id: event.owner_id,
+        };
+        crate::service::validate_peer_event(&event)?;
+        self.broadcaster.publish_from_peer(event);
+        Ok(Response::new(PublishEventResponse {}))
     }
 }
 
@@ -361,8 +389,10 @@ impl RaftTransportService {
             })?;
 
         let db = self.groups.db_handle();
+        let default_algorithm = self.groups.default_algorithm();
         tokio::task::spawn_blocking(move || {
-            execute_read_blocking(&db, group, op).map_err(|e| ForwardError::Other(e.to_string()))
+            execute_read_blocking(&db, group, op, default_algorithm)
+                .map_err(|e| ForwardError::Other(e.to_string()))
         })
         .await
         .map_err(|e| ForwardError::Other(format!("read task failed: {e}")))?
@@ -376,30 +406,35 @@ pub fn execute_read_blocking(
     db: &Arc<rocksdb::DB>,
     group: u32,
     op: ReadOp,
+    default_algorithm: crate::engine::LockAlgorithm,
 ) -> anyhow::Result<ReadResult> {
     // Clamp the read clock to the group's persisted monotone apply clock so
     // a node with a lagging wall clock cannot judge TTL liveness more
     // generously at read time than the apply path would.
-    let now_ms =
-        crate::store_keys::now_ms().max(crate::raft::state_machine::read_last_now(db, group)?);
-    let mut txn = crate::store_rocksdb::RocksDbTxn::new(db.clone(), group, now_ms);
+    let snapshot = db.snapshot();
+    let now_ms = crate::store_keys::now_ms().max(
+        crate::raft::state_machine::read_last_now_snapshot(db, &snapshot, group)?,
+    );
+    let mut txn = crate::store_rocksdb::SnapshotTxn::new(db, &snapshot, group, now_ms);
     match op {
         ReadOp::AssertFencing {
+            namespace,
             owner,
             token,
             paths,
-        } => crate::engine::assert_fencing_inner(&mut txn, &owner, token, &paths)
+        } => crate::engine::assert_fencing_inner(&mut txn, &namespace, &owner, token, &paths)
             .map(ReadResult::AssertFencing),
-        ReadOp::InspectPath { path } => {
-            crate::engine::inspect_path_inner(&mut txn, &path).map(ReadResult::InspectPath)
+        ReadOp::InspectPath { namespace, path } => {
+            crate::engine::inspect_path_inner(&mut txn, &namespace, &path)
+                .map(ReadResult::InspectPath)
         }
         ReadOp::IsBlocking {
+            namespace,
             path,
             owner,
             reason,
-        } => {
-            crate::engine::is_blocking_inner(&mut txn, &path, &owner, &reason).map(ReadResult::Bool)
-        }
+        } => crate::engine::is_blocking_inner(&mut txn, &namespace, &path, &owner, reason)
+            .map(ReadResult::Bool),
         ReadOp::IsOwnerAlive { owner } => {
             crate::engine::is_owner_alive_inner(&mut txn, &owner).map(ReadResult::Bool)
         }
@@ -411,6 +446,24 @@ pub fn execute_read_blocking(
         }
         ReadOp::ReadWaitEdge { owner } => {
             crate::engine::read_wait_edge(&mut txn, &owner).map(ReadResult::WaitEdge)
+        }
+        ReadOp::GetNamespacePolicy { namespace } => {
+            let (policy, explicit) = crate::engine::get_namespace_policy_record_inner(
+                &mut txn,
+                &namespace,
+                default_algorithm,
+            )?;
+            Ok(ReadResult::NamespacePolicy {
+                algorithm: policy.algorithm,
+                explicit,
+                epoch: policy.epoch,
+            })
+        }
+        ReadOp::ListNamespaces => crate::store_rocksdb::list_namespace_settings(db, group, now_ms)
+            .map(ReadResult::NamespaceList),
+        ReadOp::NamespaceHasLocks { namespace } => {
+            crate::store_rocksdb::namespace_has_live_locks(db, group, now_ms, &namespace)
+                .map(ReadResult::Bool)
         }
     }
 }

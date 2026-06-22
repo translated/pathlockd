@@ -32,6 +32,7 @@ fn wr(path: &str) -> pathlockd::proto::LockRequest {
         path: path.into(),
         mode: Mode::Write as i32,
         state: LockState::New as i32,
+        permits: 0,
     }
 }
 
@@ -62,7 +63,7 @@ async fn live_cluster_mutual_exclusion() {
             fencing_token: token,
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -78,7 +79,7 @@ async fn live_cluster_mutual_exclusion() {
             fencing_token: token + 1,
             requests: vec![wr("live:/contended")],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await
@@ -86,7 +87,7 @@ async fn live_cluster_mutual_exclusion() {
         .into_inner();
     assert_eq!(
         resp.status,
-        AcquireStatus::Conflict as i32,
+        AcquireStatus::Queued as i32,
         "node B must see node A's lock: {resp:?}"
     );
     assert_eq!(resp.owner, "live-owner-1");
@@ -143,13 +144,13 @@ async fn live_cluster_state_survives_on_survivors() {
                 fencing_token: 999_999,
                 requests: vec![wr(&path)],
                 release_requests: vec![],
-                emit_release: false,
+                queue_ttl_ms: 0,
                 idempotency_key: String::new(),
             })
             .await
             .unwrap()
             .into_inner();
-        assert_eq!(resp.status, AcquireStatus::Conflict as i32, "via {node}");
+        assert_eq!(resp.status, AcquireStatus::Queued as i32, "via {node}");
     }
 }
 
@@ -176,7 +177,7 @@ async fn live_cluster_take_lock() {
             fencing_token: token,
             requests: vec![wr(&path)],
             release_requests: vec![],
-            emit_release: false,
+            queue_ttl_ms: 0,
             idempotency_key: String::new(),
         })
         .await

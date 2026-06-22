@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::engine::{AcquireArgs, RelReq};
+use crate::engine::{AcquireArgs, LockAlgorithm, LockPolicy, RelReq};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
@@ -28,8 +28,8 @@ pub struct RequestId {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Op {
-    Acquire(AcquireArgs),
     Release {
+        namespace: String,
         owner: String,
         reqs: Vec<RelReq>,
         del_wait: bool,
@@ -45,15 +45,6 @@ pub enum Op {
     ForceRelease {
         victim: String,
     },
-    SetClaim {
-        path: String,
-        claimant: String,
-        ttl_ms: u64,
-    },
-    ClearClaim {
-        path: String,
-        claimant: String,
-    },
     SetWaitEdge {
         owner: String,
         edge: WaitEdge,
@@ -62,10 +53,17 @@ pub enum Op {
     ClearWaitEdge {
         owner: String,
     },
+    /// Record a pending cooperative-revoke marker for an owner (TTL-bounded).
+    /// The owner observes it on its next `Renew` and yields voluntarily — a
+    /// poll-only client thus needs no event stream to learn it was asked to
+    /// release.
+    RequestRevoke {
+        owner: String,
+        ttl_ms: u64,
+    },
     GcSweep {
-        /// Unused (the apply path uses the command's clamped `now_ms`), but
-        /// retained: removing it would change the bincode log encoding and
-        /// break replay of existing raft logs.
+        /// Unused by apply; retained as an explicit command payload timestamp
+        /// for callers that want to include the requested sweep time.
         now_ms: u64,
         batch: u32,
     },
@@ -86,6 +84,22 @@ pub enum Op {
         node_id: u64,
         draining: bool,
     },
+    /// Set the lock algorithm for a namespace in this group's policy table.
+    SetNamespacePolicy {
+        namespace: String,
+        algorithm: LockAlgorithm,
+    },
+    /// Delete an explicit namespace policy/routing row from this group's
+    /// namespace-settings table. Missing rows are a no-op.
+    DeleteNamespacePolicy {
+        namespace: String,
+    },
+    /// Acquire using the router-resolved namespace and policy snapshot.
+    AcquireInNamespace {
+        namespace: String,
+        policy: LockPolicy,
+        args: AcquireArgs,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +119,8 @@ pub enum RejectKind {
     /// The request id was already used by a different command within the
     /// dedupe window.
     IdempotencyMismatch,
+    PolicyEpochStale,
+    RoutingStale,
 }
 
 /// Responses returned by the state machine after applying an Op.
@@ -113,7 +129,6 @@ pub enum ApplyResponse {
     Acquire(crate::engine::AcquireOutcome),
     Renew(crate::engine::RenewOutcome),
     AssertFencing(crate::engine::AssertOutcome),
-    SetClaim(crate::engine::ClaimOutcome),
     IncrFence(i64),
     /// Outcome of a `GcSweep` pass. `scanned` is the number of expiry-index
     /// entries processed (a full batch means more backlog remains); `reclaimed`
@@ -121,16 +136,33 @@ pub enum ApplyResponse {
     Gc {
         scanned: u32,
         reclaimed: u64,
+        granted: Vec<String>,
     },
     Unit,
     /// The command was refused and none of its writes committed. Logical
-    /// limits are rejections the proposer must surface to the client — unlike
-    /// storage errors they must not shut the raft core down, because the
-    /// entry is already committed and every replica would fail it identically
-    /// (a poison-pill log entry). Appended last so existing variant encodings
-    /// stay stable.
+    /// limits are rejections the proposer must surface to the client. Unlike
+    /// storage errors they must not shut the raft core down, because the entry
+    /// is already committed and every replica would fail it identically.
     Rejected {
         kind: RejectKind,
         detail: String,
     },
+    /// Owners whose queued acquire was granted in place by this command's grant
+    /// sweep (release / release-all / force-release). The service layer emits a
+    /// GRANT event for each.
+    Granted(Vec<String>),
+    /// An acquire that succeeded *and*, via its inline releases, granted queued
+    /// waiters in place: the acquire outcome plus the granted owners. The
+    /// service layer emits a GRANT event for each.
+    AcquireGranted {
+        outcome: crate::engine::AcquireOutcome,
+        granted: Vec<String>,
+    },
+    /// Owners whose held and/or queued locks were force-cleared because a
+    /// namespace's effective lock algorithm changed (`SetNamespacePolicy` to a
+    /// different algorithm, or `DeleteNamespacePolicy` reverting an explicit
+    /// non-default policy). Those locks were acquired under the old algorithm's
+    /// conflict semantics, so they are dropped and the owners told to
+    /// re-establish; the service layer emits a KILLED event for each.
+    NamespaceCleared(Vec<String>),
 }

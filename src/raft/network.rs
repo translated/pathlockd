@@ -34,6 +34,45 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Snapshot images stream in slices of this size.
 const DEFAULT_SNAPSHOT_CHUNK: usize = 1 << 20;
+pub const INTERNAL_AUTH_HEADER: &str = "x-pathlockd-cluster-token";
+
+/// Maximum encoded bytes accepted on the internal node-to-node transport.
+/// The public `AcquireStream` merges up to 4 MiB of encoded request before
+/// wrapping it in a bincode `Command` inside a `ForwardRequest`/`RaftFrame`, so
+/// the internal transport must accept comfortably more than the public 4 MiB
+/// limit or a large request that the leader accepts can fail when forwarded
+/// or replicated. Generous headroom keeps the internal cap from becoming the
+/// de facto public cap.
+pub const MAX_INTERNAL_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+
+pub fn authorize_internal_request<T>(
+    request: &mut tonic::Request<T>,
+    token: &str,
+) -> anyhow::Result<()> {
+    let mut value = tonic::metadata::MetadataValue::try_from(token)
+        .map_err(|e| anyhow::anyhow!("invalid internal auth token: {e}"))?;
+    value.set_sensitive(true);
+    request.metadata_mut().insert(INTERNAL_AUTH_HEADER, value);
+    Ok(())
+}
+
+pub fn authenticate_internal_request<T>(
+    request: &tonic::Request<T>,
+    token: &str,
+) -> Result<(), tonic::Status> {
+    let authorized = request
+        .metadata()
+        .get(INTERNAL_AUTH_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == token);
+    if authorized {
+        Ok(())
+    } else {
+        Err(tonic::Status::unauthenticated(
+            "invalid cluster credentials",
+        ))
+    }
+}
 
 pub(crate) fn encode<T: serde::Serialize>(v: &T) -> Result<Vec<u8>, Unreachable<TypeConfig>> {
     bincode::serde::encode_to_vec(v, bincode::config::standard())
@@ -58,14 +97,22 @@ pub(crate) struct IoStr(pub String);
 
 /// Shared cache of per-peer gRPC channels, keyed by node id; re-keyed when a
 /// node's advertised raft_addr changes.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct PeerPool {
     channels: Arc<Mutex<HashMap<u64, (String, Channel)>>>,
+    auth_token: Arc<str>,
 }
 
 impl PeerPool {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(auth_token: impl Into<String>) -> Self {
+        Self {
+            channels: Arc::new(Mutex::new(HashMap::new())),
+            auth_token: Arc::from(auth_token.into()),
+        }
+    }
+
+    pub fn authorize<T>(&self, request: &mut tonic::Request<T>) -> anyhow::Result<()> {
+        authorize_internal_request(request, &self.auth_token)
     }
 
     /// Get (or lazily create) the channel for a peer.
@@ -136,7 +183,9 @@ impl RaftClientConn {
             .pool
             .channel(self.target, &self.node.raft_addr)
             .map_err(|e| RPCError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
-        Ok(RaftTransportClient::new(channel))
+        Ok(RaftTransportClient::new(channel)
+            .max_decoding_message_size(MAX_INTERNAL_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_INTERNAL_MESSAGE_BYTES))
     }
 
     fn frame<T: serde::Serialize>(&self, payload: &T) -> Result<RaftFrame, RPCError> {
@@ -173,6 +222,9 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
     ) -> Result<AppendEntriesResponse<TypeConfig>, RPCError> {
         let mut client = self.client()?;
         let mut request = tonic::Request::new(self.frame(&rpc)?);
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
         request.set_timeout(option.hard_ttl());
         let resp = client.append_entries(request).await.map_err(rpc_err)?;
         decode(&resp.into_inner().payload).map_err(RPCError::Unreachable)
@@ -185,6 +237,9 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
     ) -> Result<VoteResponse<TypeConfig>, RPCError> {
         let mut client = self.client()?;
         let mut request = tonic::Request::new(self.frame(&rpc)?);
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
         request.set_timeout(option.hard_ttl());
         let resp = client.vote(request).await.map_err(rpc_err)?;
         decode(&resp.into_inner().payload).map_err(RPCError::Unreachable)
@@ -241,6 +296,9 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
         };
 
         let mut request = tonic::Request::new(chunks);
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| StreamingError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
         request.set_timeout(option.hard_ttl());
 
         tokio::pin!(cancel);
@@ -263,8 +321,25 @@ impl RaftNetworkV2<TypeConfig> for RaftClientConn {
     ) -> Result<(), RPCError> {
         let mut client = self.client()?;
         let mut request = tonic::Request::new(self.frame(&req)?);
+        self.pool
+            .authorize(&mut request)
+            .map_err(|e| RPCError::Unreachable(Unreachable::new(&IoStr(e.to_string()))))?;
         request.set_timeout(option.hard_ttl());
         client.transfer_leader(request).await.map_err(rpc_err)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn internal_auth_requires_the_shared_token() {
+        let mut request = tonic::Request::new(());
+        assert!(authenticate_internal_request(&request, "secret").is_err());
+        authorize_internal_request(&mut request, "secret").unwrap();
+        assert!(authenticate_internal_request(&request, "secret").is_ok());
+        assert!(authenticate_internal_request(&request, "different").is_err());
     }
 }

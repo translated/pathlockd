@@ -17,7 +17,7 @@ deterministic state machine.
 |---|---|
 | `proto/pathlockd.proto` | The gRPC contract (the only public API). |
 | `src/store_rocksdb.rs` | RocksDB-backed `StoreTxn` trait, value model, TTL emulation. |
-| `src/store_keys.rs` | Key layout for all 14 column families. |
+| `src/store_keys.rs` | Key layout for all 15 column families. |
 | `src/engine.rs` | The lock primitives (acquire/release/renew/…), conflict logic. |
 | `src/service.rs` | gRPC service: proto ⇄ engine mapping, event publishing. |
 | `src/events.rs` | Per-owner event broadcaster + peer fan-out. |
@@ -38,17 +38,26 @@ deterministic state machine.
 4. [Events](04-events.md) — the per-owner stream, deadlock resolution, peers.
 5. [Configuration](05-config.md) — every knob.
 6. [Testing](06-testing.md) — running the suite.
+7. [Extending](07-extending.md) — adding an RPC, touching the data model.
+8. [Lock algorithms & namespace policies](08-lock-algorithms.md) — the four
+   `LockAlgorithm` policies, per-algorithm conflict matrices, how the
+   algorithm is selected and stamped on the held lock, and how routing
+   and the wait queue interact with it.
 
 ## Invariants to preserve
 
 - A write lock on `P` excludes any lock on `P`, on an ancestor of `P`, or
-  anywhere in `P`'s subtree. Reads are point-only.
+  anywhere in `P`'s subtree. Reads are point-only. (The scope of
+  "subtree" and whether reads are even allowed depend on the
+  `LockAlgorithm` — see [08-lock-algorithms.md](08-lock-algorithms.md).)
 - Conflict precedence is fixed: `ancestor_locked` → `write_locked` →
   `read_locked` → `descendant_write_locked` → `descendant_read_locked` →
-  `stale_fencing_token`.
+  `read_locks_disabled` → `stale_fencing_token`.
 - Fencing tokens are monotonic and never decrease for a path.
 - Every lock is a lease; nothing is held forever without renewal (`ttl_ms` must
   be `> 0`, so a lock can never be created non-expiring).
 - A subscription only ever sees its own owner's events.
 - Mutations are applied serially through a single RocksDB WriteBatch per group,
   executed synchronously in the Raft state machine.
+- A held lock keeps the `LockAlgorithm` it was acquired with — a namespace
+  policy change is **forward-only**.

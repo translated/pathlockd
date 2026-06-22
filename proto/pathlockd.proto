@@ -8,7 +8,7 @@ package pathlockd.v1;
 //
 // Each lock is owned by a caller-supplied owner id, leases a set of hierarchical
 // paths (read or write), renews its lease to stay alive, and observes lifecycle
-// events (release / kill / revoke) for its own owner id over a server stream.
+// events (kill / revoke) for its own owner id over a server stream.
 // The RPCs below are the complete primitive surface; higher-level orchestration
 // (renewal cadence, contention waiting, deadlock resolution policy) lives in the
 // client.
@@ -32,17 +32,107 @@ enum LockState {
   LOCK_STATE_HELD = 1;
 }
 
+enum LockAlgorithm {
+  // Default: shared point reads; writes are exclusive on the path and its
+  // descendants.
+  LOCK_ALGORITHM_RECURSIVE_RW = 0;
+  // Shared point reads; writes are exclusive only on the exact path.
+  LOCK_ALGORITHM_POINT_RW = 1;
+  // Write locks only; writes are exclusive on the path and descendants.
+  LOCK_ALGORITHM_RECURSIVE_WRITE = 2;
+  // Write locks only; writes are exclusive only on the exact path.
+  LOCK_ALGORITHM_POINT_WRITE = 3;
+  // Counting semaphore: point-scoped, write-only. Each semaphore path has its
+  // own permit capacity supplied by LockRequest.permits on first acquire; no
+  // read mode, no descendant exclusion, no fencing.
+  LOCK_ALGORITHM_SEMAPHORE = 4;
+}
+
+enum ReasonCode {
+  REASON_CODE_UNSPECIFIED = 0;
+  REASON_CODE_ANCESTOR_LOCKED = 1;
+  REASON_CODE_WRITE_LOCKED = 2;
+  REASON_CODE_READ_LOCKED = 3;
+  REASON_CODE_DESCENDANT_WRITE_LOCKED = 4;
+  REASON_CODE_DESCENDANT_READ_LOCKED = 5;
+  REASON_CODE_READ_LOCKS_DISABLED = 6;
+  REASON_CODE_STALE_FENCING_TOKEN = 7;
+  REASON_CODE_INVALID_PERMITS = 8;
+  REASON_CODE_SEMAPHORE_FULL = 9;
+  REASON_CODE_MISSING_SEMAPHORE = 10;
+  REASON_CODE_MISSING_WRITE = 11;
+  REASON_CODE_MISSING_READ = 12;
+  REASON_CODE_MISSING_FENCE = 13;
+  REASON_CODE_MISSING_ALIVE = 14;
+  REASON_CODE_MISSING_OWNER_SET = 15;
+  REASON_CODE_EMPTY_OWNER_SET = 16;
+  REASON_CODE_QUEUED = 17;
+  REASON_CODE_STALE_OWNER = 18;
+}
+
 message LockRequest {
   // Path form: "<handlerType>:<normalizedPath>", e.g. "google_drive:/a/b".
   string path = 1;
   Mode mode = 2;
   LockState state = 3;
+  // Required > 0 for LOCK_ALGORITHM_SEMAPHORE write acquires. The first acquire
+  // for a semaphore path establishes that path's capacity; later acquires for
+  // the same path must use the same value. Ignored by other algorithms.
+  uint32 permits = 4;
 }
 
 message ReleaseRequest {
   string path = 1;
   Mode mode = 2;
 }
+
+// ---------------------------------------------------------------------------
+// Namespace policy
+// ---------------------------------------------------------------------------
+
+message SetNamespacePolicyRequest {
+  // Namespace is either a handler ("google_drive") or a normalized path root
+  // ("google_drive:/docs" or "google_drive:/docs/team"). A path namespace
+  // also becomes an explicit routing root; longest explicit root wins.
+  //
+  // If this changes the namespace's effective algorithm, every lock under the
+  // namespace — held AND queued — is force-cleared: those locks were taken
+  // under the old conflict semantics, so they are dropped and each affected
+  // owner receives a KILLED event and must re-acquire. Re-setting the same
+  // algorithm clears nothing.
+  string namespace = 1;
+  LockAlgorithm algorithm = 2;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 3;
+}
+
+message SetNamespacePolicyResponse {}
+
+message GetNamespacePolicyRequest {
+  // Exact namespace key to read. Missing rows use LOCK_ALGORITHM_RECURSIVE_RW.
+  string namespace = 1;
+}
+
+message GetNamespacePolicyResponse {
+  LockAlgorithm algorithm = 1;
+  // false means no explicit row exists and the daemon is using the default
+  // LOCK_ALGORITHM_RECURSIVE_RW policy.
+  bool explicit = 2;
+}
+
+message DeleteNamespacePolicyRequest {
+  // Removes the explicit policy/routing root. Future requests fall back to the
+  // default resolver unless another explicit parent namespace matches.
+  //
+  // If reverting to the default changes the namespace's effective algorithm,
+  // its locks (held and queued) are force-cleared exactly as in
+  // SetNamespacePolicy, and each affected owner receives a KILLED event.
+  string namespace = 1;
+  // Optional apply-once key for safe client retries of this logical request.
+  string idempotency_key = 2;
+}
+
+message DeleteNamespacePolicyResponse {}
 
 // ---------------------------------------------------------------------------
 // Acquire
@@ -52,34 +142,51 @@ message AcquireRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
   repeated LockRequest requests = 3;
-  // Required to be > 0 when any request is MODE_WRITE. Reads ignore it.
+  // Optional caller-supplied fence. 0 lets the server mint the next token for
+  // write acquires. Reads and semaphore namespaces ignore it.
   int64 fencing_token = 4;
   // Releases folded into the same atomic transaction (shadowing transitions).
   repeated ReleaseRequest release_requests = 5;
-  // When true and releases were applied, publish a RELEASED event for owner_id.
-  bool emit_release = 6;
   // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 7;
+  string idempotency_key = 6;
+  // If this acquire is queued (contended), how long its wait-queue entry lives
+  // without being granted — the caller's own acquire deadline. 0 selects a
+  // server default. Lets an abandoned waiter self-evict at the client's
+  // threshold rather than a fixed server TTL.
+  uint64 queue_ttl_ms = 7;
 }
 
 enum AcquireStatus {
   ACQUIRE_STATUS_OK = 0;
   ACQUIRE_STATUS_CONFLICT = 1;
   ACQUIRE_STATUS_LOST = 2;
+  // The request was enqueued in the wait queue (contended). It will be granted
+  // in place when the contended path frees; the caller waits for a GRANT event
+  // rather than retrying. `path`/`owner`/`reason` describe what it is queued
+  // behind (same fields as a conflict).
+  ACQUIRE_STATUS_QUEUED = 3;
 }
 
 message AcquireResponse {
   AcquireStatus status = 1;
   // CONFLICT: the conflicting path. LOST: the path whose key/fence went missing.
   string path = 2;
-  // CONFLICT: the conflicting owner id (or, for stale_fencing_token, the
-  // persisted fence value as a string). Empty for LOST/OK.
+  // CONFLICT: the conflicting owner id. Empty for LOST/OK.
   string owner = 3;
-  // CONFLICT/LOST: machine-readable reason
-  // (ancestor_locked | write_locked | read_locked | descendant_write_locked |
-  //  descendant_read_locked | stale_fencing_token | missing_write | missing_read |
-  //  missing_fence | missing_alive).
-  string reason = 4;
+  // CONFLICT/LOST/QUEUED: machine-readable reason.
+  ReasonCode reason = 4;
+  // OK/QUEUED: server-minted or caller-supplied fencing token for this acquire.
+  int64 fencing_token = 5;
+  // STALE_FENCING_TOKEN: persisted current token for the path.
+  int64 current_fencing_token = 6;
+  // OK: the routing namespace this acquire resolved to. Every path in a single
+  // acquire shares one routing namespace (the daemon rejects acquires that span
+  // namespaces), so this one value covers them all. Record it per held path and
+  // replay the distinct set as Renew.domains: renew then targets exactly the
+  // groups where the owner holds locks, with no client-side routing logic and
+  // explicit namespaces honored — the daemon resolved it, so it can never
+  // mis-map. Empty for non-OK responses.
+  string namespace = 7;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +207,12 @@ message ReleaseAllRequest {
   bool del_wait_key = 2;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 3;
+  // Optional routing namespaces this owner holds locks in (same form as
+  // Renew.domains). When set, the release fan-out targets only those groups
+  // instead of every lock group; an under-declared set leaves locks in
+  // unlisted groups to expire on their TTL. When empty, every group is swept
+  // (the safe default for an unconditional "release everything").
+  repeated string domains = 4;
 }
 
 message ReleaseResponse {}
@@ -111,11 +224,11 @@ message ReleaseResponse {}
 message RenewRequest {
   string owner_id = 1;
   uint64 ttl_ms = 2;
-  // The routing domains in which this owner holds locks (the handler prefix
-  // of each held path, e.g. "google_drive"; with deeper routing prefixes,
-  // the prefix at the configured depth). Targets the renew fan-out at exactly
-  // those Raft groups. When empty, every group is probed — correct, but
-  // amplified; strongly discouraged for heartbeat-frequency renews.
+  // The routing namespaces in which this owner holds locks, e.g.
+  // "google_drive:/team" by default or an explicit root such as
+  // "google_drive:/team/archive". Targets the renew fan-out at exactly those
+  // Raft groups. When empty, every group is probed — correct, but amplified;
+  // strongly discouraged for heartbeat-frequency renews.
   repeated string domains = 3;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 4;
@@ -129,7 +242,13 @@ enum RenewStatus {
 message RenewResponse {
   RenewStatus status = 1;
   string path = 2;
-  string reason = 3;
+  ReasonCode reason = 3;
+  // OK only: a cooperative revoke is pending for this owner (set by
+  // RequestRevoke). The holder should finish its current unit of work and
+  // release. Carried on the renew heartbeat so a poll-only client — one that
+  // cannot hold a Subscribe/SSE stream — still learns it has been asked to
+  // yield, with no separate event channel.
+  bool revoke_requested = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -163,7 +282,7 @@ enum AssertStatus {
 message AssertFencingResponse {
   AssertStatus status = 1;
   string path = 2;
-  string reason = 3; // stale_owner | stale_fencing_token
+  ReasonCode reason = 3;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +317,7 @@ message DetectCycleResponse {
 message IsBlockingRequest {
   string conflict_path = 1;
   string conflict_owner = 2;
-  string reason = 3;
+  ReasonCode reason = 3;
 }
 
 message IsBlockingResponse {
@@ -228,10 +347,8 @@ message SetWaitEdgeRequest {
   uint64 ttl_ms = 3;
   // Optional metadata for the blocking edge. New clients populate these so
   // DetectCycle can discard stale live-owner edges before reporting a cycle.
-  // Older clients may leave them empty; the daemon keeps legacy best-effort
-  // behaviour for those edges.
   string conflict_path = 4;
-  string reason = 5;
+  ReasonCode reason = 5;
   // Optional apply-once key for safe client retries of this logical request.
   string idempotency_key = 6;
 }
@@ -252,6 +369,11 @@ message ClearWaitEdgeResponse {}
 
 message IsOwnerAliveRequest {
   string owner_id = 1;
+  // Optional routing namespaces to probe (same form as Renew.domains). When
+  // set, only those groups are queried; an under-declared set can report a
+  // false negative, so omit it when an authoritative answer is needed. When
+  // empty, every lock group is probed.
+  repeated string domains = 2;
 }
 
 message IsOwnerAliveResponse {
@@ -259,65 +381,11 @@ message IsOwnerAliveResponse {
 }
 
 // ---------------------------------------------------------------------------
-// Claims (anti-starvation path reservations)
-//
-// A claim reserves a path for a claimant without granting the lock: new
-// acquires by other owners that overlap the claimed path (exact, ancestor, or
-// — for write requests — descendant) are refused with `preempt_claimed` while
-// existing holders drain. The claimant's own acquire consumes its claim
-// atomically on grant. Claims are TTL-governed only — they never require the
-// claimant to hold a lease, so a pure waiter (holding nothing yet) can reserve
-// the path it is queued for; a crashed claimant's reservation simply expires.
-// ---------------------------------------------------------------------------
-
-message SetClaimRequest {
-  // Path form "<handlerType>:<normalizedPath>".
-  string path = 1;
-  string claimant_owner_id = 2;
-  // Reservation TTL; 0 selects a short server default. Capped at the server's
-  // max claim TTL. Refreshing one's own claim re-arms the TTL.
-  uint64 ttl_ms = 3;
-  // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 4;
-}
-
-enum SetClaimStatus {
-  SET_CLAIM_STATUS_OK = 0;
-  // Another live claimant already reserves this path: the claim was NOT
-  // overwritten (claim-if-absent semantics). claim_owner names the holder.
-  SET_CLAIM_STATUS_HELD = 1;
-}
-
-message SetClaimResponse {
-  SetClaimStatus status = 1;
-  // The current claimant when status is HELD; empty on OK.
-  string claim_owner = 2;
-}
-
-message ClearClaimRequest {
-  string path = 1;
-  // Only this claimant's own claim is cleared; a foreign claim is untouched.
-  string claimant_owner_id = 2;
-  // Optional apply-once key for safe client retries of this logical request.
-  string idempotency_key = 3;
-}
-
-message ClearClaimResponse {}
-
-// ---------------------------------------------------------------------------
 // Cooperative revoke (publish a REVOKE event for an owner)
 // ---------------------------------------------------------------------------
 
 message RequestRevokeRequest {
   string owner_id = 1;
-  // Optional preemption claim. When claim_path and claimant_owner_id are both
-  // set, the daemon reserves claim_path for claimant_owner_id (for
-  // claim_ttl_ms, or a short default when 0) before publishing the REVOKE, so
-  // the revoked victim cannot re-acquire the path before the winner does.
-  // Omitting them yields the legacy pure-notification behavior.
-  string claim_path = 2;
-  string claimant_owner_id = 3;
-  uint64 claim_ttl_ms = 4;
 }
 
 message RequestRevokeResponse {}
@@ -326,15 +394,19 @@ message RequestRevokeResponse {}
 // Event stream — scoped to a single owner.
 //
 // A subscription is bound to exactly one owner id and receives ONLY that owner's
-// lifecycle events: a cooperative REVOKE request, a forced KILL, or its own
-// RELEASED notification. Nothing about any other owner is delivered on the
-// stream — a lock's channel carries only that lock's information.
+// lifecycle events: a cooperative REVOKE request, a forced KILL, or a GRANT of
+// its queued acquire. Nothing about any other owner is delivered on the stream
+// — a lock's channel carries only that lock's information.
 // ---------------------------------------------------------------------------
 
 enum EventType {
-  EVENT_TYPE_RELEASED = 0;
+  // No event; never emitted. Present only as the proto3 zero default.
+  EVENT_TYPE_UNSPECIFIED = 0;
   EVENT_TYPE_KILLED = 1;
   EVENT_TYPE_REVOKE = 2;
+  // The owner's queued acquire was granted in place: it now holds the lock and
+  // can stop waiting (delivered to the owner whose request was granted).
+  EVENT_TYPE_GRANT = 3;
 }
 
 message SubscribeRequest {
@@ -347,14 +419,6 @@ message Event {
   EventType type = 1;
   string owner_id = 2;
 }
-
-// Internal: instances forward events to configured peers so an event raised on
-// instance A reaches the owner's subscription on instance B.
-message PublishEventRequest {
-  Event event = 1;
-}
-
-message PublishEventResponse {}
 
 // ---------------------------------------------------------------------------
 // Inspection (read-only observability)
@@ -383,13 +447,19 @@ message InspectPathResponse {
   bool has_fence = 3;
   // The persisted fencing token. Meaningful only when has_fence is true.
   int64 fence = 4;
-  // Live preemption claimant reserving this path for an in-flight revoke, or
-  // empty if none.
+  // Always empty; path claims were removed in favour of the wait queue.
   string claim_owner = 5;
+  // Live semaphore holders of this exact path (LOCK_ALGORITHM_SEMAPHORE
+  // namespaces). Empty for non-semaphore paths.
+  repeated string semaphore_owners = 6;
 }
 
 message ListOwnerLocksRequest {
   string owner_id = 1;
+  // Optional routing namespaces to list from (same form as Renew.domains).
+  // When set, only those groups are queried; locks in unlisted groups are
+  // omitted. When empty, every lock group is listed.
+  repeated string domains = 2;
 }
 
 message OwnedLock {
@@ -450,6 +520,9 @@ message HealthResponse {
 
 service PathLock {
   rpc Acquire(AcquireRequest) returns (AcquireResponse);
+  rpc SetNamespacePolicy(SetNamespacePolicyRequest) returns (SetNamespacePolicyResponse);
+  rpc GetNamespacePolicy(GetNamespacePolicyRequest) returns (GetNamespacePolicyResponse);
+  rpc DeleteNamespacePolicy(DeleteNamespacePolicyRequest) returns (DeleteNamespacePolicyResponse);
   // Client-streamed form of Acquire for large path sets. The daemon buffers all
   // chunks, validates them as one logical request, then applies a single
   // Acquire transaction; it never acquires chunk-by-chunk.
@@ -464,8 +537,6 @@ service PathLock {
   rpc IncrFencingToken(IncrFencingTokenRequest) returns (IncrFencingTokenResponse);
   rpc SetWaitEdge(SetWaitEdgeRequest) returns (SetWaitEdgeResponse);
   rpc ClearWaitEdge(ClearWaitEdgeRequest) returns (ClearWaitEdgeResponse);
-  rpc SetClaim(SetClaimRequest) returns (SetClaimResponse);
-  rpc ClearClaim(ClearClaimRequest) returns (ClearClaimResponse);
   rpc IsOwnerAlive(IsOwnerAliveRequest) returns (IsOwnerAliveResponse);
   rpc RequestRevoke(RequestRevokeRequest) returns (RequestRevokeResponse);
 
@@ -475,7 +546,4 @@ service PathLock {
   rpc DumpLocks(DumpLocksRequest) returns (DumpLocksResponse);
   rpc Subscribe(SubscribeRequest) returns (stream Event);
   rpc Health(HealthRequest) returns (HealthResponse);
-
-  // Internal peer fan-out.
-  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
 }

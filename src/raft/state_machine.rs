@@ -16,21 +16,20 @@ use std::sync::Arc;
 use rocksdb::DB;
 
 use crate::cluster::placement::GroupId;
-use crate::engine::{self, AcquireOutcome, RenewOutcome};
+use crate::engine::{
+    self, AcquireArgs, AcquireOutcome, LockAlgorithm, LockPolicy, Mode, Reason, RenewOutcome,
+};
 use crate::raft::command::{ApplyResponse, Command, Op, RejectKind, RequestId};
 use crate::store_keys;
 use crate::store_rocksdb::{
-    decode_record, encode_record, SetScanLimitExceeded, StoredRecord, WriteTxn,
+    decode_record, encode_record, SetScanLimitExceeded, StoreTxn, StoredRecord, WriteTxn,
 };
 
 /// How long a request-id → response dedupe record is retained. Must exceed
 /// the longest plausible client/forwarding retry window.
 const DEDUPE_TTL_MS: u64 = 300_000;
 
-/// Version marker for fingerprinted dedupe records. Legacy records are raw
-/// bincode `ApplyResponse` bytes whose first byte is a small variant index,
-/// never this value.
-const DEDUPE_RECORD_V2: u8 = 0xD1;
+const DEDUPE_RECORD: u8 = 0xD1;
 
 /// Deterministic fingerprint of a command's op, binding a dedupe record to
 /// the request that produced it. Every replica re-encodes the op decoded from
@@ -41,7 +40,7 @@ fn op_fingerprint(op: &Op) -> anyhow::Result<u64> {
 }
 
 fn encode_dedupe_record(fingerprint: u64, resp: &ApplyResponse) -> anyhow::Result<Vec<u8>> {
-    let mut buf = vec![DEDUPE_RECORD_V2];
+    let mut buf = vec![DEDUPE_RECORD];
     buf.extend_from_slice(&bincode::serde::encode_to_vec(
         (fingerprint, resp),
         bincode::config::standard(),
@@ -49,23 +48,16 @@ fn encode_dedupe_record(fingerprint: u64, resp: &ApplyResponse) -> anyhow::Resul
     Ok(buf)
 }
 
-/// Decode a cached dedupe record into `(fingerprint, response)`; legacy
-/// records carry no fingerprint. `None` means undecodable — the caller treats
-/// it as a cache miss (re-evaluating the command is deterministic and safe),
-/// never as a fatal storage error.
-fn decode_dedupe_record(bytes: &[u8]) -> Option<(Option<u64>, ApplyResponse)> {
-    match bytes.split_first() {
-        Some((&DEDUPE_RECORD_V2, rest)) => {
-            let ((fingerprint, resp), _): ((u64, ApplyResponse), _) =
-                bincode::serde::decode_from_slice(rest, bincode::config::standard()).ok()?;
-            Some((Some(fingerprint), resp))
-        }
-        _ => {
-            let (resp, _): (ApplyResponse, _) =
-                bincode::serde::decode_from_slice(bytes, bincode::config::standard()).ok()?;
-            Some((None, resp))
-        }
+/// Decode a cached dedupe record into `(fingerprint, response)`. `None` means
+/// undecodable, and the caller treats it as a cache miss.
+fn decode_dedupe_record(bytes: &[u8]) -> Option<(u64, ApplyResponse)> {
+    let (&version, rest) = bytes.split_first()?;
+    if version != DEDUPE_RECORD {
+        return None;
     }
+    let ((fingerprint, resp), _): ((u64, ApplyResponse), _) =
+        bincode::serde::decode_from_slice(rest, bincode::config::standard()).ok()?;
+    Some((fingerprint, resp))
 }
 
 /// Applies a committed command to one group's RocksDB state machine.
@@ -99,6 +91,23 @@ pub(crate) fn read_last_now(db: &DB, group: GroupId) -> anyhow::Result<u64> {
     })
 }
 
+pub(crate) fn read_last_now_snapshot(
+    db: &DB,
+    snapshot: &rocksdb::Snapshot<'_>,
+    group: GroupId,
+) -> anyhow::Result<u64> {
+    let meta = db
+        .cf_handle(store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    let key = store_keys::group_key(group, store_keys::META_LAST_NOW_KEY);
+    Ok(match snapshot.get_cf(&meta, &key)? {
+        Some(v) if v.len() == 8 => {
+            u64::from_be_bytes([v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]])
+        }
+        _ => 0,
+    })
+}
+
 /// Like [`apply`], additionally reporting whether anything was written (used
 /// by the writer to decide whether a group needs a WAL fsync).
 pub fn apply_committing(
@@ -106,7 +115,11 @@ pub fn apply_committing(
     group: GroupId,
     cmd: &Command,
 ) -> anyhow::Result<(ApplyResponse, bool)> {
-    apply_with_meta(db, group, cmd, None)
+    // Standalone helper (tests, ad-hoc apply): no Config in scope, so it pins
+    // the built-in default. The replicated apply path goes through
+    // `GroupStateMachine::apply` → `apply_entry`, which carries the configured
+    // `Config::default_lock_algorithm`.
+    apply_with_meta(db, group, cmd, None, LockAlgorithm::default())
 }
 
 /// Apply one Raft log entry's command, persisting the applied position
@@ -117,9 +130,10 @@ pub fn apply_entry(
     group: GroupId,
     cmd: &Command,
     log_id: &crate::raft::types::LogId,
+    default_algorithm: LockAlgorithm,
 ) -> anyhow::Result<ApplyResponse> {
     let applied = bincode::serde::encode_to_vec(log_id, bincode::config::standard())?;
-    apply_with_meta(db, group, cmd, Some(applied)).map(|(resp, _)| resp)
+    apply_with_meta(db, group, cmd, Some(applied), default_algorithm).map(|(resp, _)| resp)
 }
 
 fn apply_with_meta(
@@ -127,6 +141,7 @@ fn apply_with_meta(
     group: GroupId,
     cmd: &Command,
     applied_position: Option<Vec<u8>>,
+    default_algorithm: LockAlgorithm,
 ) -> anyhow::Result<(ApplyResponse, bool)> {
     // Deterministic monotone clock: a command's effective time is its stamped
     // `now_ms` clamped against the group's persisted high-water mark, so a
@@ -152,7 +167,7 @@ fn apply_with_meta(
     if let (Some(id), Some(fingerprint)) = (&cmd.request_id, fingerprint) {
         if let Some(cached) = txn.get_bytes(store_keys::CF_DEDUPE, &dedupe_key(id))? {
             match decode_dedupe_record(&cached) {
-                Some((Some(cached_fp), _)) if cached_fp != fingerprint => {
+                Some((cached_fp, _)) if cached_fp != fingerprint => {
                     return Ok((
                         ApplyResponse::Rejected {
                             kind: RejectKind::IdempotencyMismatch,
@@ -174,7 +189,7 @@ fn apply_with_meta(
         }
     }
 
-    let resp = match execute_op(&mut txn, cmd, now_eff) {
+    let resp = match execute_op(&mut txn, cmd, now_eff, default_algorithm) {
         Ok(resp) => resp,
         // Deterministic logical limits become rejections, never storage
         // errors: the entry is already committed, and a storage error here
@@ -189,13 +204,11 @@ fn apply_with_meta(
 
     // A rejected command must not commit: its writes (lease refreshes, lazy
     // prunes, partially-executed grants) were made under the assumption the
-    // whole operation would succeed. A claim refused by claim-if-absent wrote
-    // nothing either.
+    // whole operation would succeed.
     let commit = !matches!(
         &resp,
         ApplyResponse::Acquire(AcquireOutcome::Conflict { .. } | AcquireOutcome::Lost { .. })
             | ApplyResponse::Renew(RenewOutcome::Lost { .. })
-            | ApplyResponse::SetClaim(crate::engine::ClaimOutcome::Held { .. })
             | ApplyResponse::Rejected { .. }
     );
 
@@ -228,42 +241,324 @@ fn apply_with_meta(
         }
         txn.commit()?
     } else {
-        // Rejected outcome: the engine's writes are discarded, but the
-        // applied position must still advance (the entry IS applied).
+        let mut meta_txn = WriteTxn::new(db.clone(), group, now_eff);
+        if now_eff > last_now && !matches!(cmd.op, Op::Noop) {
+            meta_txn.put_raw(
+                store_keys::CF_META,
+                store_keys::META_LAST_NOW_KEY,
+                now_eff.to_be_bytes().to_vec(),
+            )?;
+        }
         if let Some(applied) = applied_position {
-            let mut meta_txn = WriteTxn::new(db.clone(), group, now_eff);
             meta_txn.put_raw(
                 store_keys::CF_META,
                 store_keys::META_LAST_APPLIED_KEY,
                 applied,
             )?;
-            meta_txn.commit()?;
         }
-        false
+        meta_txn.commit()?
     };
     Ok((resp, wrote))
+}
+
+/// Whether a conflict reason represents *waiting for a held lock to free* — the
+/// only conflicts the queue parks. `stale_fencing_token` (refresh-and-retry) is
+/// not a held-lock wait and is returned as a conflict instead.
+fn is_queueable_conflict(reason: Reason) -> bool {
+    reason.is_queueable()
+}
+
+/// After any operation that frees lock state, grant queued waiters that can now
+/// proceed — in place (their lock keys are written by re-running the engine's
+/// acquire), in per-resource FIFO order. Returns the granted owners; a later
+/// increment emits a GRANT event per owner via the service layer.
+fn sweep_grants(txn: &mut WriteTxn) -> anyhow::Result<Vec<String>> {
+    crate::queue::grant_sweep(txn, |txn, namespace, args, policy| {
+        engine::acquire_inner_in_namespace(txn, args, policy, namespace)
+    })
+}
+
+/// Targeted grant sweep: only re-try waiters whose paths intersect the scoped
+/// paths just freed (`freed_scoped`), via the queue path indexes. Used on the
+/// hot acquire path and on releases so a no-op acquire (one that frees nothing)
+/// never scans the whole queue, and a release only touches waiters it could have
+/// unblocked.
+fn sweep_grants_for_paths(
+    txn: &mut WriteTxn,
+    freed_scoped: &[String],
+) -> anyhow::Result<Vec<String>> {
+    crate::queue::grant_sweep_for_paths(txn, freed_scoped, |txn, namespace, args, policy| {
+        engine::acquire_inner_in_namespace(txn, args, policy, namespace)
+    })
+}
+
+/// `Granted(..)` only when the sweep actually granted someone; otherwise `Unit`,
+/// so grant-less releases keep their existing response shape.
+fn granted_response(granted: Vec<String>) -> ApplyResponse {
+    if granted.is_empty() {
+        ApplyResponse::Unit
+    } else {
+        ApplyResponse::Granted(granted)
+    }
+}
+
+/// Scoped paths that a set of release requests frees, for a targeted grant
+/// sweep. Duplicates are removed so the sweep's candidate index lookups don't
+/// repeat work.
+fn scoped_freed_paths(namespace: &str, reqs: &[engine::RelReq]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(reqs.len());
+    for req in reqs {
+        let scoped = engine::scoped_path(namespace, &req.path);
+        if !out.contains(&scoped) {
+            out.push(scoped);
+        }
+    }
+    out
+}
+
+fn execute_acquire(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    args: &AcquireArgs,
+    policy: LockPolicy,
+) -> anyhow::Result<ApplyResponse> {
+    let args = mint_fence_if_needed(txn, namespace, args, policy.algorithm)?;
+    // Whether the owner is already alive before the acquire: a not-alive
+    // owner's acquire first calls `release_owner_wide` inside the engine,
+    // freeing any stale holds it still has on record beyond the explicit
+    // `release_requests`. Those freed paths are not in `release_requests`, so
+    // the targeted sweep below would miss them; remember to fall back to a
+    // full sweep in that case so waiters on those paths are still granted.
+    let was_alive = txn
+        .get_str(
+            store_keys::CF_OWNER_ALIVE,
+            &store_keys::alive_key(&args.owner_id),
+        )?
+        .is_some();
+    // FIFO admission: a newcomer yields to any earlier waiter it
+    // conflicts with, queueing behind them instead of barging ahead.
+    if let Some((owner, path, reason)) =
+        crate::queue::blocked_by_earlier(txn, namespace, &args, policy)?
+    {
+        crate::queue::enqueue(txn, namespace, &args, policy)?;
+        return Ok(ApplyResponse::Acquire(AcquireOutcome::Queued {
+            path,
+            owner,
+            reason,
+            fencing_token: args.fencing_token,
+        }));
+    }
+
+    Ok(
+        match engine::acquire_inner_in_namespace(txn, &args, policy, namespace)? {
+            AcquireOutcome::Ok { fencing_token } => {
+                // No longer waiting; inline releases may free paths and
+                // grant queued waiters — surface them so a GRANT fires. Only
+                // sweep when the acquire actually freed state: it carried
+                // `release_requests`, or the owner was not alive and the
+                // engine freed its stale holds owner-wide. A pure acquire by
+                // an already-alive owner adds locks and frees nothing, so a
+                // full queue scan would be wasted work that scales with
+                // queue size. The targeted sweep consults the per-path
+                // indexes and only re-tries waiters it could have unblocked;
+                // the owner-wide case falls back to a full sweep because the
+                // freed path set is not known here.
+                crate::queue::dequeue(txn, &args.owner_id)?;
+                let freed = scoped_freed_paths(namespace, &args.release_requests);
+                let granted = if !was_alive && !args.requests.is_empty() {
+                    // The engine ran `release_owner_wide`, freeing stale holds
+                    // that are not in `release_requests`; a targeted sweep would
+                    // miss their waiters. The full sweep also covers any
+                    // explicit releases carried in this same command, so it must
+                    // take precedence over the targeted branch below.
+                    sweep_grants(txn)?
+                } else if !freed.is_empty() {
+                    sweep_grants_for_paths(txn, &freed)?
+                } else {
+                    Vec::new()
+                };
+                let outcome = AcquireOutcome::Ok { fencing_token };
+                if granted.is_empty() {
+                    ApplyResponse::Acquire(outcome)
+                } else {
+                    ApplyResponse::AcquireGranted { outcome, granted }
+                }
+            }
+            AcquireOutcome::Conflict {
+                path,
+                owner,
+                reason,
+            } => {
+                if is_queueable_conflict(reason) {
+                    crate::queue::enqueue(txn, namespace, &args, policy)?;
+                    ApplyResponse::Acquire(AcquireOutcome::Queued {
+                        path,
+                        owner,
+                        reason,
+                        fencing_token: args.fencing_token,
+                    })
+                } else {
+                    ApplyResponse::Acquire(AcquireOutcome::Conflict {
+                        path,
+                        owner,
+                        reason,
+                    })
+                }
+            }
+            other => ApplyResponse::Acquire(other),
+        },
+    )
+}
+
+fn mint_fence_if_needed(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    args: &AcquireArgs,
+    algorithm: LockAlgorithm,
+) -> anyhow::Result<AcquireArgs> {
+    if args.fencing_token > 0 || algorithm.is_semaphore() {
+        return Ok(args.clone());
+    }
+    // Semaphores returned above, so any write request here needs a fence token.
+    if !args.requests.iter().any(|req| req.mode == Mode::Write) {
+        return Ok(args.clone());
+    }
+
+    let mut max_seen = match txn.get_raw(store_keys::CF_META, store_keys::META_FENCE_COUNTER_KEY)? {
+        Some(bytes) => match decode_record(&bytes)? {
+            StoredRecord::Counter { v } => v,
+            _ => 0,
+        },
+        None => 0,
+    };
+    for req in args.requests.iter().filter(|req| req.mode == Mode::Write) {
+        let key_path = engine::scoped_path(namespace, &req.path);
+        if let Some(cur) = engine::parse_fence(
+            txn.get_str(store_keys::CF_FENCES, &store_keys::fence_key(&key_path))?,
+        ) {
+            max_seen = max_seen.max(cur);
+        }
+    }
+    let token = max_seen.saturating_add(1);
+    txn.put_raw(
+        store_keys::CF_META,
+        store_keys::META_FENCE_COUNTER_KEY,
+        encode_record(&StoredRecord::Counter { v: token })?,
+    )?;
+    let mut minted = args.clone();
+    minted.fencing_token = token;
+    Ok(minted)
+}
+
+/// Force-clear held and queued locks selected by a namespace transition,
+/// returning affected owners in deterministic order. A pure algorithm change
+/// selects the exact stored namespace. Creating a new routing root also clears
+/// acquisitions committed through the previous route while preserving existing
+/// explicit namespaces nested below the new root.
+fn clear_namespace(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    include_legacy_routes: bool,
+) -> anyhow::Result<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // Group the namespace's held locks by owner, then release each owner's set
+    // in one call. Collecting the full set up front means the release writes
+    // never mutate the scan mid-iteration. Every collected hold was stored
+    // under `namespace`, so the release uses it directly as the key scope.
+    let mut preserved_namespaces = BTreeSet::new();
+    if include_legacy_routes {
+        let now_ms = txn.now_ms();
+        txn.scan_merged(
+            store_keys::CF_NAMESPACE_SETTINGS,
+            None,
+            None,
+            |key, value| {
+                let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) else {
+                    return Ok(true);
+                };
+                if store_keys::expired(exp, now_ms) {
+                    return Ok(true);
+                }
+                let Ok(root) = std::str::from_utf8(key) else {
+                    return Ok(true);
+                };
+                if root != namespace
+                    && crate::cluster::placement::namespace_contains_path(namespace, root)
+                {
+                    preserved_namespaces.insert(root.to_string());
+                }
+                Ok(true)
+            },
+        )?;
+    }
+    let holds = crate::store_rocksdb::collect_namespace_holds(
+        txn,
+        namespace,
+        include_legacy_routes,
+        &preserved_namespaces,
+    )?;
+    let mut by_owner: BTreeMap<(String, String), Vec<engine::RelReq>> = BTreeMap::new();
+    for (owner, held_namespace, mode, path) in holds {
+        let mode = match mode.as_str() {
+            "read" => engine::Mode::Read,
+            _ => engine::Mode::Write,
+        };
+        by_owner
+            .entry((held_namespace, owner))
+            .or_default()
+            .push(engine::RelReq { path, mode });
+    }
+
+    let mut affected: BTreeSet<String> = BTreeSet::new();
+    for ((held_namespace, owner), reqs) in by_owner {
+        engine::release_inner_in_namespace(txn, &held_namespace, &owner, &reqs, false)?;
+        affected.insert(owner);
+    }
+
+    for owner in
+        crate::queue::clear_namespace(txn, namespace, include_legacy_routes, &preserved_namespaces)?
+    {
+        affected.insert(owner);
+    }
+
+    Ok(affected.into_iter().collect())
+}
+
+/// `NamespaceCleared(..)` only when locks were actually cleared; otherwise
+/// `Unit`, so a policy write that changes nothing keeps its plain response.
+fn namespace_cleared_response(cleared: Vec<String>) -> ApplyResponse {
+    if cleared.is_empty() {
+        ApplyResponse::Unit
+    } else {
+        ApplyResponse::NamespaceCleared(cleared)
+    }
 }
 
 /// Run one command's op against the transaction. Errors bubble to
 /// [`apply_with_meta`], which separates deterministic logical rejections from
 /// genuine storage failures.
-fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result<ApplyResponse> {
+fn execute_op(
+    txn: &mut WriteTxn,
+    cmd: &Command,
+    now_eff: u64,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<ApplyResponse> {
     Ok(match &cmd.op {
-        Op::Acquire(args) => {
-            let outcome = engine::acquire_inner(txn, args)?;
-            ApplyResponse::Acquire(outcome)
-        }
         Op::Release {
+            namespace,
             owner,
             reqs,
             del_wait,
         } => {
-            engine::release_inner(txn, owner, reqs, *del_wait)?;
-            ApplyResponse::Unit
+            engine::release_inner_in_namespace(txn, namespace, owner, reqs, *del_wait)?;
+            let freed = scoped_freed_paths(namespace, reqs);
+            granted_response(sweep_grants_for_paths(txn, &freed)?)
         }
         Op::ReleaseAll { owner, del_wait } => {
             engine::release_all_inner(txn, owner, *del_wait)?;
-            ApplyResponse::Unit
+            crate::queue::dequeue(txn, owner)?;
+            granted_response(sweep_grants(txn)?)
         }
         Op::Renew { owner, ttl_ms } => {
             let outcome = engine::renew_inner(txn, owner, *ttl_ms)?;
@@ -271,19 +566,8 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
         }
         Op::ForceRelease { victim } => {
             engine::force_release_inner(txn, victim)?;
-            ApplyResponse::Unit
-        }
-        Op::SetClaim {
-            path,
-            claimant,
-            ttl_ms,
-        } => {
-            let outcome = engine::set_claim_inner(txn, path, claimant, *ttl_ms)?;
-            ApplyResponse::SetClaim(outcome)
-        }
-        Op::ClearClaim { path, claimant } => {
-            engine::clear_claim_inner(txn, path, claimant)?;
-            ApplyResponse::Unit
+            crate::queue::dequeue(txn, victim)?;
+            granted_response(sweep_grants(txn)?)
         }
         Op::SetWaitEdge {
             owner,
@@ -303,9 +587,22 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
             engine::clear_wait_edge_inner(txn, owner)?;
             ApplyResponse::Unit
         }
+        Op::RequestRevoke { owner, ttl_ms } => {
+            engine::request_revoke_inner(txn, owner, *ttl_ms)?;
+            ApplyResponse::Unit
+        }
         Op::GcSweep { now_ms: _, batch } => {
-            let (scanned, reclaimed) = gc_sweep(txn, now_eff, *batch)?;
-            ApplyResponse::Gc { scanned, reclaimed }
+            let (scanned, reclaimed, may_unblock) = gc_sweep(txn, now_eff, *batch)?;
+            let granted = if may_unblock {
+                sweep_grants(txn)?
+            } else {
+                Vec::new()
+            };
+            ApplyResponse::Gc {
+                scanned,
+                reclaimed,
+                granted,
+            }
         }
         Op::IncrFence => {
             let token = incr_fence_inner(txn)?;
@@ -330,7 +627,128 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
             crate::cluster::directory::apply_set_draining(txn, *node_id, *draining)?;
             ApplyResponse::Unit
         }
+        Op::SetNamespacePolicy {
+            namespace,
+            algorithm,
+        } => {
+            // The algorithm in force before this write: the explicit row's
+            // value, or the configured fallback when none exists.
+            let (before, explicit) =
+                engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
+            let after = LockPolicy::new(*algorithm, before.epoch);
+            engine::set_namespace_policy_inner(txn, namespace, *algorithm)?;
+            if explicit && after.algorithm == before.algorithm {
+                // No effective change (re-set to the same value); locks stay.
+                ApplyResponse::Unit
+            } else {
+                namespace_cleared_response(clear_namespace(txn, namespace, !explicit)?)
+            }
+        }
+        Op::DeleteNamespacePolicy { namespace } => {
+            let (_before, explicit) =
+                engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
+            engine::delete_namespace_policy_inner(txn, namespace)?;
+            // Deleting reverts the namespace to the configured default and
+            // removes its routing boundary.
+            if explicit {
+                namespace_cleared_response(clear_namespace(txn, namespace, false)?)
+            } else {
+                ApplyResponse::Unit
+            }
+        }
+        Op::AcquireInNamespace {
+            namespace,
+            policy,
+            args,
+        } => {
+            if let Some(resp) = reject_stale_routing(txn, namespace, args)? {
+                return Ok(resp);
+            }
+            if cmd.request_id.is_some() {
+                if let Some(resp) =
+                    reject_stale_policy_epoch(txn, namespace, *policy, default_algorithm)?
+                {
+                    return Ok(resp);
+                }
+            }
+            execute_acquire(txn, namespace, args, *policy)?
+        }
     })
+}
+
+fn reject_stale_routing(
+    txn: &WriteTxn,
+    stamped_namespace: &str,
+    args: &AcquireArgs,
+) -> anyhow::Result<Option<ApplyResponse>> {
+    let now_ms = txn.now_ms();
+    let mut roots = Vec::new();
+    txn.scan_merged(
+        store_keys::CF_NAMESPACE_SETTINGS,
+        None,
+        None,
+        |key, value| {
+            // Lenient: an undecodable or non-Str settings row is skipped, not
+            // surfaced as an error. This runs in the deterministic apply path,
+            // where a propagated decode error is not a `SetScanLimitExceeded`
+            // and would therefore poison-pill the raft core on every replica.
+            let Ok(StoredRecord::Str { exp, .. }) = decode_record(value) else {
+                return Ok(true);
+            };
+            if store_keys::expired(exp, now_ms) {
+                return Ok(true);
+            }
+            if let Ok(root) = std::str::from_utf8(key) {
+                roots.push(root.to_string());
+            }
+            Ok(true)
+        },
+    )?;
+    roots.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    for path in args
+        .requests
+        .iter()
+        .map(|req| req.path.as_str())
+        .chain(args.release_requests.iter().map(|req| req.path.as_str()))
+    {
+        if let Some(current) = roots
+            .iter()
+            .find(|root| crate::cluster::placement::namespace_contains_path(root.as_str(), path))
+        {
+            if current != stamped_namespace {
+                return Ok(Some(ApplyResponse::Rejected {
+                    kind: RejectKind::RoutingStale,
+                    detail: format!(
+                        "routing namespace for {path} changed: stamped {stamped_namespace}, current {current}"
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn reject_stale_policy_epoch(
+    txn: &mut WriteTxn,
+    namespace: &str,
+    stamped: LockPolicy,
+    default_algorithm: LockAlgorithm,
+) -> anyhow::Result<Option<ApplyResponse>> {
+    let (current, _) =
+        engine::get_namespace_policy_record_inner(txn, namespace, default_algorithm)?;
+    if current == stamped {
+        return Ok(None);
+    }
+    Ok(Some(ApplyResponse::Rejected {
+        kind: RejectKind::PolicyEpochStale,
+        detail: format!(
+            "namespace policy for {namespace} changed: stamped epoch {} {}, current epoch {} {}",
+            stamped.epoch,
+            stamped.algorithm.as_str(),
+            current.epoch,
+            current.algorithm.as_str(),
+        ),
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -351,7 +769,7 @@ fn execute_op(txn: &mut WriteTxn, cmd: &Command, now_eff: u64) -> anyhow::Result
 /// index entry is always dropped. Returns `(scanned, reclaimed)`; a `scanned`
 /// equal to `batch` signals remaining backlog, letting the caller loop until
 /// caught up.
-fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32, u64)> {
+fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32, u64, bool)> {
     let cursor = txn.get_raw(store_keys::CF_META, store_keys::META_GC_CURSOR_KEY)?;
     let upper = store_keys::expiry_scan_upper(now_ms);
 
@@ -367,17 +785,30 @@ fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32,
     )?;
 
     let mut reclaimed = 0u64;
+    let mut may_unblock = false;
     for key in &keys {
         if let Some((_exp, cf, primary_key)) = store_keys::decode_expiry_entry(key) {
             // The expiry entry names its CF by string; map to the static name
             // so the overlay (keyed by &'static str) stays coherent.
             if let Some(static_cf) = static_cf_name(cf) {
+                may_unblock |=
+                    matches!(static_cf, store_keys::CF_OWNER_ALIVE | store_keys::CF_QUEUE);
                 if let Some(bytes) = txn.get_raw(static_cf, primary_key)? {
                     if let Ok(StoredRecord::Str { exp, .. } | StoredRecord::Bytes { exp, .. }) =
                         decode_record(&bytes)
                     {
                         if store_keys::expired(exp, now_ms) {
-                            txn.delete_raw(static_cf, primary_key)?;
+                            if static_cf == store_keys::CF_OWNER_ALIVE && !primary_key.contains(&0)
+                            {
+                                if let Ok(owner) = std::str::from_utf8(primary_key) {
+                                    engine::force_release_inner(txn, owner)?;
+                                }
+                            }
+                            if static_cf != store_keys::CF_QUEUE
+                                || !crate::queue::expire_entry(txn, primary_key)?
+                            {
+                                txn.delete_raw(static_cf, primary_key)?;
+                            }
                             reclaimed += 1;
                         }
                     }
@@ -398,7 +829,7 @@ fn gc_sweep(txn: &mut WriteTxn, now_ms: u64, batch: u32) -> anyhow::Result<(u32,
         )?;
     }
 
-    Ok((keys.len() as u32, reclaimed))
+    Ok((keys.len() as u32, reclaimed, may_unblock))
 }
 
 /// Map a CF name decoded from an expiry-index key to its `&'static str`
@@ -469,11 +900,28 @@ pub struct GroupStateMachine {
     db: Arc<DB>,
     group: GroupId,
     batcher: FsyncBatcher,
+    /// Configured fallback algorithm for namespaces without an explicit policy
+    /// row (`Config::default_lock_algorithm`). Carried into the deterministic
+    /// apply path; must be identical on every replica.
+    default_algorithm: LockAlgorithm,
+    snapshot_max_bytes: u64,
 }
 
 impl GroupStateMachine {
-    pub fn new(db: Arc<DB>, group: GroupId, batcher: FsyncBatcher) -> Self {
-        Self { db, group, batcher }
+    pub fn new(
+        db: Arc<DB>,
+        group: GroupId,
+        batcher: FsyncBatcher,
+        default_algorithm: LockAlgorithm,
+        snapshot_max_bytes: u64,
+    ) -> Self {
+        Self {
+            db,
+            group,
+            batcher,
+            default_algorithm,
+            snapshot_max_bytes,
+        }
     }
 
     fn meta_cf(&self) -> io::Result<Arc<rocksdb::BoundColumnFamily<'_>>> {
@@ -557,7 +1005,8 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
                 EntryPayload::Normal(cmd) => {
                     // The engine's writes and the applied-position land
                     // atomically; rejected outcomes persist position only.
-                    apply_entry(&self.db, self.group, &cmd, &log_id).map_err(io_err)?
+                    apply_entry(&self.db, self.group, &cmd, &log_id, self.default_algorithm)
+                        .map_err(io_err)?
                 }
                 EntryPayload::Membership(m) => {
                     let stored = StoredMembership::new(Some(log_id), m);
@@ -586,35 +1035,43 @@ impl RaftStateMachine<TypeConfig> for GroupStateMachine {
         snapshot: std::io::Cursor<Vec<u8>>,
     ) -> Result<(), io::Error> {
         let image = snapshot.into_inner();
-        let mut batch = rocksdb::WriteBatch::default();
-        crate::raft::snapshot::install_group_image(&self.db, self.group, &image, &mut batch)
-            .map_err(io_err)?;
-        let cf = self.meta_cf()?;
-        if let Some(last) = &meta.last_log_id {
+        let db = self.db.clone();
+        let group = self.group;
+        let meta = meta.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), io::Error> {
+            let mut batch = rocksdb::WriteBatch::default();
+            crate::raft::snapshot::install_group_image(&db, group, &image, &mut batch)
+                .map_err(io_err)?;
+            let cf = db
+                .cf_handle(store_keys::CF_META)
+                .ok_or_else(|| io_err("missing meta column family"))?;
+            if let Some(last) = &meta.last_log_id {
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(group, store_keys::META_LAST_APPLIED_KEY),
+                    encode_meta(last)?,
+                );
+            }
             batch.put_cf(
                 &cf,
-                store_keys::group_key(self.group, store_keys::META_LAST_APPLIED_KEY),
-                encode_meta(last)?,
+                store_keys::group_key(group, store_keys::META_MEMBERSHIP_KEY),
+                encode_meta(&meta.last_membership)?,
             );
-        }
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_MEMBERSHIP_KEY),
-            encode_meta(&meta.last_membership)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_SNAPSHOT_META_KEY),
-            encode_meta(meta)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.group, store_keys::META_SNAPSHOT_DATA_KEY),
-            &image,
-        );
-        self.db
-            .write_opt(batch, &rocksdb::WriteOptions::default())
-            .map_err(io_err)?;
+            batch.put_cf(
+                &cf,
+                store_keys::group_key(group, store_keys::META_SNAPSHOT_META_KEY),
+                encode_meta(&meta)?,
+            );
+            batch.put_cf(
+                &cf,
+                store_keys::group_key(group, store_keys::META_SNAPSHOT_DATA_KEY),
+                &image,
+            );
+            db.write_opt(batch, &rocksdb::WriteOptions::default())
+                .map_err(io_err)
+        })
+        .await
+        .map_err(io_err)??;
         // An installed snapshot replaces purged log history: it must survive
         // power loss before openraft purges the log on its account.
         self.batcher.barrier().await
@@ -661,50 +1118,53 @@ pub struct GroupSnapshotBuilder {
 
 impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<RaftSnapshot, io::Error> {
-        let db_snapshot = self.sm.db.snapshot();
-        let (last_applied, membership) = self.sm.applied_state_from_snapshot(&db_snapshot)?;
-        let image = crate::raft::snapshot::build_group_image_from_snapshot(
-            &self.sm.db,
-            &db_snapshot,
-            self.sm.group,
-        )
-        .map_err(io_err)?;
-
-        let snapshot_id = format!(
-            "g{}-{}-{}",
-            self.sm.group,
-            last_applied
-                .as_ref()
-                .map(|l| l.index.to_string())
-                .unwrap_or_else(|| "0".into()),
-            store_keys::now_ms()
-        );
-        let meta = SnapshotMeta {
-            last_log_id: last_applied,
-            last_membership: membership,
-            snapshot_id,
-        };
-
-        // Meta and data must land atomically: written separately, a crash
-        // between them (point-in-time WAL recovery keeps a prefix) could pair
-        // fresh meta with an older image, and `get_current_snapshot` would
-        // serve followers old state labeled with a newer last_log_id.
-        let cf = self.sm.meta_cf()?;
-        let mut batch = rocksdb::WriteBatch::default();
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_META_KEY),
-            encode_meta(&meta)?,
-        );
-        batch.put_cf(
-            &cf,
-            store_keys::group_key(self.sm.group, store_keys::META_SNAPSHOT_DATA_KEY),
-            &image,
-        );
-        self.sm
-            .db
-            .write_opt(batch, &rocksdb::WriteOptions::default())
-            .map_err(io_err)?;
+        static SNAPSHOT_BUILD_LIMIT: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let _permit = SNAPSHOT_BUILD_LIMIT.acquire().await.map_err(io_err)?;
+        let sm = self.sm.clone();
+        let (meta, image) =
+            tokio::task::spawn_blocking(move || -> Result<(SnapshotMeta, Vec<u8>), io::Error> {
+                let db_snapshot = sm.db.snapshot();
+                let (last_applied, membership) = sm.applied_state_from_snapshot(&db_snapshot)?;
+                let image = crate::raft::snapshot::build_group_image_from_snapshot_limited(
+                    &sm.db,
+                    &db_snapshot,
+                    sm.group,
+                    usize::try_from(sm.snapshot_max_bytes).unwrap_or(usize::MAX),
+                )
+                .map_err(io_err)?;
+                let snapshot_id = format!(
+                    "g{}-{}-{}",
+                    sm.group,
+                    last_applied
+                        .as_ref()
+                        .map(|log_id| log_id.index.to_string())
+                        .unwrap_or_else(|| "0".into()),
+                    store_keys::now_ms()
+                );
+                let meta = SnapshotMeta {
+                    last_log_id: last_applied,
+                    last_membership: membership,
+                    snapshot_id,
+                };
+                let cf = sm.meta_cf()?;
+                let mut batch = rocksdb::WriteBatch::default();
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(sm.group, store_keys::META_SNAPSHOT_META_KEY),
+                    encode_meta(&meta)?,
+                );
+                batch.put_cf(
+                    &cf,
+                    store_keys::group_key(sm.group, store_keys::META_SNAPSHOT_DATA_KEY),
+                    &image,
+                );
+                sm.db
+                    .write_opt(batch, &rocksdb::WriteOptions::default())
+                    .map_err(io_err)?;
+                Ok((meta, image))
+            })
+            .await
+            .map_err(io_err)??;
         // Durable before openraft purges logs covered by this snapshot.
         self.sm.batcher.barrier().await?;
 
@@ -712,5 +1172,115 @@ impl RaftSnapshotBuilder<TypeConfig> for GroupSnapshotBuilder {
             meta,
             snapshot: std::io::Cursor::new(image),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{AcquireArgs, LockPolicy, LockReq, Mode, RelReq, State};
+    use crate::raft::command::{Command, Op};
+
+    fn open_temp_db() -> (Arc<DB>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::store_rocksdb::open_db(
+            &dir.path().join("db"),
+            &crate::store_rocksdb::DbTuning::default(),
+        )
+        .unwrap();
+        (db, dir)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn acquire_cmd(
+        owner: &str,
+        path: &str,
+        state: State,
+        token: i64,
+        ttl_ms: u64,
+        releases: &[&str],
+        now_ms: u64,
+    ) -> Command {
+        Command {
+            request_id: None,
+            now_ms,
+            op: Op::AcquireInNamespace {
+                namespace: "h".to_string(),
+                policy: LockPolicy::from_algorithm(LockAlgorithm::RecursiveRw),
+                args: AcquireArgs {
+                    owner_id: owner.to_string(),
+                    ttl_ms,
+                    requests: vec![LockReq {
+                        path: path.to_string(),
+                        mode: Mode::Write,
+                        state,
+                        permits: 0,
+                    }],
+                    fencing_token: token,
+                    release_requests: releases
+                        .iter()
+                        .map(|p| RelReq {
+                            path: p.to_string(),
+                            mode: Mode::Write,
+                        })
+                        .collect(),
+                    queue_ttl_ms: 0,
+                },
+            },
+        }
+    }
+
+    /// A not-alive owner re-acquiring (which makes the engine free its stale
+    /// holds owner-wide) while also carrying an explicit release must still
+    /// grant the waiters parked on those owner-wide-freed paths. The explicit
+    /// release's *targeted* sweep alone would miss them, so the not-alive case
+    /// must take precedence and run a full sweep.
+    #[test]
+    fn reacquire_by_dead_owner_with_release_grants_owner_wide_freed_waiters() {
+        let (db, _dir) = open_temp_db();
+        let group = 0u32;
+
+        // Owner A holds h:/p with a short lease (its liveness expires at 2000).
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("A", "h:/p", State::New, 1, 1_000, &[], 1_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            resp,
+            ApplyResponse::Acquire(AcquireOutcome::Ok { .. })
+        ));
+
+        // Owner B queues behind A for that same path.
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("B", "h:/p", State::New, 2, 10_000, &[], 1_100),
+        )
+        .unwrap();
+        assert!(matches!(
+            resp,
+            ApplyResponse::Acquire(AcquireOutcome::Queued { .. })
+        ));
+
+        // Past 2000 A's lease has expired. A re-acquires a *different* path and
+        // also releases an unrelated one. The engine frees A's stale hold on
+        // h:/p owner-wide; B (parked on h:/p, not on the released path) must be
+        // granted in place rather than left queued until the next GC sweep.
+        let resp = apply(
+            &db,
+            group,
+            &acquire_cmd("A", "h:/q", State::New, 5, 10_000, &["h:/r"], 3_000),
+        )
+        .unwrap();
+        let granted = match resp {
+            ApplyResponse::AcquireGranted { granted, .. } => granted,
+            other => panic!("expected AcquireGranted granting B, got {other:?}"),
+        };
+        assert!(
+            granted.contains(&"B".to_string()),
+            "B must be granted h:/p owner-wide, got {granted:?}"
+        );
     }
 }

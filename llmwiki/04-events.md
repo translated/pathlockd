@@ -5,26 +5,30 @@
 `Subscribe(owner_id)` opens a server stream bound to exactly one owner. The
 daemon runs an in-process `broadcast` channel; the stream filters it so the
 subscriber receives **only** events whose `owner_id` matches — its own
-`released`, `killed`, or `revoke`. Nothing about any other owner is delivered. A
+`grant`, `killed`, or `revoke`. Nothing about any other owner is delivered. A
 lock's channel therefore carries only that lock's information.
 
 Events are raised at the point ownership changes:
 
-- `RELEASED:<owner>` — on `release`, `release_all`, and an `acquire` whose inline
-  release ran (when requested).
+- `GRANT:<owner>` — the owner's queued acquire became grantable (granted in
+  place by a release/force-release/GC sweep, or it must refresh a stale fencing
+  token and retry). This is the waiter's wake signal.
 - `KILLED:<owner>` — on `force_release`.
 - `REVOKE:<owner>` — on `request_revoke` (a *request* to the owner to yield; it
   changes no state itself).
 
-## Why scoped streams matter for waiters
+There is no `RELEASED` event: a release is only ever observed by the releasing
+owner itself, which never needs it, so it was removed.
 
-Because a waiter does **not** receive the *blocker's* release on its own
-channel, it cannot be woken by an event when the lock it wants frees up. The
-client therefore wakes by **re-checking** the conflict (`IsBlocking`) on a short
-interval. Events drive the *owner's own* lifecycle (respond to a revoke/kill);
-contention progress is driven by the recheck. Both `force_release` (which
-deletes keys) and `request_revoke` (which makes the owner delete its own keys)
-result in the blocker's keys disappearing, which the waiter's next recheck sees.
+## Why scoped streams suffice for waiters
+
+A contended acquire is **enqueued** (the server-side wait queue, see
+[engine](03-engine.md)). When the contended path frees, the daemon grants the
+queued waiter in place and pushes a `GRANT` to that waiter's own stream — so the
+waiter *is* woken by an event for itself, even though it never sees the blocker's
+release. A periodic `IsBlocking` recheck remains only as a coarse safety net for
+an event lost in transit (failover, a dropped cross-instance forward), not as
+the primary wake path.
 
 ## Deadlock resolution (client policy)
 
@@ -48,8 +52,9 @@ the *policy* (who leads, grace timing) is the client's.
 With multiple pathlockd replicas, an event is raised on the replica that handled
 the request. If clients are sticky to one replica per owner (recommended — one
 lock keeps one connection), the owner's subscription is on that same replica and
-gets the event directly. Otherwise set `PATHLOCKD_PEERS` so each replica forwards
-events to its peers' internal `PublishEvent` RPC. Forwarding is done by one
+gets the event directly. Otherwise set `PATHLOCKD_PEERS` to internal Raft
+endpoints so each replica forwards events through the Raft-transport
+`PublishEvent` RPC. Forwarding is done by one
 long-lived task per peer draining a bounded queue (with a per-RPC timeout): a
 slow or dead peer can neither pile up tasks nor stall the request path — a full
 queue just drops the event. The client recheck remains the correctness backstop,

@@ -16,6 +16,7 @@ services:
       PATHLOCKD_BOOTSTRAP: "true"
       PATHLOCKD_LOG_LEVEL: "info"
       PATHLOCKD_NODE_ID: "pathlockd-0"
+      PATHLOCKD_INTERNAL_AUTH_TOKEN: "local-development-pathlockd-token"
       # This compose file runs a SINGLE pathlockd instance for local use
       # (a 1-node Raft cluster: fully functional, no fault tolerance).
       # For a replicated 3-node HA cluster on Docker Swarm, see

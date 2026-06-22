@@ -1,0 +1,9 @@
+# Run the pathlockd throughput benchmark as `cargo benchmark [args...]`.
+#
+# It is a harness=false `[[bench]]` target, so it is never executed by
+# `cargo test` and never built by `cargo build` / release builds — only here.
+# Args after the alias are forwarded to the benchmark, e.g.
+#   cargo benchmark single unique-writes
+#   cargo benchmark cluster all measure=5 max-workers=256
+[alias]
+benchmark = "bench --bench benchmark --"

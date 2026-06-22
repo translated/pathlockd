@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{
@@ -8,6 +9,7 @@ use std::{
 
 use futures::FutureExt;
 use tonic::transport::{Endpoint, Server};
+use tonic::Request;
 use tracing::{error, info, warn};
 
 use pathlockd::cluster::controller::{spawn_controller, ControllerOptions};
@@ -32,6 +34,34 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
 const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const CLUSTER_CONFIG_FINGERPRINT_KEY: &[u8] = b"pathlockd/cluster-config-fingerprint/v1";
+
+fn ensure_local_cluster_config(db: &rocksdb::DB, expected: u64) -> anyhow::Result<()> {
+    let cf = db
+        .cf_handle(pathlockd::store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    if let Some(raw) = db.get_cf(&cf, CLUSTER_CONFIG_FINGERPRINT_KEY)? {
+        let stored = u64::from_be_bytes(
+            raw.as_slice()
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid stored cluster configuration"))?,
+        );
+        anyhow::ensure!(
+            stored == expected,
+            "cluster configuration differs from this data directory (stored {stored:016x}, configured {expected:016x})"
+        );
+        return Ok(());
+    }
+    let mut options = rocksdb::WriteOptions::default();
+    options.set_sync(true);
+    db.put_cf_opt(
+        &cf,
+        CLUSTER_CONFIG_FINGERPRINT_KEY,
+        expected.to_be_bytes(),
+        &options,
+    )?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -41,7 +71,7 @@ async fn main() -> anyhow::Result<()> {
         return health_probe(&cfg.listen).await;
     }
 
-    let telemetry = otel::init(&cfg.log_level)?;
+    let telemetry = otel::init(&cfg.log_level, cfg.log_file.as_deref())?;
     let node_id = cfg.numeric_node_id()?;
     let node_meta = cfg.node_meta();
 
@@ -76,8 +106,13 @@ async fn main() -> anyhow::Result<()> {
             max_background_jobs: cfg.rocksdb_max_background_jobs,
             block_cache_mb: cfg.rocksdb_block_cache_mb,
             write_buffer_mb: cfg.rocksdb_write_buffer_mb,
+            write_buffer_manager_mb: cfg.rocksdb_write_buffer_manager_mb,
+            max_write_buffers: cfg.rocksdb_max_write_buffers,
+            enable_pipelined_write: cfg.rocksdb_enable_pipelined_write,
         },
     )?;
+    ensure_local_cluster_config(&db, cfg.cluster_config_fingerprint())?;
+    otel::register_rocksdb_metrics(db.clone());
 
     // The node-wide WAL fsync batcher (group commit across all raft groups).
     let batcher = FsyncBatcher::start(db.clone(), cfg.rocksdb_wal_sync);
@@ -90,7 +125,8 @@ async fn main() -> anyhow::Result<()> {
         raft_config(&cfg),
         cfg.raft_snapshot_max_bytes,
         batcher,
-        PeerPool::new(),
+        PeerPool::new(&cfg.internal_auth_token),
+        cfg.default_lock_algorithm,
     )?;
 
     // Resume every group with prior local raft state (restart path). Whether
@@ -100,17 +136,35 @@ async fn main() -> anyhow::Result<()> {
     let resumed = resume_local_groups(&groups, &db, cfg.group_count).await?;
     info!(resumed, "resumed locally-known raft groups");
 
+    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers, &cfg.internal_auth_token)?;
+
     // Internal raft transport (protocol RPCs, forwarding) on raft_addr.
     let raft_listen = raft_listen_addr(&cfg.raft_addr)?;
     {
-        let transport = RaftTransportService::new(groups.clone(), cfg.group_count);
+        let transport =
+            RaftTransportService::new(groups.clone(), cfg.group_count, broadcaster.clone());
+        let internal_auth_token = cfg.internal_auth_token.clone();
+        let listener = tokio::net::TcpListener::bind(raft_listen)
+            .await
+            .map_err(|e| anyhow::anyhow!("binding raft transport {raft_listen}: {e}"))?;
         tokio::spawn(async move {
             let server = Server::builder()
                 .http2_keepalive_interval(Some(HTTP2_KEEPALIVE_INTERVAL))
                 .http2_keepalive_timeout(Some(HTTP2_KEEPALIVE_TIMEOUT))
                 .tcp_keepalive(Some(TCP_KEEPALIVE))
-                .add_service(RaftTransportServer::new(transport))
-                .serve(raft_listen)
+                .add_service(tonic::service::interceptor::InterceptedService::new(
+                    RaftTransportServer::new(transport).max_decoding_message_size(
+                        pathlockd::raft::network::MAX_INTERNAL_MESSAGE_BYTES,
+                    ),
+                    move |request: Request<()>| {
+                        pathlockd::raft::network::authenticate_internal_request(
+                            &request,
+                            &internal_auth_token,
+                        )?;
+                        Ok(request)
+                    },
+                ))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
                 .await;
             if let Err(e) = server {
                 error!(error = %e, "raft transport server exited");
@@ -140,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
         node_id,
         meta: advertised_meta,
         incarnation: pathlockd::store_keys::now_ms(),
+        config_fingerprint: cfg.cluster_config_fingerprint(),
     };
     info!(%gossip_advertised, "gossip advertise address");
     let members = gossip::start_gossip_with_options(
@@ -182,6 +237,19 @@ async fn main() -> anyhow::Result<()> {
                  answered through the seeds — refusing to initialize a second \
                  cluster; joining the existing one instead"
             );
+        } else if !cfg.seed_nodes.is_empty() && !cfg.force_bootstrap {
+            // Fail closed: an empty-disk bootstrap node that cannot reach any
+            // seed must not initialize a new cluster, since a transient
+            // partition (not a truly absent cluster) would otherwise create a
+            // second lock authority. An operator who genuinely intends to
+            // found a new cluster despite configured seeds sets
+            // `force_bootstrap = true`.
+            anyhow::bail!(
+                "bootstrap requested on an empty disk, but no seed node \
+                 answered; refusing to initialize a second cluster. Set \
+                 force_bootstrap=true only if you are intentionally founding \
+                 the first node of a brand-new cluster with no reachable peers"
+            );
         } else {
             let voters = std::collections::BTreeMap::from([(node_id, node_meta.clone())]);
             for group in (0..cfg.group_count).chain([SYS_GROUP]) {
@@ -211,7 +279,6 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Events: cross-instance fan-out — static peers + gossip-discovered ones.
-    let broadcaster = Broadcaster::new(cfg.event_buffer, &cfg.peers)?;
     spawn_event_peer_sync(broadcaster.clone(), members.clone(), node_id);
 
     // GC: each node sweeps the groups it leads (the sweep is a raft command,
@@ -219,6 +286,7 @@ async fn main() -> anyhow::Result<()> {
     if cfg.group_gc_interval_secs > 0 {
         spawn_group_gc(
             router.clone(),
+            broadcaster.clone(),
             cfg.group_gc_interval_secs,
             cfg.group_gc_batch,
         );
@@ -229,7 +297,17 @@ async fn main() -> anyhow::Result<()> {
         spawn_expiry_maintenance(db.clone(), groups.clone(), cfg.gc_compact_interval_secs);
     }
 
-    let path_lock = PathLockService::new(router, broadcaster.clone(), cfg.routing_prefix_segments);
+    let path_lock = PathLockService::new(router, broadcaster.clone());
+
+    // Optional HTTP/1.1+HTTP/2+HTTP/3 facade over the same engine (opt-in via
+    // web_listen). Spawned before the blocking gRPC serve; binding errors here
+    // abort startup.
+    if cfg.web_enabled() {
+        pathlockd::web::spawn(&cfg, path_lock.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("starting web facade: {e}"))?;
+    }
+
     let addr: SocketAddr = cfg
         .listen
         .parse()
@@ -343,8 +421,8 @@ fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembe
                 let peers: Vec<String> = rx
                     .borrow()
                     .values()
-                    .filter(|m| m.node_id != self_id && !m.meta.public_addr.is_empty())
-                    .map(|m| m.meta.public_addr.clone())
+                    .filter(|m| m.node_id != self_id && !m.meta.raft_addr.is_empty())
+                    .map(|m| m.meta.raft_addr.clone())
                     .collect();
                 broadcaster.reconcile_dynamic_peers(&peers);
             }
@@ -362,34 +440,65 @@ fn spawn_event_peer_sync(broadcaster: Broadcaster, members: gossip::ClusterMembe
 /// spent, so GC throughput adapts to the write rate.
 const GC_PASS_BUDGET: Duration = Duration::from_millis(250);
 
-fn spawn_group_gc(router: Arc<Router>, interval_secs: u64, batch: u32) {
+/// Round-robin cursor so a perpetually backlogged first group cannot starve
+/// every later group's queue-expiry grants and physical cleanup. Each pass
+/// starts where the previous one stopped.
+static GC_START_OFFSET: AtomicUsize = AtomicUsize::new(0);
+
+fn spawn_group_gc(router: Arc<Router>, broadcaster: Broadcaster, interval_secs: u64, batch: u32) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
-            run_background_step("group gc", group_gc_pass(router.clone(), batch)).await;
+            run_background_step(
+                "group gc",
+                group_gc_pass(router.clone(), broadcaster.clone(), batch),
+            )
+            .await;
         }
     });
 }
 
-async fn group_gc_pass(router: Arc<Router>, batch: u32) {
+async fn group_gc_pass(router: Arc<Router>, broadcaster: Broadcaster, batch: u32) {
     let started = Instant::now();
     let mut total_scanned = 0u64;
     let mut total_reclaimed = 0u64;
     // Only the groups this node currently leads: the leader proposes the
-    // sweep; every replica applies it identically.
-    'groups: for group in router.led_groups() {
+    // sweep; every replica applies it identically. Rotate the starting point
+    // each pass so one chronically backlogged group cannot consume the whole
+    // budget and stall cleanup elsewhere.
+    let mut led = router.led_groups();
+    if led.is_empty() {
+        otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), true);
+        return;
+    }
+    let offset = GC_START_OFFSET.load(Ordering::Relaxed) % led.len();
+    led.rotate_left(offset);
+    let mut next_offset = offset;
+    'groups: for (i, group) in led.iter().copied().enumerate() {
         loop {
             match router.gc_sweep(group, batch).await {
-                Ok((scanned, reclaimed)) => {
+                Ok((scanned, reclaimed, granted)) => {
+                    for owner in granted {
+                        broadcaster.grant(&owner);
+                    }
                     total_scanned += u64::from(scanned);
                     total_reclaimed += reclaimed;
                     if scanned < batch {
+                        // This group is caught up; advance the round-robin
+                        // cursor past it for the next pass.
+                        next_offset = (offset + i + 1) % led.len();
                         break;
                     }
                     if started.elapsed() >= GC_PASS_BUDGET {
+                        // Budget spent mid-group: cede to the next group so a
+                        // perpetually backlogged group cannot starve later
+                        // groups' expiry reclamation and queue-expiry grants.
+                        // Its own persisted GC cursor resumes its progress when
+                        // the rotation comes back around.
+                        next_offset = (offset + i + 1) % led.len();
                         break 'groups;
                     }
                 }
@@ -397,11 +506,13 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
                     otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), false);
                     // Lost leadership mid-pass or backpressure: retry next tick.
                     warn!(error = %e, group, "group gc sweep failed; retrying next tick");
+                    GC_START_OFFSET.store(next_offset, Ordering::Relaxed);
                     return;
                 }
             }
         }
     }
+    GC_START_OFFSET.store(next_offset, Ordering::Relaxed);
     otel::record_gc_sweep(total_scanned, total_reclaimed, started.elapsed(), true);
 }
 
@@ -409,17 +520,18 @@ async fn group_gc_pass(router: Arc<Router>, batch: u32) {
 
 fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, groups: Arc<RaftGroups>, interval_secs: u64) {
     tokio::spawn(async move {
+        let mut compacted = std::collections::HashMap::new();
         let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await;
         loop {
             tick.tick().await;
             let hosted = groups.hosted();
-            run_background_step(
-                "expiry maintenance",
-                expiry_maintenance_pass(db.clone(), hosted),
-            )
-            .await;
+            let result = expiry_maintenance_pass(db.clone(), hosted, compacted.clone()).await;
+            match result {
+                Ok(next) => compacted = next,
+                Err(e) => error!(error = %e, "expiry index maintenance failed"),
+            }
         }
     });
 }
@@ -427,19 +539,23 @@ fn spawn_expiry_maintenance(db: Arc<rocksdb::DB>, groups: Arc<RaftGroups>, inter
 async fn expiry_maintenance_pass(
     db: Arc<rocksdb::DB>,
     groups: Vec<pathlockd::cluster::placement::GroupId>,
-) {
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+    mut compacted: std::collections::HashMap<pathlockd::cluster::placement::GroupId, Vec<u8>>,
+) -> anyhow::Result<std::collections::HashMap<pathlockd::cluster::placement::GroupId, Vec<u8>>> {
+    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         for group in groups {
+            let Some(cursor) = pathlockd::store_rocksdb::expiry_gc_cursor(&db, group)? else {
+                continue;
+            };
+            if compacted.get(&group) == Some(&cursor) {
+                continue;
+            }
             pathlockd::store_rocksdb::compact_swept_expiry(&db, group)?;
+            compacted.insert(group, cursor);
         }
-        Ok(())
+        Ok(compacted)
     })
-    .await;
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => error!(error = %e, "expiry index maintenance failed"),
-        Err(e) => error!(error = %e, "expiry index maintenance task failed"),
-    }
+    .await
+    .map_err(|e| anyhow::anyhow!("expiry index maintenance task failed: {e}"))?
 }
 
 // --- Health probe ---
@@ -556,5 +672,14 @@ mod tests {
             "0.0.0.0:50052".parse::<SocketAddr>().unwrap()
         );
         assert!(raft_listen_addr("http://nodeport").is_err());
+    }
+
+    #[test]
+    fn data_directory_rejects_a_changed_cluster_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_db(&dir.path().join("db"), &DbTuning::default()).unwrap();
+        ensure_local_cluster_config(&db, 7).unwrap();
+        ensure_local_cluster_config(&db, 7).unwrap();
+        assert!(ensure_local_cluster_config(&db, 8).is_err());
     }
 }

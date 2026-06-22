@@ -27,12 +27,14 @@ Configuration is loaded from lowest to highest precedence:
 
 | Field | Default | Description |
 |---|---|---|
-| `group_count` | `32` | Number of Raft groups (shards; fixed at cluster birth) |
-| `routing_prefix_segments` | `0` | Path depth of the routing domain (0 = handler only) |
+| `group_count` | `256` | Number of virtual Raft groups (fixed at cluster birth) |
+| `routing_prefix_segments` | `1` | Fallback path depth when no explicit namespace root exists (`1` = handler plus first segment; `0` = legacy handler only) |
 | `replication_factor` | `3` | Voters per Raft group (odd; auto-degrades to the node count and upgrades as nodes join) |
 | `seed_nodes` | `[]` | Gossip addresses of existing members; required on every non-bootstrap node |
 | `bootstrap` | `false` | `true` on exactly one node to create a brand-new cluster (guarded: an empty-disk restart joins the existing cluster instead of re-initializing) |
+| `force_bootstrap` | `false` | Allow `bootstrap` to initialize when `seed_nodes` are configured but unreachable. Fail-closed by default so a transient partition cannot found a second cluster; set `true` only for the first node of a brand-new cluster with no reachable peers |
 | `public_addr` / `raft_addr` | localhost | Addresses advertised to peers — must be reachable cluster-wide |
+| `internal_auth_token` | required | Shared secret for the internal Raft transport; use the same random value on every node (minimum 32 bytes) |
 | `gossip_addr` | `0.0.0.0:7946` | SWIM UDP bind; `gossip_advertise_addr` overrides the advertised ip:port |
 | `gossip_cluster_size` | `32` | Expected SWIM members for Foca dissemination/suspicion tuning |
 | `gossip_max_packet_size` | `1400` | Maximum Foca UDP payload size |
@@ -53,8 +55,19 @@ Configuration is loaded from lowest to highest precedence:
 |---|---|---|
 | `rocksdb_wal_sync` | `true` | Sync WAL on every write (set to `false` for throughput) |
 | `rocksdb_max_open_files` | `4096` | RocksDB max open files |
+| `rocksdb_max_total_wal_size_mb` | `512` | Total WAL cap before RocksDB flushes cold column families |
+| `rocksdb_max_background_jobs` | `4` | Flush and compaction worker budget |
+| `rocksdb_block_cache_mb` | `128` | Shared block cache across column families |
+| `rocksdb_write_buffer_mb` | `16` | Memtable size per column family |
+| `rocksdb_write_buffer_manager_mb` | `256` | Node-wide soft cap across all memtables |
+| `rocksdb_max_write_buffers` | `3` | Mutable and immutable memtables allowed per column family |
+| `rocksdb_enable_pipelined_write` | `true` | Overlap WAL and memtable write stages |
 | `raft_snapshot_interval_entries` | `10000` | Entries between snapshots |
 | `raft_snapshot_min_log_entries` | `5000` | Minimum log entries before snapshot |
+| `raft_snapshot_max_bytes` | `536870912` | Maximum snapshot image built, sent, or accepted |
+
+`log_file` optionally duplicates stdout logs to an append-only file. Rotation
+is external; use the container logging driver or `logrotate`.
 
 ### Example config
 
@@ -64,12 +77,13 @@ node_id = "pathlockd-0"
 data_dir = "/var/lib/pathlockd"
 public_addr = "http://pathlockd-0.pathlockd:50051"
 raft_addr = "http://pathlockd-0.pathlockd:50052"
+internal_auth_token = "replace-with-a-shared-random-secret-of-at-least-32-bytes"
 gossip_addr = "0.0.0.0:7946"
 gossip_cluster_size = 32
 gossip_max_packet_size = 1400
 gossip_seed_announce_interval_ms = 5000
 seed_nodes = ["pathlockd-0.pathlockd:7946", "pathlockd-1.pathlockd:7946", "pathlockd-2.pathlockd:7946"]
-group_count = 32
+group_count = 256
 replication_factor = 3
 group_gc_interval_secs = 1
 group_gc_batch = 1024
@@ -77,6 +91,11 @@ event_buffer = 8192
 request_timeout_ms = 30000
 log_level = "info"
 ```
+
+The internal transport rejects requests without the shared token. Keep
+`raft_addr` on a private network because the default transport is plaintext;
+use network policy or a mutually authenticated proxy when traffic crosses an
+untrusted network.
 
 ## Running
 
@@ -203,13 +222,13 @@ families:
 | `write_locks` | `path -> LockRecord` |
 | `read_locks` | `path:NUL:owner -> LockRecord` |
 | `fences` | `path -> FenceRecord` |
-| `claims` | `path -> ClaimRecord` |
 | `desc_write` | `ancestor:NUL:path -> ExpiringIndexRecord` |
 | `desc_read` | `ancestor:NUL:path:NUL:owner -> ExpiringIndexRecord` |
-| `desc_claim` | `ancestor:NUL:path -> ExpiringIndexRecord` |
 | `owner_alive` | `owner -> AliveRecord` |
 | `owner_holds` | `owner:NUL:mode:NUL:path -> OwnedLockRecord` |
 | `wait_edges` | `owner -> WaitEdgeRecord` |
+| `namespace_settings` | `namespace -> lock algorithm policy / explicit route root` |
+| `lock_queue` | `'e':be64(seq) -> QueueEntry` (FIFO waiters); `'o':owner -> seq` |
 | `expiry` | `be64(expires_at):NUL:kind:NUL:primary_key -> ExpiryRecord` |
 | `request_dedupe` | `request_id -> cached ApplyResponse` (apply-once forwarding) |
 
@@ -234,12 +253,14 @@ Set `group_gc_interval_secs = 0` to disable active GC (lazy expiry still applies
 
 ### Lock domain cardinality and write scaling
 
-- Each routing domain maps to exactly one Raft group (HRW); all writes for a
-  domain serialize through that group's leader. Write throughput scales with
-  the number of *domains*, spread across nodes by leader balancing.
-- Few handlers? Set `routing_prefix_segments = K` to shard by the first K
-  path segments — locks above depth K are then rejected (containment must
-  stay single-group).
+- Each routing namespace maps to exactly one Raft group (HRW); all writes for a
+  namespace serialize through that group's leader. Write throughput scales with
+  the number of namespaces, spread across nodes by leader balancing.
+- The fallback namespace for `handler:/a/b` is `handler:/a`. Use
+  `SetNamespacePolicy` to create explicit namespace roots such as
+  `handler:/a/b` when a subtree needs its own shard. The longest explicit root
+  wins; define/delete nested roots while the affected subtree is drained if
+  parent recursive locks must cover it.
 - Multi-domain acquires are rejected; owner-wide operations (renew,
   release-all, force-release) fan out per group. Clients should declare
   `RenewRequest.domains` so heartbeats touch only the groups holding state.
@@ -276,4 +297,10 @@ Set `group_gc_interval_secs = 0` to disable active GC (lazy expiry still applies
 ### Memory usage
 
 - `rocksdb_max_open_files`: Lower this if file descriptor limits are tight
+- Budget `rocksdb_write_buffer_manager_mb` and `rocksdb_block_cache_mb`
+  together; snapshots are additional transient memory up to
+  `raft_snapshot_max_bytes`.
+- Monitor `pathlockd.rocksdb.memtable_bytes`,
+  `pathlockd.rocksdb.block_cache_bytes`, and
+  `pathlockd.rocksdb.pending_compaction_bytes` before increasing write buffers.
 - `event_buffer`: Per-subscriber event queue depth; large values increase memory

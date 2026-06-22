@@ -17,6 +17,7 @@
 //! is transparently prefixed with its group id (`store_keys::group_key`).
 //! Engine-level code only ever sees group-relative keys.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Arc;
@@ -88,7 +89,7 @@ pub enum StoredRecord {
         v: i64,
     },
     /// Arbitrary binary payload with an expiry (e.g. cached ApplyResponses in
-    /// the dedupe CF). Appended last so existing variant encodings are stable.
+    /// the dedupe CF).
     Bytes {
         v: Vec<u8>,
         exp: u64,
@@ -148,6 +149,9 @@ pub struct DbTuning {
     pub max_background_jobs: i32,
     pub block_cache_mb: u64,
     pub write_buffer_mb: u64,
+    pub write_buffer_manager_mb: u64,
+    pub max_write_buffers: i32,
+    pub enable_pipelined_write: bool,
 }
 
 impl Default for DbTuning {
@@ -158,6 +162,9 @@ impl Default for DbTuning {
             max_background_jobs: 4,
             block_cache_mb: 128,
             write_buffer_mb: 16,
+            write_buffer_manager_mb: 256,
+            max_write_buffers: 3,
+            enable_pipelined_write: true,
         }
     }
 }
@@ -189,10 +196,24 @@ pub fn open_db(path: &Path, tuning: &DbTuning) -> anyhow::Result<Arc<DB>> {
     db_opts.set_max_open_files(tuning.max_open_files);
     db_opts.set_max_total_wal_size(tuning.max_total_wal_size_mb.saturating_mul(MIB));
     db_opts.set_max_background_jobs(tuning.max_background_jobs);
+    db_opts.set_max_subcompactions((tuning.max_background_jobs as u32 / 2).max(1));
+    db_opts.set_enable_pipelined_write(tuning.enable_pipelined_write);
+    db_opts.set_bytes_per_sync(MIB);
+    db_opts.set_wal_bytes_per_sync(MIB);
 
-    let cache = rocksdb::Cache::new_lru_cache(
+    // AutoHyperClockCache (estimated_entry_charge = 0): lock-free clock eviction
+    // instead of LRU's per-shard mutex, which matters under the engine's many
+    // concurrent point gets. The auto-tuned charge suits our mixed cache
+    // contents (4 KiB data blocks plus differently-sized index/filter blocks).
+    let cache = rocksdb::Cache::new_hyper_clock_cache(
         usize::try_from(tuning.block_cache_mb.saturating_mul(MIB)).unwrap_or(usize::MAX),
+        0,
     );
+    let write_buffer_manager = rocksdb::WriteBufferManager::new_write_buffer_manager(
+        usize::try_from(tuning.write_buffer_manager_mb.saturating_mul(MIB)).unwrap_or(usize::MAX),
+        true,
+    );
+    db_opts.set_write_buffer_manager(&write_buffer_manager);
 
     let cf_descriptors: Vec<rocksdb::ColumnFamilyDescriptor> = store_keys::ALL_CFS
         .iter()
@@ -209,6 +230,7 @@ fn cf_options(name: &str, cache: &rocksdb::Cache, tuning: &DbTuning) -> rocksdb:
     opts.set_write_buffer_size(
         usize::try_from(tuning.write_buffer_mb.saturating_mul(MIB)).unwrap_or(usize::MAX),
     );
+    opts.set_max_write_buffer_number(tuning.max_write_buffers);
     opts.set_level_compaction_dynamic_level_bytes(true);
     // Backstop: rewrite any SST untouched for a day so trivial tombstones and
     // expired records do not survive indefinitely in cold levels.
@@ -276,6 +298,7 @@ pub(crate) fn key_successor(key: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 type Overlay = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+type ReadCache = HashMap<&'static str, HashMap<Vec<u8>, Option<Vec<u8>>>>;
 
 /// Walk `[start, upper)` of a column family in key order, merging committed
 /// state with an optional uncommitted overlay (overlay entries shadow
@@ -288,6 +311,7 @@ pub(crate) fn scan_with_overlay<F>(
     db: &DB,
     cf: &'static str,
     overlay: Option<&Overlay>,
+    snapshot: Option<&rocksdb::Snapshot<'_>>,
     start: Option<&[u8]>,
     upper: Option<&[u8]>,
     mut visit: F,
@@ -299,6 +323,9 @@ where
         .cf_handle(cf)
         .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
     let mut read_opts = rocksdb::ReadOptions::default();
+    if let Some(snapshot) = snapshot {
+        read_opts.set_snapshot(snapshot);
+    }
     if let Some(u) = upper {
         read_opts.set_iterate_upper_bound(u.to_vec());
     }
@@ -375,6 +402,7 @@ fn smembers_limited_impl(
     db: &DB,
     cf: &'static str,
     overlay: Option<&Overlay>,
+    snapshot: Option<&rocksdb::Snapshot<'_>>,
     key: &[u8],
     limit: usize,
     now_ms: u64,
@@ -385,24 +413,32 @@ fn smembers_limited_impl(
     let mut raw = 0usize;
     let raw_cap = raw_scan_cap(limit);
     let mut exceeded = false;
-    scan_with_overlay(db, cf, overlay, Some(&prefix), upper.as_deref(), |k, v| {
-        if !k.starts_with(&prefix) {
-            return Ok(false);
-        }
-        raw += 1;
-        if let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) {
-            if members.len() >= limit {
+    scan_with_overlay(
+        db,
+        cf,
+        overlay,
+        snapshot,
+        Some(&prefix),
+        upper.as_deref(),
+        |k, v| {
+            if !k.starts_with(&prefix) {
+                return Ok(false);
+            }
+            raw += 1;
+            if let Some(member) = live_str(decode_record(v)?, now_ms) {
+                if members.len() >= limit {
+                    exceeded = true;
+                    return Ok(false);
+                }
+                members.push(member);
+            }
+            if raw >= raw_cap {
                 exceeded = true;
                 return Ok(false);
             }
-            members.push(member);
-        }
-        if raw >= raw_cap {
-            exceeded = true;
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
+            Ok(true)
+        },
+    )?;
     if exceeded {
         return Err(SetScanLimitExceeded {
             operation: "smembers",
@@ -413,10 +449,12 @@ fn smembers_limited_impl(
     Ok(members)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn smembers_page_impl(
     db: &DB,
     cf: &'static str,
     overlay: Option<&Overlay>,
+    snapshot: Option<&rocksdb::Snapshot<'_>>,
     key: &[u8],
     cursor: Option<Vec<u8>>,
     page: usize,
@@ -428,20 +466,28 @@ fn smembers_page_impl(
     let mut members = Vec::new();
     let mut raw = 0usize;
     let mut next_cursor = None;
-    scan_with_overlay(db, cf, overlay, Some(&start), upper.as_deref(), |k, v| {
-        if !k.starts_with(&prefix) {
-            return Ok(false);
-        }
-        if raw >= page {
-            next_cursor = Some(k.to_vec());
-            return Ok(false);
-        }
-        raw += 1;
-        if let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) {
-            members.push(member);
-        }
-        Ok(true)
-    })?;
+    scan_with_overlay(
+        db,
+        cf,
+        overlay,
+        snapshot,
+        Some(&start),
+        upper.as_deref(),
+        |k, v| {
+            if !k.starts_with(&prefix) {
+                return Ok(false);
+            }
+            if raw >= page {
+                next_cursor = Some(k.to_vec());
+                return Ok(false);
+            }
+            raw += 1;
+            if let Some(member) = live_str(decode_record(v)?, now_ms) {
+                members.push(member);
+            }
+            Ok(true)
+        },
+    )?;
     Ok((members, next_cursor))
 }
 
@@ -449,25 +495,31 @@ fn has_live_member_impl(
     db: &DB,
     cf: &'static str,
     overlay: Option<&Overlay>,
+    snapshot: Option<&rocksdb::Snapshot<'_>>,
     key: &[u8],
     now_ms: u64,
 ) -> anyhow::Result<bool> {
     let prefix = member_prefix(key);
     let upper = prefix_upper_bound(&prefix);
     let mut found = false;
-    scan_with_overlay(db, cf, overlay, Some(&prefix), upper.as_deref(), |k, v| {
-        if !k.starts_with(&prefix) {
-            return Ok(false);
-        }
-        if decode_record_lenient(v)
-            .and_then(|r| live_str(r, now_ms))
-            .is_some()
-        {
-            found = true;
-            return Ok(false);
-        }
-        Ok(true)
-    })?;
+    scan_with_overlay(
+        db,
+        cf,
+        overlay,
+        snapshot,
+        Some(&prefix),
+        upper.as_deref(),
+        |k, v| {
+            if !k.starts_with(&prefix) {
+                return Ok(false);
+            }
+            if live_str(decode_record(v)?, now_ms).is_some() {
+                found = true;
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )?;
     Ok(found)
 }
 
@@ -485,6 +537,7 @@ pub struct WriteTxn {
     group: GroupId,
     batch: rocksdb::WriteBatch,
     overlay: HashMap<&'static str, Overlay>,
+    read_cache: RefCell<ReadCache>,
     now_ms: u64,
     dirty: bool,
 }
@@ -496,6 +549,7 @@ impl WriteTxn {
             group,
             batch: rocksdb::WriteBatch::default(),
             overlay: HashMap::new(),
+            read_cache: RefCell::new(HashMap::new()),
             now_ms,
             dirty: false,
         }
@@ -516,11 +570,25 @@ impl WriteTxn {
         if let Some(entry) = self.overlay.get(cf).and_then(|m| m.get(full_key)) {
             return Ok(entry.clone());
         }
+        if let Some(entry) = self
+            .read_cache
+            .borrow()
+            .get(cf)
+            .and_then(|cache| cache.get(full_key))
+        {
+            return Ok(entry.clone());
+        }
         let cf_handle = self
             .db
             .cf_handle(cf)
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
-        Ok(self.db.get_cf(&cf_handle, full_key)?)
+        let value = self.db.get_cf(&cf_handle, full_key)?;
+        self.read_cache
+            .borrow_mut()
+            .entry(cf)
+            .or_default()
+            .insert(full_key.to_vec(), value.clone());
+        Ok(value)
     }
 
     pub fn put_raw(&mut self, cf: &'static str, key: &[u8], value: Vec<u8>) -> anyhow::Result<()> {
@@ -543,6 +611,7 @@ impl WriteTxn {
             .entry(cf)
             .or_default()
             .insert(full_key, Some(value));
+        self.read_cache.borrow_mut().remove(cf);
         self.dirty = true;
         Ok(())
     }
@@ -555,6 +624,7 @@ impl WriteTxn {
             .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
         self.batch.delete_cf(&cf_handle, &full_key);
         self.overlay.entry(cf).or_default().insert(full_key, None);
+        self.read_cache.borrow_mut().remove(cf);
         self.dirty = true;
         Ok(())
     }
@@ -586,6 +656,7 @@ impl WriteTxn {
             &self.db,
             cf,
             self.overlay.get(cf),
+            None,
             Some(&scoped_start),
             scoped_upper.as_deref(),
             |k, v| visit(&k[gp.len()..], v),
@@ -728,7 +799,15 @@ impl StoreTxn for WriteTxn {
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
         let sk = self.scoped(key);
-        smembers_limited_impl(&self.db, cf, self.overlay.get(cf), &sk, limit, self.now_ms)
+        smembers_limited_impl(
+            &self.db,
+            cf,
+            self.overlay.get(cf),
+            None,
+            &sk,
+            limit,
+            self.now_ms,
+        )
     }
 
     fn smembers_page(
@@ -746,6 +825,7 @@ impl StoreTxn for WriteTxn {
             &self.db,
             cf,
             self.overlay.get(cf),
+            None,
             &sk,
             scoped_cursor,
             page,
@@ -770,7 +850,7 @@ impl StoreTxn for WriteTxn {
 
     fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<bool> {
         let sk = self.scoped(key);
-        has_live_member_impl(&self.db, cf, self.overlay.get(cf), &sk, self.now_ms)
+        has_live_member_impl(&self.db, cf, self.overlay.get(cf), None, &sk, self.now_ms)
     }
 }
 
@@ -854,7 +934,7 @@ impl StoreTxn for RocksDbTxn {
         limit: usize,
     ) -> anyhow::Result<Vec<String>> {
         let sk = self.scoped(key);
-        smembers_limited_impl(&self.db, cf, None, &sk, limit, self.now_ms)
+        smembers_limited_impl(&self.db, cf, None, None, &sk, limit, self.now_ms)
     }
 
     fn smembers_page(
@@ -866,8 +946,16 @@ impl StoreTxn for RocksDbTxn {
     ) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
         let sk = self.scoped(key);
         let scoped_cursor = cursor.map(|c| store_keys::group_key(self.group, &c));
-        let (members, next) =
-            smembers_page_impl(&self.db, cf, None, &sk, scoped_cursor, page, self.now_ms)?;
+        let (members, next) = smembers_page_impl(
+            &self.db,
+            cf,
+            None,
+            None,
+            &sk,
+            scoped_cursor,
+            page,
+            self.now_ms,
+        )?;
         Ok((
             members,
             next.map(|n| n[store_keys::GROUP_PREFIX_LEN..].to_vec()),
@@ -891,7 +979,146 @@ impl StoreTxn for RocksDbTxn {
 
     fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<bool> {
         let sk = self.scoped(key);
-        has_live_member_impl(&self.db, cf, None, &sk, self.now_ms)
+        has_live_member_impl(&self.db, cf, None, None, &sk, self.now_ms)
+    }
+}
+
+pub struct SnapshotTxn<'a> {
+    db: &'a DB,
+    snapshot: &'a rocksdb::Snapshot<'a>,
+    group: GroupId,
+    now_ms: u64,
+}
+
+impl<'a> SnapshotTxn<'a> {
+    pub fn new(
+        db: &'a DB,
+        snapshot: &'a rocksdb::Snapshot<'a>,
+        group: GroupId,
+        now_ms: u64,
+    ) -> Self {
+        Self {
+            db,
+            snapshot,
+            group,
+            now_ms,
+        }
+    }
+
+    fn scoped(&self, key: &[u8]) -> Vec<u8> {
+        store_keys::group_key(self.group, key)
+    }
+}
+
+impl StoreTxn for SnapshotTxn<'_> {
+    fn now_ms(&self) -> u64 {
+        self.now_ms
+    }
+
+    fn get_str(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<Option<String>> {
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
+        match self.snapshot.get_cf(&cf_handle, self.scoped(key))? {
+            Some(v) => Ok(live_str(decode_record(&v)?, self.now_ms)),
+            None => Ok(None),
+        }
+    }
+
+    fn set_str(
+        &mut self,
+        _cf: &'static str,
+        _key: &[u8],
+        _value: &str,
+        _ttl_ms: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("SnapshotTxn is read-only")
+    }
+
+    fn pexpire_str(&mut self, _cf: &'static str, _key: &[u8], _ttl_ms: u64) -> anyhow::Result<()> {
+        anyhow::bail!("SnapshotTxn is read-only")
+    }
+
+    fn del(&mut self, _cf: &'static str, _key: &[u8]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn sadd(
+        &mut self,
+        _cf: &'static str,
+        _key: &[u8],
+        _member: &str,
+        _ttl_ms: u64,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("SnapshotTxn is read-only")
+    }
+
+    fn srem(&mut self, _cf: &'static str, _key: &[u8], _member: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn smembers_limited(
+        &mut self,
+        cf: &'static str,
+        key: &[u8],
+        limit: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        let sk = self.scoped(key);
+        smembers_limited_impl(
+            self.db,
+            cf,
+            None,
+            Some(self.snapshot),
+            &sk,
+            limit,
+            self.now_ms,
+        )
+    }
+
+    fn smembers_page(
+        &mut self,
+        cf: &'static str,
+        key: &[u8],
+        cursor: Option<Vec<u8>>,
+        page: usize,
+    ) -> anyhow::Result<(Vec<String>, Option<Vec<u8>>)> {
+        let sk = self.scoped(key);
+        let scoped_cursor = cursor.map(|c| store_keys::group_key(self.group, &c));
+        let (members, next) = smembers_page_impl(
+            self.db,
+            cf,
+            None,
+            Some(self.snapshot),
+            &sk,
+            scoped_cursor,
+            page,
+            self.now_ms,
+        )?;
+        Ok((
+            members,
+            next.map(|n| n[store_keys::GROUP_PREFIX_LEN..].to_vec()),
+        ))
+    }
+
+    fn sismember(&mut self, cf: &'static str, key: &[u8], member: &str) -> anyhow::Result<bool> {
+        let member_key = self.scoped(&member_key(key, member));
+        let cf_handle = self
+            .db
+            .cf_handle(cf)
+            .ok_or_else(|| anyhow::anyhow!("missing column family {cf}"))?;
+        match self.snapshot.get_cf(&cf_handle, &member_key)? {
+            Some(v) => Ok(matches!(
+                decode_record(&v)?,
+                StoredRecord::Str { exp, .. } if !expired(exp, self.now_ms)
+            )),
+            None => Ok(false),
+        }
+    }
+
+    fn has_live_member(&mut self, cf: &'static str, key: &[u8]) -> anyhow::Result<bool> {
+        let sk = self.scoped(key);
+        has_live_member_impl(self.db, cf, None, Some(self.snapshot), &sk, self.now_ms)
     }
 }
 
@@ -914,22 +1141,30 @@ pub fn dump_owner_holds(
     cursor: Option<Vec<u8>>,
     page: usize,
 ) -> anyhow::Result<crate::engine::LockDumpPage> {
-    use crate::engine::{LockDumpPage, LockEntry, Mode};
+    use crate::engine::{scoped_path, LockDumpPage, LockEntry, Mode};
 
     let mut entries: Vec<LockEntry> = Vec::new();
     let mut alive_memo: HashMap<String, bool> = HashMap::new();
     let mut raw = 0usize;
     let mut next_cursor: Option<Vec<u8>> = None;
 
-    let mut fence_txn = RocksDbTxn::new(db.clone(), group, now_ms);
+    let snapshot = db.snapshot();
+    let owner_alive_cf = db
+        .cf_handle(store_keys::CF_OWNER_ALIVE)
+        .ok_or_else(|| anyhow::anyhow!("missing owner_alive column family"))?;
+    let fence_cf = db
+        .cf_handle(store_keys::CF_FENCES)
+        .ok_or_else(|| anyhow::anyhow!("missing fences column family"))?;
 
-    let mut owner_alive = |owner: &str, txn: &mut RocksDbTxn| -> anyhow::Result<bool> {
+    let mut owner_alive = |owner: &str| -> anyhow::Result<bool> {
         if let Some(alive) = alive_memo.get(owner) {
             return Ok(*alive);
         }
-        let alive = txn
-            .get_str(store_keys::CF_OWNER_ALIVE, &store_keys::alive_key(owner))?
-            .is_some();
+        let key = store_keys::group_key(group, &store_keys::alive_key(owner));
+        let alive = match snapshot.get_cf(&owner_alive_cf, key)? {
+            Some(raw) => live_str(decode_record(&raw)?, now_ms).is_some(),
+            None => false,
+        };
         alive_memo.insert(owner.to_string(), alive);
         Ok(alive)
     };
@@ -944,6 +1179,7 @@ pub fn dump_owner_holds(
         db,
         store_keys::CF_OWNER_HOLDS,
         None,
+        Some(&snapshot),
         Some(&start),
         upper.as_deref(),
         |full_key, v| {
@@ -965,23 +1201,26 @@ pub fn dump_owner_holds(
             let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
                 return Ok(true);
             };
-            let Some(mode_sep) = member.find(':') else {
+            let Some(held) = crate::engine::parse_hold_member(&member) else {
                 return Ok(true);
             };
-            let mode = match &member[..mode_sep] {
-                "write" => Mode::Write,
-                "read" => Mode::Read,
-                _ => return Ok(true),
-            };
-            let path = &member[mode_sep + 1..];
+            let namespace = held.namespace.as_str();
+            let mode = held.mode;
+            let path = held.path.as_str();
 
-            if !owner_alive(owner, &mut fence_txn)? {
+            if !owner_alive(owner)? {
                 return Ok(true);
             }
 
             let fence = if mode == Mode::Write {
-                fence_txn
-                    .get_str(store_keys::CF_FENCES, &store_keys::fence_key(path))?
+                let key_path = scoped_path(namespace, path);
+                snapshot
+                    .get_cf(
+                        &fence_cf,
+                        store_keys::group_key(group, &store_keys::fence_key(&key_path)),
+                    )?
+                    .and_then(|raw| decode_record(&raw).ok())
+                    .and_then(|record| live_str(record, now_ms))
                     .and_then(|s| s.parse::<i64>().ok())
             } else {
                 None
@@ -1001,6 +1240,165 @@ pub fn dump_owner_holds(
         entries,
         next_cursor,
     })
+}
+
+/// List explicit namespace policy/routing roots in one group's namespace
+/// settings CF. The settings are permanent (`exp == 0`) unless explicitly
+/// deleted, but this still uses normal live-record decoding so old expiring
+/// test/corrupt rows do not leak into the resolver.
+pub fn list_namespace_settings(
+    db: &Arc<DB>,
+    group: GroupId,
+    now_ms: u64,
+) -> anyhow::Result<Vec<crate::engine::NamespacePolicyEntry>> {
+    let snapshot = db.snapshot();
+    let gp = store_keys::group_prefix(group);
+    let start = gp.to_vec();
+    let upper = prefix_upper_bound(&gp);
+    let mut namespaces = Vec::new();
+    scan_with_overlay(
+        db,
+        store_keys::CF_NAMESPACE_SETTINGS,
+        None,
+        Some(&snapshot),
+        Some(&start),
+        upper.as_deref(),
+        |full_key, v| {
+            let Some(raw) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
+                return Ok(true);
+            };
+            let key = &full_key[gp.len()..];
+            if let Ok(namespace) = std::str::from_utf8(key) {
+                let policy = crate::engine::parse_namespace_policy_value(&raw)?;
+                namespaces.push(crate::engine::NamespacePolicyEntry {
+                    namespace: namespace.to_string(),
+                    algorithm: policy.algorithm,
+                    epoch: policy.epoch,
+                });
+            }
+            Ok(true)
+        },
+    )?;
+    namespaces.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+    namespaces.dedup_by(|a, b| a.namespace == b.namespace);
+    Ok(namespaces)
+}
+
+/// Return true if this group has any live lock path contained by `namespace`.
+/// Used by namespace-root reconfiguration guards; expensive but administrative.
+pub fn namespace_has_live_locks(
+    db: &Arc<DB>,
+    group: GroupId,
+    now_ms: u64,
+    namespace: &str,
+) -> anyhow::Result<bool> {
+    let snapshot = db.snapshot();
+    let gp = store_keys::group_prefix(group);
+    let start = gp.to_vec();
+    let upper = prefix_upper_bound(&gp);
+    let mut found = false;
+    let mut alive_memo: HashMap<String, bool> = HashMap::new();
+    let alive_cf = db
+        .cf_handle(store_keys::CF_OWNER_ALIVE)
+        .ok_or_else(|| anyhow::anyhow!("missing owner_alive column family"))?;
+
+    scan_with_overlay(
+        db,
+        store_keys::CF_OWNER_HOLDS,
+        None,
+        Some(&snapshot),
+        Some(&start),
+        upper.as_deref(),
+        |full_key, v| {
+            if found {
+                return Ok(false);
+            }
+            let key = &full_key[gp.len()..];
+            let Some(sep) = key.windows(2).position(|w| w == [0, 0]) else {
+                return Ok(true);
+            };
+            let Ok(owner) = std::str::from_utf8(&key[..sep]) else {
+                return Ok(true);
+            };
+            let Some(member) = decode_record_lenient(v).and_then(|r| live_str(r, now_ms)) else {
+                return Ok(true);
+            };
+            let Some(held) = crate::engine::parse_hold_member(&member) else {
+                return Ok(true);
+            };
+            if !crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str()) {
+                return Ok(true);
+            }
+            let alive = match alive_memo.get(owner) {
+                Some(alive) => *alive,
+                None => {
+                    let key = store_keys::group_key(group, &store_keys::alive_key(owner));
+                    let alive = match snapshot.get_cf(&alive_cf, key)? {
+                        Some(raw) => live_str(decode_record(&raw)?, now_ms).is_some(),
+                        None => false,
+                    };
+                    alive_memo.insert(owner.to_string(), alive);
+                    alive
+                }
+            };
+            if alive {
+                found = true;
+                return Ok(false);
+            }
+            Ok(true)
+        },
+    )?;
+
+    Ok(found)
+}
+
+/// Every live held lock selected for a namespace transition, returned as
+/// `(owner, stored namespace, mode, path)` against the transaction's merged
+/// view.
+///
+/// Algorithm changes select the exact stored namespace. Creating a routing root
+/// additionally selects paths acquired through its previous route, excluding
+/// explicitly preserved nested namespaces.
+///
+/// Like [`namespace_has_live_locks`] the scan is unbounded (administrative):
+/// the clear is all-or-nothing within a group rather than risking a partially
+/// cleared namespace under a scan cap.
+pub fn collect_namespace_holds(
+    txn: &WriteTxn,
+    namespace: &str,
+    include_legacy_routes: bool,
+    preserved_namespaces: &std::collections::BTreeSet<String>,
+) -> anyhow::Result<Vec<(String, String, String, String)>> {
+    let now = txn.now_ms();
+    let mut out = Vec::new();
+    txn.scan_merged(store_keys::CF_OWNER_HOLDS, None, None, |key, value| {
+        let Some(sep) = key.windows(2).position(|w| w == [0, 0]) else {
+            return Ok(true);
+        };
+        let Ok(owner) = std::str::from_utf8(&key[..sep]) else {
+            return Ok(true);
+        };
+        let Some(member) = decode_record_lenient(value).and_then(|r| live_str(r, now)) else {
+            return Ok(true);
+        };
+        let Some(held) = crate::engine::parse_hold_member(&member) else {
+            return Ok(true);
+        };
+        let held_namespace = held.namespace.as_str();
+        let legacy_match = include_legacy_routes
+            && crate::cluster::placement::namespace_contains_path(namespace, held.path.as_str())
+            && !preserved_namespaces.contains(held_namespace);
+        if held_namespace == namespace || legacy_match {
+            out.push((
+                owner.to_string(),
+                held.namespace.to_string(),
+                held.mode.as_str().to_string(),
+                held.path.into_string(),
+            ));
+        }
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1446,37 @@ pub fn compact_swept_expiry(db: &DB, group: GroupId) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("delete_file_in_range: {e}"))?;
     db.compact_range_cf(&expiry, Some(from.as_slice()), Some(to.as_slice()));
     Ok(())
+}
+
+pub fn expiry_gc_cursor(db: &DB, group: GroupId) -> anyhow::Result<Option<Vec<u8>>> {
+    let meta = db
+        .cf_handle(store_keys::CF_META)
+        .ok_or_else(|| anyhow::anyhow!("missing meta column family"))?;
+    db.get_cf(
+        &meta,
+        store_keys::group_key(group, store_keys::META_GC_CURSOR_KEY),
+    )
+    .map_err(Into::into)
+}
+
+pub fn group_has_expiry_due(db: &DB, group: GroupId, now_ms: u64) -> anyhow::Result<bool> {
+    let expiry = db
+        .cf_handle(store_keys::CF_EXPIRY)
+        .ok_or_else(|| anyhow::anyhow!("missing expiry column family"))?;
+    let start = match expiry_gc_cursor(db, group)? {
+        Some(cursor) => store_keys::group_key(group, &cursor),
+        None => store_keys::group_prefix(group).to_vec(),
+    };
+    let upper = store_keys::group_key(group, &store_keys::expiry_scan_upper(now_ms));
+    let mut read_opts = rocksdb::ReadOptions::default();
+    read_opts.set_iterate_upper_bound(upper);
+    let mut iter = db.raw_iterator_cf_opt(&expiry, read_opts);
+    iter.seek(start);
+    if !iter.valid() {
+        iter.status()?;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1319,6 +1748,31 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_txn_keeps_one_consistent_view() {
+        let (db, _dir) = open_test_db();
+        {
+            let mut tx = WriteTxn::new(db.clone(), 0, 1_000);
+            tx.set_str(store_keys::CF_WRITE_LOCKS, b"h:/a", "alice", 0)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let snapshot = db.snapshot();
+        let mut view = SnapshotTxn::new(&db, &snapshot, 0, 1_001);
+        {
+            let mut tx = WriteTxn::new(db.clone(), 0, 1_001);
+            tx.set_str(store_keys::CF_WRITE_LOCKS, b"h:/a", "bob", 0)
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(
+            view.get_str(store_keys::CF_WRITE_LOCKS, b"h:/a")
+                .unwrap()
+                .as_deref(),
+            Some("alice")
+        );
+    }
+
+    #[test]
     fn read_only_txn_mutations_fail_or_noop() {
         let (db, _dir) = open_test_db();
         let mut txn = RocksDbTxn::new(db, 0, 100_000);
@@ -1395,19 +1849,19 @@ mod tests {
                 60_000,
             )
             .unwrap();
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "write:h:/a", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "write\0h\0h:/a", 60_000)
                 .unwrap();
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "read:h:/b", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &alice, "read\0h\0h:/b", 60_000)
                 .unwrap();
             txn.set_str(
                 store_keys::CF_FENCES,
-                &store_keys::fence_key("h:/a"),
+                &store_keys::fence_key(&crate::engine::scoped_path("h", "h:/a")),
                 "7",
                 60_000,
             )
             .unwrap();
             // A dead owner's residue must not be reported.
-            txn.sadd(store_keys::CF_OWNER_HOLDS, &ghost, "write:h:/g", 60_000)
+            txn.sadd(store_keys::CF_OWNER_HOLDS, &ghost, "write\0h\0h:/g", 60_000)
                 .unwrap();
             txn.commit().unwrap();
         }
@@ -1440,7 +1894,7 @@ mod tests {
                 txn.sadd(
                     store_keys::CF_OWNER_HOLDS,
                     &alice,
-                    &format!("read:h:/p{i}"),
+                    &format!("read\0h\0h:/p{i}"),
                     60_000,
                 )
                 .unwrap();

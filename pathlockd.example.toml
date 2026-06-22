@@ -34,17 +34,32 @@ gossip_send_queue_depth = 1024
 # adopted by the membership reconcilers (learner -> voter, automatically).
 bootstrap = true
 
+# Allow bootstrap on an empty disk even when seed_nodes are configured but
+# none can be reached. Without this, a bootstrap node that cannot confirm its
+# cluster is absent refuses to initialize (so a transient partition cannot
+# found a second lock authority). Set true only when intentionally standing
+# up the very first node of a new cluster with no reachable peers yet.
+force_bootstrap = false
+
 # Gossip addresses of existing members (required unless bootstrap = true).
 # seed_nodes = ["pathlockd-0.pathlockd:7946"]
 
 # Number of Raft groups (deterministic sharding via HRW hashing; fixed at
 # cluster birth — changing it remaps every routing domain).
-group_count = 32
+group_count = 256
 
 # Path segments (beyond the handler) in the routing domain. 0 shards by
 # handler only (no restrictions); K > 0 shards deeper for write parallelism
 # within one handler, at the cost of rejecting locks at depth < K.
 routing_prefix_segments = 0
+
+# Lock algorithm applied to namespaces with no explicit SetNamespacePolicy row.
+# One of: recursive_rw (default) | point_rw | recursive_write | point_write | semaphore.
+# Cluster-wide invariant: every node MUST set the same value — it feeds the
+# deterministic Raft state machine, so a divergent value corrupts replicated
+# state (same rule as group_count / routing_prefix_segments). Changing a
+# namespace's effective algorithm later force-clears that namespace's locks.
+default_lock_algorithm = "recursive_rw"
 
 # Voters per Raft group (odd). The effective factor degrades to the largest
 # odd number <= the stable node count and upgrades automatically as nodes
@@ -72,6 +87,9 @@ rocksdb_max_total_wal_size_mb = 512    # cap total WAL size (cold CFs get flushe
 rocksdb_max_background_jobs = 4        # flush/compaction parallelism
 rocksdb_block_cache_mb = 128           # shared block cache
 rocksdb_write_buffer_mb = 16           # per-column-family memtable size
+rocksdb_write_buffer_manager_mb = 256  # node-wide soft cap across all memtables
+rocksdb_max_write_buffers = 3           # mutable + immutable memtables per CF
+rocksdb_enable_pipelined_write = true   # overlap WAL and memtable insertion
 
 # In-flight write budget per Raft group; excess writes are rejected with
 # UNAVAILABLE (fail-fast backpressure instead of unbounded queueing).
@@ -87,8 +105,9 @@ group_gc_batch = 1024
 gc_compact_interval_secs = 600
 
 # Cross-instance event fan-out: cluster members are discovered via gossip
-# automatically; this adds extra static endpoints (rarely needed).
+# automatically; this adds extra static internal Raft endpoints (rarely needed).
 peers = []
+internal_auth_token = "replace-with-a-shared-random-secret-of-at-least-32-bytes"
 
 # In-process event broadcast channel capacity.
 event_buffer = 8192
@@ -99,6 +118,23 @@ max_concurrent_requests_per_connection = 256
 
 # tracing log filter.
 log_level = "info"
+
+# Optional: duplicate log output to a file (append mode) in addition to stdout.
+# Leave unset for stdout-only (containers/journald). The file is opened append-only
+# and created if missing; the daemon does not rotate it — use logrotate(8) or a
+# container log driver for rotation.
+# log_file = "/var/log/pathlockd/pathlockd.log"
+
+# --- Web facade (optional): the same RPCs as JSON over HTTPS (HTTP/1.1 +
+# HTTP/2) and HTTP/3, plus event streaming via SSE and a long-poll fallback.
+# Leave web_listen empty (the default) to run gRPC only.
+#
+# web_listen = "0.0.0.0:8443"      # TCP: HTTP/1.1 + HTTP/2 over TLS
+# h3_listen  = "0.0.0.0:8443"      # UDP: HTTP/3 over QUIC (usually same port)
+# tls_cert_path = "/etc/pathlockd/tls/cert.pem"   # PEM chain; omit both for a
+# tls_key_path  = "/etc/pathlockd/tls/key.pem"    # self-signed dev cert
+# web_zero_rtt = true              # allow HTTP/3 0-RTT (read-only RPCs only)
+# web_event_log_capacity = 1024    # retained events per owner (SSE Last-Event-ID replay)
 
 # OpenTelemetry tracing/metrics export is configured via standard OTEL_* env
 # vars, not TOML. For example:

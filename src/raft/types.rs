@@ -12,7 +12,7 @@ pub struct NodeMeta {
     pub name: String,
     /// Internal Raft/forwarding gRPC endpoint (e.g. `http://10.0.0.1:50052`).
     pub raft_addr: String,
-    /// Public client gRPC endpoint (used for event fan-out between nodes).
+    /// Public client gRPC endpoint.
     pub public_addr: String,
     /// SWIM gossip UDP address.
     pub gossip_addr: String,
@@ -53,17 +53,20 @@ pub type RaftMetrics = openraft::metrics::RaftMetrics<TypeConfig>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReadOp {
     AssertFencing {
+        namespace: String,
         owner: String,
         token: i64,
         paths: Vec<String>,
     },
     InspectPath {
+        namespace: String,
         path: String,
     },
     IsBlocking {
+        namespace: String,
         path: String,
         owner: String,
-        reason: String,
+        reason: crate::engine::Reason,
     },
     IsOwnerAlive {
         owner: String,
@@ -79,6 +82,17 @@ pub enum ReadOp {
     ReadWaitEdge {
         owner: String,
     },
+    /// Sys-group only: read a namespace's lock algorithm policy.
+    GetNamespacePolicy {
+        namespace: String,
+    },
+    /// Sys-group only: list explicit namespace policy/routing roots.
+    ListNamespaces,
+    /// Lock-group read: true if the group has live locks contained by a
+    /// namespace root.
+    NamespaceHasLocks {
+        namespace: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +106,12 @@ pub enum ReadResult {
     },
     DumpPage(crate::engine::LockDumpPage),
     WaitEdge(Option<crate::engine::WaitEdge>),
+    NamespacePolicy {
+        algorithm: crate::engine::LockAlgorithm,
+        explicit: bool,
+        epoch: u64,
+    },
+    NamespaceList(Vec<crate::engine::NamespacePolicyEntry>),
 }
 
 /// Error half of a forwarded command/read response.

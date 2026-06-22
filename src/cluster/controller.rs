@@ -62,7 +62,7 @@ pub struct ControllerOptions {
 impl Default for ControllerOptions {
     fn default() -> Self {
         Self {
-            group_count: 32,
+            group_count: 256,
             replication_factor: 3,
             stability_window: Duration::from_secs(30),
             eviction_window: Duration::from_secs(60),
@@ -160,13 +160,28 @@ async fn controller_loop(
         tick.tick().await;
         let now = Instant::now();
         let catalog = member_rx.borrow().clone();
-        presence.observe(&catalog, now);
+        let local = members.local();
+        let compatible_catalog: MemberMap = catalog
+            .into_iter()
+            .filter(|(node, identity)| {
+                let compatible = identity.config_fingerprint == local.config_fingerprint;
+                if !compatible {
+                    warn!(
+                        node,
+                        expected = local.config_fingerprint,
+                        actual = identity.config_fingerprint,
+                        "excluding node with incompatible cluster configuration"
+                    );
+                }
+                compatible
+            })
+            .collect();
+        presence.observe(&compatible_catalog, now);
         presence.prune(opts.eviction_window.saturating_mul(2), now);
 
         // Bootstrap grace: a single-node cluster must not wait the stability
         // window to make itself a voter — it already is one.
-        let mut stable = presence.stable(&catalog, opts.stability_window, now);
-        let local = members.local();
+        let mut stable = presence.stable(&compatible_catalog, opts.stability_window, now);
         stable.insert(local.node_id, local.meta.clone());
 
         // Draining nodes are excluded from every desired set.

@@ -23,12 +23,13 @@ Resolution order, lowest to highest precedence:
 | Gossip periodic | `gossip_foca_periodic` | `PATHLOCKD_GOSSIP_FOCA_PERIODIC` | `true` | Use Foca's built-in periodic announce/gossip timers |
 | Gossip send queue | `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
 | Seed nodes | `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip seed addresses (comma-separated in env) |
-| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups |
+| Group count | `group_count` | `PATHLOCKD_GROUP_COUNT` | `256` | Number of virtual Raft groups |
 | Replication factor | `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (must be odd) |
 | GC interval | `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 = off) |
 | GC batch | `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys processed per GC sweep |
 | Event buffer | `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | Per-subscriber event queue depth |
-| Peers | `peers` | `PATHLOCKD_PEERS` | `[]` | Static peer list for event fan-out |
+| Peers | `peers` | `PATHLOCKD_PEERS` | `[]` | Static internal Raft endpoint list for event fan-out |
+| Internal auth token | `internal_auth_token` | `PATHLOCKD_INTERNAL_AUTH_TOKEN` | required | Shared cluster credential (at least 32 bytes) for every internal Raft RPC |
 | Peer discovery DNS | `peer_discovery_dns` | `PATHLOCKD_PEER_DISCOVERY_DNS` | none | Headless Service DNS for dynamic peer discovery |
 | Self IP | `self_ip` | `PATHLOCKD_SELF_IP` | none | Exclude own IP from discovered peers |
 | Peer refresh | `peer_refresh_secs` | `PATHLOCKD_PEER_REFRESH_SECS` | `10` | How often to re-resolve peer_discovery_dns |
@@ -38,10 +39,19 @@ Resolution order, lowest to highest precedence:
 | Join | `join` | `PATHLOCKD_JOIN` | `false` | Join an existing cluster |
 | Raft snapshot interval | `raft_snapshot_interval_entries` | `PATHLOCKD_RAFT_SNAPSHOT_INTERVAL_ENTRIES` | `10000` | Entries between snapshots |
 | Raft snapshot min log | `raft_snapshot_min_log_entries` | `PATHLOCKD_RAFT_SNAPSHOT_MIN_LOG_ENTRIES` | `5000` | Min entries to trigger snapshot |
+| Raft snapshot max bytes | `raft_snapshot_max_bytes` | `PATHLOCKD_RAFT_SNAPSHOT_MAX_BYTES` | `536870912` | Maximum in-memory snapshot image |
 | Raft max inflight | `raft_max_inflight` | `PATHLOCKD_RAFT_MAX_INFLIGHT` | `256` | Max in-flight proposals |
 | RocksDB WAL sync | `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync WAL on every write |
 | RocksDB max open files | `rocksdb_max_open_files` | `PATHLOCKD_ROCKSDB_MAX_OPEN_FILES` | `4096` | File descriptor limit |
+| RocksDB total WAL | `rocksdb_max_total_wal_size_mb` | `PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB` | `512` | Total WAL cap before cold-CF flushes |
+| RocksDB background jobs | `rocksdb_max_background_jobs` | `PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS` | `4` | Flush and compaction worker budget |
+| RocksDB block cache | `rocksdb_block_cache_mb` | `PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB` | `128` | Shared cache across column families |
+| RocksDB write buffer | `rocksdb_write_buffer_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB` | `16` | Memtable size per column family |
+| RocksDB memtable cap | `rocksdb_write_buffer_manager_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MANAGER_MB` | `256` | Node-wide soft cap across memtables |
+| RocksDB write buffers | `rocksdb_max_write_buffers` | `PATHLOCKD_ROCKSDB_MAX_WRITE_BUFFERS` | `3` | Mutable and immutable memtables per CF |
+| RocksDB pipelined writes | `rocksdb_enable_pipelined_write` | `PATHLOCKD_ROCKSDB_ENABLE_PIPELINED_WRITE` | `true` | Pipeline WAL and memtable write stages |
 | Log level | `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
+| Log file | `log_file` | `PATHLOCKD_LOG_FILE` | none | Duplicate logs to an append-only file |
 
 Env lists are comma-separated. `RUST_LOG`, if set, overrides `log_level`
 (standard `tracing-subscriber` env filter).
@@ -68,3 +78,8 @@ export stays off and normal tracing logs still initialize.
 - **WAL fsync** (`rocksdb_wal_sync = true` by default) ensures every committed
   apply is durable before the RPC returns. Disable only for throughput testing
   where occasional node loss is acceptable.
+- **Memtable budgeting** is node-wide. Keep `rocksdb_write_buffer_manager_mb`
+  below the container memory limit after reserving the shared block cache,
+  Raft snapshots, event buffers, and process overhead.
+- **Pipelined writes** overlap WAL and memtable work without weakening WAL sync.
+  Disable them only when diagnosing a RocksDB-specific write-ordering issue.

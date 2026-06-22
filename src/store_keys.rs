@@ -25,8 +25,9 @@
 //! cf:desc_read        ancestor\0 \0path -> member record
 //! cf:desc_claim       ancestor\0 \0path -> member record
 //! cf:owner_alive      owner -> liveness record
-//! cf:owner_holds      owner\0 \0mode:path -> member record
+//! cf:owner_holds      owner\0 mode\0namespace\0path -> member record
 //! cf:wait_edges       owner -> wait edge record
+//! cf:namespace_settings namespace -> lock algorithm policy / explicit route root
 //! cf:expiry           be_u64(expires_at)\0cf_name\0primary_key -> expiry record
 //! cf:request_dedupe   request_id -> cached ApplyResponse record
 //! ```
@@ -35,7 +36,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cluster::placement::GroupId;
 
-pub const FENCE_MIN_TTL_MS: u64 = 86_400_000;
 pub const MAX_SET_ENUM_MEMBERS: usize = 65_536;
 
 /// Expiry-index timestamps for long leases are rounded up to this quantum so
@@ -49,6 +49,11 @@ pub const EXPIRY_INDEX_QUANTUM_MS: u64 = 3_600_000;
 
 pub const META_FENCE_COUNTER_KEY: &[u8] = b"fence_counter";
 pub const META_GC_CURSOR_KEY: &[u8] = b"gc_cursor";
+/// Per-group monotonic counter handing out FIFO sequence numbers to wait-queue
+/// entries. Bumped deterministically in the apply path, so every replica
+/// assigns identical ordering (= Raft log order).
+pub const META_QUEUE_SEQ_KEY: &[u8] = b"queue_seq";
+pub const META_QUEUE_COUNT_KEY: &[u8] = b"queue_count";
 pub const META_LAST_NOW_KEY: &[u8] = b"last_now_ms";
 pub const META_VOTE_KEY: &[u8] = b"raft_vote";
 pub const META_COMMITTED_KEY: &[u8] = b"raft_committed";
@@ -95,34 +100,45 @@ pub const CF_META: &str = "meta";
 pub const CF_RAFT_LOG: &str = "raft_log";
 pub const CF_WRITE_LOCKS: &str = "write_locks";
 pub const CF_READ_LOCKS: &str = "read_locks";
+/// Per-path set of semaphore holders. Keyed by path (see [`sem_prefix`]), members
+/// are owner ids. Unlike `CF_WRITE_LOCKS` (single owner per path), a semaphore
+/// path admits up to the acquirer's requested permit count concurrent holders.
+pub const CF_SEMAPHORE: &str = "semaphore_holders";
 pub const CF_FENCES: &str = "fences";
-pub const CF_CLAIMS: &str = "claims";
 pub const CF_DESC_WRITE: &str = "desc_write";
 pub const CF_DESC_READ: &str = "desc_read";
-pub const CF_DESC_CLAIM: &str = "desc_claim";
 pub const CF_OWNER_ALIVE: &str = "owner_alive";
 pub const CF_OWNER_HOLDS: &str = "owner_holds";
 pub const CF_WAIT_EDGES: &str = "wait_edges";
+pub const CF_NAMESPACE_SETTINGS: &str = "namespace_settings";
 pub const CF_EXPIRY: &str = "expiry";
 /// Request-id → cached ApplyResponse, so a command retried after an
 /// ambiguous timeout (e.g. re-forwarded after a leader change) applies once.
 pub const CF_DEDUPE: &str = "request_dedupe";
+/// Persisted FIFO wait queue. Two key shapes share the CF, disambiguated by a
+/// 1-byte tag: entry keys (`'e' ++ be_u64(seq)`) hold the serialized waiter
+/// (owner + full AcquireArgs) and iterate in seq order; owner keys
+/// (`'o' ++ owner`) map an owner to its seq for O(1) dequeue/dedupe. Entries
+/// are TTL-governed (GC-reaped), so an abandoned waiter — or one stranded by a
+/// whole-cluster shutdown — self-evicts and can never wedge a path.
+pub const CF_QUEUE: &str = "lock_queue";
 
 /// All state-machine column families (excluding CF_RAFT_LOG and CF_META which
 /// are owned by openraft's storage wrappers).
 pub const STATE_CFS: &[&str] = &[
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
+    CF_SEMAPHORE,
     CF_FENCES,
-    CF_CLAIMS,
     CF_DESC_WRITE,
     CF_DESC_READ,
-    CF_DESC_CLAIM,
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
+    CF_NAMESPACE_SETTINGS,
     CF_EXPIRY,
     CF_DEDUPE,
+    CF_QUEUE,
 ];
 
 /// All column families including raft internals.
@@ -132,16 +148,17 @@ pub const ALL_CFS: &[&str] = &[
     CF_RAFT_LOG,
     CF_WRITE_LOCKS,
     CF_READ_LOCKS,
+    CF_SEMAPHORE,
     CF_FENCES,
-    CF_CLAIMS,
     CF_DESC_WRITE,
     CF_DESC_READ,
-    CF_DESC_CLAIM,
     CF_OWNER_ALIVE,
     CF_OWNER_HOLDS,
     CF_WAIT_EDGES,
+    CF_NAMESPACE_SETTINGS,
     CF_EXPIRY,
     CF_DEDUPE,
+    CF_QUEUE,
 ];
 
 // --- key encoding ---
@@ -159,6 +176,14 @@ pub fn rd_prefix(path: &str) -> Vec<u8> {
     buf
 }
 
+/// Set key under which a path's semaphore holders are stored.
+pub fn sem_prefix(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(path.len() + 1);
+    buf.extend_from_slice(path.as_bytes());
+    buf.push(0);
+    buf
+}
+
 /// Encode a fence key: `path`
 pub fn fence_key(path: &str) -> Vec<u8> {
     path.as_bytes().to_vec()
@@ -169,7 +194,20 @@ pub fn alive_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
-/// Set key under which an owner's held `mode:path` members are stored.
+/// Pending cooperative-revoke marker for an owner: `owner ++ NUL ++ "revoke"`.
+/// Stored in `CF_OWNER_ALIVE` as a sibling of [`alive_key`] (a distinct suffix,
+/// so a point get on the bare-owner liveness key never matches it, and that CF
+/// is only ever point-accessed). It carries its own TTL and is deleted whenever
+/// the owner's liveness record is, so the marker shares the lease's lifecycle.
+pub fn revoke_key(owner: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(owner.len() + 7);
+    buf.extend_from_slice(owner.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(b"revoke");
+    buf
+}
+
+/// Set key under which an owner's held lock members are stored.
 pub fn own_prefix(owner: &str) -> Vec<u8> {
     let mut buf = Vec::with_capacity(owner.len() + 1);
     buf.extend_from_slice(owner.as_bytes());
@@ -182,9 +220,30 @@ pub fn wait_key(owner: &str) -> Vec<u8> {
     owner.as_bytes().to_vec()
 }
 
-/// Encode a claim key: `path`
-pub fn claim_key(path: &str) -> Vec<u8> {
-    path.as_bytes().to_vec()
+/// Per-held-lock algorithm metadata, stored in the lock group's meta CF and
+/// expiring with the held lock. `mode` is the engine mode string.
+pub fn hold_algorithm_key(owner: &str, mode: &str, path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(10 + owner.len() + mode.len() + path.len());
+    buf.extend_from_slice(b"hold_alg:");
+    buf.extend_from_slice(owner.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(mode.as_bytes());
+    buf.push(0);
+    buf.extend_from_slice(path.as_bytes());
+    buf
+}
+
+/// Per-path semaphore capacity, stored in the lock group's meta CF.
+pub fn semaphore_permits_key(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12 + path.len());
+    buf.extend_from_slice(b"sem_permits:");
+    buf.extend_from_slice(path.as_bytes());
+    buf
+}
+
+/// Per-namespace lock policy, stored in each group's namespace-settings CF.
+pub fn namespace_policy_key(namespace: &str) -> Vec<u8> {
+    namespace.as_bytes().to_vec()
 }
 
 /// Encode a write-descendant index key: `ancestor:NUL:path`
@@ -203,12 +262,89 @@ pub fn rddesc_prefix(anc: &str) -> Vec<u8> {
     buf
 }
 
-/// Encode a claim-descendant index key: `ancestor:NUL:path`
-pub fn claimdesc_key(anc: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(anc.len() + 1);
-    buf.extend_from_slice(anc.as_bytes());
+// --- wait-queue key encoding (CF_QUEUE) ---
+
+/// 1-byte tag distinguishing the two key shapes that share `CF_QUEUE`.
+const QUEUE_ENTRY_TAG: u8 = b'e';
+const QUEUE_OWNER_TAG: u8 = b'o';
+const QUEUE_PATH_TAG: u8 = b'p';
+
+/// Queue entry key: `'e' ++ be_u64(seq)`. Big-endian seq makes a prefix scan
+/// of all entry keys iterate in FIFO (ascending seq) order.
+pub fn queue_entry_key(seq: u64) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + 8);
+    buf.push(QUEUE_ENTRY_TAG);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+/// Inclusive lower / exclusive upper bound covering every entry key, for an
+/// ordered `scan_merged` over the whole queue.
+pub fn queue_entry_lower() -> Vec<u8> {
+    vec![QUEUE_ENTRY_TAG]
+}
+pub fn queue_entry_upper() -> Vec<u8> {
+    vec![QUEUE_ENTRY_TAG + 1]
+}
+
+/// Decode the seq from a queue entry key, or `None` if it is not one.
+pub fn decode_queue_entry_seq(key: &[u8]) -> Option<u64> {
+    if key.len() != 9 || key[0] != QUEUE_ENTRY_TAG {
+        return None;
+    }
+    Some(u64::from_be_bytes([
+        key[1], key[2], key[3], key[4], key[5], key[6], key[7], key[8],
+    ]))
+}
+
+/// Owner → seq index key: `'o' ++ owner`, for O(1) dequeue/dedupe.
+pub fn queue_owner_key(owner: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + owner.len());
+    buf.push(QUEUE_OWNER_TAG);
+    buf.extend_from_slice(owner.as_bytes());
+    buf
+}
+
+pub fn queue_path_prefix(path: &str) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(1 + path.len() + 1);
+    buf.push(QUEUE_PATH_TAG);
+    buf.extend_from_slice(path.as_bytes());
     buf.push(0);
     buf
+}
+
+pub fn queue_path_upper(path: &str) -> Vec<u8> {
+    let mut upper = queue_path_prefix(path);
+    if let Some(last) = upper.last_mut() {
+        *last = last.saturating_add(1);
+    }
+    upper
+}
+
+pub fn queue_path_key(path: &str, seq: u64) -> Vec<u8> {
+    let mut buf = queue_path_prefix(path);
+    buf.extend_from_slice(&seq.to_be_bytes());
+    buf
+}
+
+pub fn decode_queue_path_seq(key: &[u8]) -> Option<u64> {
+    if key.len() < 10 || key[0] != QUEUE_PATH_TAG {
+        return None;
+    }
+    let tail = key.len() - 8;
+    if key[tail - 1] != 0 {
+        return None;
+    }
+    Some(u64::from_be_bytes([
+        key[tail],
+        key[tail + 1],
+        key[tail + 2],
+        key[tail + 3],
+        key[tail + 4],
+        key[tail + 5],
+        key[tail + 6],
+        key[tail + 7],
+    ]))
 }
 
 /// Encode an expiry index key: `be_u64(expires_at):NUL:kind:NUL:primary_key_bytes`
@@ -270,10 +406,18 @@ pub fn handler_of(path: &str) -> &str {
     }
 }
 
-/// The lock domain of a path (the segment before the first `:`), used as the
-/// sharding key for Raft group placement.
+/// The default lock domain of a path: handler plus the first path segment.
 pub fn lock_domain(path: &str) -> &str {
-    handler_of(path)
+    let Some(colon) = path.find(':') else {
+        return path;
+    };
+    let rest = &path[colon + 1..];
+    for (i, b) in rest.bytes().enumerate() {
+        if b == b'/' && i > 0 {
+            return &path[..colon + 1 + i];
+        }
+    }
+    path
 }
 
 // --- time helpers ---
@@ -350,8 +494,9 @@ mod tests {
 
     #[test]
     fn lock_domain_equals_handler() {
-        assert_eq!(lock_domain("vol_9:/a/b"), "vol_9");
-        assert_eq!(lock_domain("workspace_123:/jobs/10"), "workspace_123");
+        assert_eq!(lock_domain("vol_9:/a/b"), "vol_9:/a");
+        assert_eq!(lock_domain("workspace_123:/jobs/10"), "workspace_123:/jobs");
+        assert_eq!(lock_domain("workspace_123:/"), "workspace_123:/");
     }
 
     // --- key encoding round-trips ---
@@ -384,11 +529,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_key_is_path_bytes() {
-        assert_eq!(claim_key("h:/a"), b"h:/a");
-    }
-
-    #[test]
     fn own_prefix_is_owner_plus_nul() {
         assert_eq!(own_prefix("alice"), b"alice\x00");
     }
@@ -417,12 +557,6 @@ mod tests {
     fn rddesc_prefix_is_anc_plus_nul() {
         let prefix = rddesc_prefix("h:/a");
         assert_eq!(prefix, b"h:/a\x00");
-    }
-
-    #[test]
-    fn claimdesc_key_is_anc_nul_prefix() {
-        let key = claimdesc_key("h:/a");
-        assert_eq!(key, b"h:/a\x00");
     }
 
     // --- expiry key encoding ---
@@ -488,13 +622,16 @@ mod tests {
         assert!(names.contains("write_locks"));
         assert!(names.contains("read_locks"));
         assert!(names.contains("fences"));
-        assert!(names.contains("claims"));
         assert!(names.contains("owner_alive"));
         assert!(names.contains("owner_holds"));
         assert!(names.contains("wait_edges"));
         assert!(names.contains("expiry"));
+        assert!(names.contains("lock_queue"));
         assert!(names.contains("meta"));
         assert!(names.contains("raft_log"));
+        // Claim CFs were removed in 0.9.0 (the wait queue subsumes them).
+        assert!(!names.contains("claims"));
+        assert!(!names.contains("desc_claim"));
     }
 
     #[test]

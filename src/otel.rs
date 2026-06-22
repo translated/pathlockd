@@ -5,6 +5,7 @@
 //! pathlockd-specific config keys.
 
 use std::future::Future;
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -20,12 +21,14 @@ use tonic::metadata::{KeyRef, MetadataMap};
 use tonic::{Code, Request, Response, Status};
 use tracing::{field, Instrument, Span};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 use crate::cluster::gossip::GossipMetrics;
 use crate::raft::manager::RaftGroups;
+use crate::store_keys;
 
 const SERVICE_NAME: &str = "pathlockd";
 const INSTRUMENTATION_NAME: &str = "pathlockd";
@@ -36,6 +39,7 @@ static METRICS: OnceLock<Metrics> = OnceLock::new();
 pub struct TelemetryGuard {
     tracer_provider: Option<SdkTracerProvider>,
     meter_provider: Option<SdkMeterProvider>,
+    _writer_guards: Vec<tracing_appender::non_blocking::WorkerGuard>,
 }
 
 impl TelemetryGuard {
@@ -66,18 +70,36 @@ impl TelemetryGuard {
     }
 }
 
-pub fn init(log_level: &str) -> anyhow::Result<TelemetryGuard> {
+pub fn init(log_level: &str, log_file: Option<&Path>) -> anyhow::Result<TelemetryGuard> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| EnvFilter::try_new(log_level))
         .map_err(|e| anyhow::anyhow!("invalid tracing filter {log_level:?}: {e}"))?;
-    let fmt_layer = tracing_subscriber::fmt::layer();
+
+    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
+    let mut writer_guards = vec![stdout_guard];
+    let make_writer: BoxMakeWriter = if let Some(path) = log_file {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(path)
+            .map_err(|e| anyhow::anyhow!("opening log file {}: {e}", path.display()))?;
+        let (file_writer, file_guard) = tracing_appender::non_blocking(file);
+        writer_guards.push(file_guard);
+        BoxMakeWriter::new(stdout_writer.and(file_writer))
+    } else {
+        BoxMakeWriter::new(stdout_writer)
+    };
+    let fmt_layer = tracing_subscriber::fmt::layer().with_writer(make_writer);
 
     if sdk_disabled() {
         tracing_subscriber::registry()
             .with(filter)
             .with(fmt_layer)
             .try_init()?;
-        return Ok(TelemetryGuard::default());
+        return Ok(TelemetryGuard {
+            _writer_guards: writer_guards,
+            ..TelemetryGuard::default()
+        });
     }
 
     let traces_enabled =
@@ -124,6 +146,7 @@ pub fn init(log_level: &str) -> anyhow::Result<TelemetryGuard> {
     Ok(TelemetryGuard {
         tracer_provider,
         meter_provider,
+        _writer_guards: writer_guards,
     })
 }
 
@@ -188,6 +211,63 @@ pub fn register_writer_queue_depth(depth: std::sync::Arc<std::sync::atomic::Atom
     // handle so the registration is not dropped eagerly by misbehaving SDKs.
     static GAUGE: OnceLock<opentelemetry::metrics::ObservableGauge<u64>> = OnceLock::new();
     let _ = GAUGE.set(gauge);
+}
+
+pub fn register_rocksdb_metrics(db: Arc<rocksdb::DB>) {
+    let meter = global::meter(INSTRUMENTATION_NAME);
+    let properties = [
+        (
+            "pathlockd.rocksdb.memtable_bytes",
+            "rocksdb.cur-size-all-mem-tables",
+            "Bytes held by active and immutable RocksDB memtables.",
+            true,
+        ),
+        (
+            "pathlockd.rocksdb.pending_compaction_bytes",
+            "rocksdb.estimate-pending-compaction-bytes",
+            "Estimated RocksDB compaction backlog in bytes.",
+            true,
+        ),
+        (
+            "pathlockd.rocksdb.block_cache_bytes",
+            "rocksdb.block-cache-usage",
+            "RocksDB block cache usage in bytes.",
+            false,
+        ),
+        (
+            "pathlockd.rocksdb.block_cache_pinned_bytes",
+            "rocksdb.block-cache-pinned-usage",
+            "Pinned RocksDB block cache usage in bytes.",
+            false,
+        ),
+    ];
+    let mut gauges = Vec::new();
+    for (metric_name, property, description, aggregate) in properties {
+        let db = db.clone();
+        gauges.push(
+            meter
+                .u64_observable_gauge(metric_name)
+                .with_description(description)
+                .with_callback(move |observer| {
+                    let mut total = 0u64;
+                    for cf_name in store_keys::ALL_CFS {
+                        let Some(cf) = db.cf_handle(cf_name) else {
+                            continue;
+                        };
+                        if let Ok(Some(value)) = db.property_int_value_cf(&cf, property) {
+                            total = total.saturating_add(value);
+                            if !aggregate {
+                                break;
+                            }
+                        }
+                    }
+                    observer.observe(total, &[]);
+                })
+                .build(),
+        );
+    }
+    static ROCKSDB_GAUGES: OnceLock<Vec<ObservableGauge<u64>>> = OnceLock::new();
+    let _ = ROCKSDB_GAUGES.set(gauges);
 }
 
 /// Register node-wide SWIM/Foca gauges. Counter-like values are exposed as

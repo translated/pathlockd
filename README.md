@@ -5,444 +5,296 @@
 <h1 align="center">pathlockd</h1>
 
 <p align="center">
-  <em>Fast, scalable, opinionated path-based distributed locking primitives
-  with embedded Multi-Raft and RocksDB, exposed over gRPC.</em>
+  <em>A self-contained daemon that coordinates concurrent access to shared
+  resources across remote processes through hierarchical
+  path-based synchronization primitives — replicated, durable, and
+  zero-external-dependency.</em>
 </p>
 
 ---
 
-`pathlockd` is a **self-contained** daemon that coordinates concurrent access to
-a **hierarchical path namespace** (`handler:/a/b/c`) across many processes and
-machines. It exposes a small, precise set of locking primitives over **gRPC**
-and stores all durable state in an embedded **RocksDB** engine — with no
-external dependencies.
+`pathlockd` exposes a small set of lock primitives over **gRPC** and stores all
+durable state in an embedded **RocksDB** engine behind an embedded
+**Multi-Raft** consensus layer. One binary, N replicas, SWIM/foca for peer
+discovery, HRW placement for shard-to-node mapping. No external coordination
+service, no external database. Lock state survives leader failovers with
+globally monotonic fencing tokens; a holder that dies loses its lease on the
+next sweep, never wedges a path.
 
-> **Replication status.** Lock state is **Raft-replicated** across an elastic
-> Multi-Raft cluster (one embedded openraft group per shard, SWIM/foca for
-> discovery). Any node serves any request — writes forward to the shard's
-> leader; a leader crash fails over within the election timeout with no lost
-> acknowledged state; fencing tokens stay globally monotonic across failovers.
-> 1 node works (no fault tolerance), 3+ nodes give HA; replicas join and leave
-> at runtime and groups re-place themselves automatically.
+## What you get
 
-It is *opinionated*: the locking model is exactly the one a virtual-filesystem
-needs — write locks that cover a whole subtree, point reads that don't, fencing
-tokens to make stale writers detectable, leases that expire if a holder dies,
-and built-in deadlock detection — rather than a general-purpose lock manager you
-have to assemble yourself.
+- **Hierarchical path locks.** A path is `handler:/a/b/c`. A write lock on `P`
+  conflicts with any lock on `P`, on an ancestor of `P`, or anywhere in `P`'s
+  subtree (within the routing namespace). A read lock is point-only. This is a
+  tree-shaped RWLock, not the flat textbook one — full conflict matrix in
+  [docs/locking-semantics.md](docs/locking-semantics.md).
+- **Five sync primitives, one engine.** `recursive_rw` (default), `point_rw`,
+  `recursive_write`, `point_write`, and `semaphore` (counting, per-acquire
+  capacity, non-fencing) — opt into them per routing namespace via
+  `SetNamespacePolicy`. Reference: [llmwiki/08-lock-algorithms.md](llmwiki/08-lock-algorithms.md).
+- **Fencing tokens.** Monotonic per path. A paused-then-resumed writer is
+  rejected as `stale_fencing_token` and gets the current fence back so it can
+  refresh.
+- **TTL leases.** `ttl_ms > 0` is mandatory and capped at 7 days. Renewal
+  extends the whole portfolio; a holder that dies self-evicts.
+- **Wait queue, not retry loops.** Contended acquires are durably enqueued
+  (FIFO, Raft-replicated, `queue_ttl_ms` bounded) and granted in place — the
+  daemon pushes a `GRANT` event to the waiter's own `Subscribe` stream.
+- **Subscribe, per-owner.** A subscription only sees its own owner's lifecycle
+  events (`released` / `killed` / `revoke` / `grant`). Cross-node fan-out is
+  automatic via gossip.
 
-## Why path locking
+## Where it fits
 
-When many workers manipulate a shared tree (rename a folder here, upload a file
-there, reconcile a subtree elsewhere) you need more than a flat mutex per key.
-You need locks that understand **containment**:
+`pathlockd` coordinates *who may touch what* across processes and machines — it
+never stores your data. Use it when concurrent actors mutate a tree of resources
+and a stale one must be fenced out.
 
-- A **write lock** on `/a` must conflict with any lock on `/a`, on an ancestor
-  of `/a`, or anywhere in the `/a/...` subtree — locking `/a` means "this whole
-  subtree is mine".
-- A **read lock** is **point-only**: it protects exactly one node. An ancestor
-  read does not cover its descendants, so it neither blocks nor is blocked by a
-  write deeper in the tree.
+- **Multi-tenant SaaS & collaborative docs.** Lock `tenant:/acme/projects/42`
+  to own the whole subtree without enumerating children; readers on parents
+  don't block writers deeper down. Fits CMS trees, config hierarchies, doc
+  backends.
+- **Coordinated operations across services.** When N services must sequence
+  their work — saga steps, multi-stage workflows, ordered processing across
+  workers. Acquire the path, run the step, release; a crashed service's lease
+  lapses so the workflow unsticks itself.
+- **Object-store / DB row read-modify-write.** Lock the key, `AssertFencing`
+  right before the `PUT` — a paused-then-resumed writer is rejected, not
+  applied, even across leader failovers.
+- **Singleton jobs & leader election.** A write lock on `cron:/nightly-rollup`
+  with a TTL is an only-one-runner gate; if the holder dies, a standby is
+  granted in place via its event stream — no thundering herd. *Feasibility:*
+  lock-based election, not consensus — the holder is the leader, `Renew` is the
+  heartbeat, the fence protects the backing store from a stale leader. No quorum
+  or terms, so pair with fencing-token checks at the store for split-brain
+  safety; don't use it where you need majority voting.
+- **Bounded concurrency / resource pools.** The `semaphore` primitive caps a
+  path at N concurrent acquires — throttle a rate-limited upstream, a license
+  pool, or a fixed worker fleet without a separate rate-limiter.
+- **Migrations & deploy locks.** A write lock on `deploy:/region/us-east`
+  serializes schema migrations or rollouts; the mandatory TTL means a forgotten
+  lock can never strand the pipeline.
+- **Data-pipeline / ETL partition ownership.** Each worker locks its partition
+  path (`etl:/2026/06/19/shard-7`); overlapping ranges are impossible, and a
+  crashed worker's lease lapses so the partition reprocesses.
+- **User-space virtual filesystems.** A path is a file/folder; write owns the
+  subtree, read pins one node. Fencing tokens let the backing store reject a
+  writer that paused too long. Walkthrough:
+  [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md).
 
-pathlockd enforces this containment directly, with O(subtree) conflict checks
-(not O(keyspace)) via descendant indexes.
+## Quick start
 
-> **It's a reader-writer lock — but not the textbook one.** A classic RWLock is
-> *symmetric and flat*: one key, readers share, a writer is exclusive. pathlockd
-> keeps the shared-readers / exclusive-writer rule but generalizes it to a tree
-> **asymmetrically**: a **write** claims its entire subtree, while a **read**
-> claims only its single node. So a write and a read collide *only when the
-> write's subtree contains the read's node* — an ancestor read does **not** cover
-> its descendants, and a descendant write does **not** block an ancestor read.
-> That asymmetry (and the precedence between conflict reasons) is the part most
-> worth understanding before you use it — read
-> **[docs/locking-semantics.md](docs/locking-semantics.md)**, the normative spec
-> for the full conflict matrix, fencing, leases, and re-entrancy rules.
-
-## Core concepts
-
-| Concept | What it does |
-| --- | --- |
-| **Owner** | A caller-supplied id that owns a lock and all the paths it holds. |
-| **Read / write modes** | Shared readers, exclusive writer — but hierarchical, not flat: a write covers its whole subtree, a read covers only its node. A tree-shaped RWLock, not the symmetric textbook one. Full rules: [docs/locking-semantics.md](docs/locking-semantics.md). |
-| **Fencing token** | A monotonic token stamped on every write-locked path. A holder can `AssertFencing` to prove it still owns a path at its token; a stale token is rejected, so a paused-then-resumed writer can't corrupt newer state. |
-| **TTL lease + renewal** | Every lock is a lease. The holder renews it; if the holder dies, the lease expires and the subtree frees itself — no orphaned locks. |
-| **Liveness & pruning** | Read sets self-heal: members whose owner lease has lapsed are pruned on the next touch. |
-| **Deadlock detection** | Wait edges (`owner → blocker`, plus the path/reason being waited on) form a wait-for graph. `DetectCycle` walks it and drops stale edges; a client that finds a cycle resolves it with a cooperative revoke, then a forced release if the victim doesn't yield. |
-| **Per-owner event stream** | A `Subscribe` stream bound to one owner delivers only that owner's lifecycle events (`released` / `killed` / `revoke`). A lock's channel carries only that lock's information. |
-
-## Architecture
-
-```text
-   your application (one lock = one owner id = one connection)
-        │  gRPC
-        ▼
-   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
-   │  pathlockd  │◄──┤  pathlockd  ├──►│  pathlockd  │  N nodes
-   └──────┬──────┘   └──────┬──────┘   └──────┬──────┘  SWIM gossip (UDP)
-          │                 │                 │         Raft RPC (gRPC)
-   ┌──────▼──────┐   ┌──────▼──────┐   ┌──────▼──────┐
-   │   RocksDB   │   │   RocksDB   │   │   RocksDB   │  embedded, per node;
-   └─────────────┘   └─────────────┘   └─────────────┘  groups replicate via
-                                                        their Raft logs
+```bash
+docker compose up --build
+# pathlockd at localhost:50051
 ```
 
-- **Self-contained binary.** All durable state lives in an embedded RocksDB
-  engine inside each node. No external coordination service is needed — start
-  a single binary and it is ready.
-- **RocksDB for persistence.** Lock metadata is stored in 14 column families
-  with TTL-based expiry and background GC sweeps. WAL fsync guarantees
-  durability across process crashes.
-- **Multi-Raft consensus.** The path namespace shards into `group_count` Raft
-  groups by **routing domain** (the handler prefix, optionally deeper): a
-  path, its ancestors, and its whole subtree always share one group, so every
-  lock operation is single-group — no cross-shard transactions, ever. Each
-  group is an independent openraft core; writes commit on the group's leader
-  and apply identically on every replica. A dedicated **system group** holds
-  the cluster-global state: the monotonic fencing counter, the deadlock
-  wait-graph, and the membership directory (replicated to every node).
-- **Elastic membership.** SWIM gossip (foca) discovers nodes and suspicion;
-  Raft membership stays the correctness authority. Each group's leader
-  reconciles its voter set toward an HRW placement over the stable members:
-  new nodes are adopted learner-first and promoted via joint consensus, dead
-  voters are replaced after an eviction window (never breaking quorum), and
-  leadership spreads across nodes. The replication factor upgrades
-  automatically as nodes arrive (1 → 3 → 5).
-- **Atomicity.** Each command applies inside a single WriteBatch with
-  read-your-writes semantics, serialized by its group's Raft apply loop.
-  Rejected outcomes (conflicts) commit nothing. One WAL fsync per batched
-  group of appends — across *all* groups on the node — preserves group-commit
-  throughput. Forwarded commands carry request ids and dedupe, so an
-  ambiguous retry (leader change mid-flight) applies exactly once.
-- **TTL-based leases.** Every record carries an absolute expiry timestamp.
-  Reads treat elapsed entries as absent (correctness); a background GC sweep
-  reclaims expired records (housekeeping, configurable interval). Set entries
-  (read sets, descendant indexes) expire **per member**, so a short-lived lock
-  never shortens the visibility of a longer-lived one sharing the same key.
+```bash
+grpcurl -plaintext -d '{}' localhost:50051 pathlockd.v1.PathLock/IncrFencingToken
+grpcurl -plaintext           localhost:50051 pathlockd.v1.PathLock/Health
+```
 
-### Scope & limits
+Typed clients: [`pathlockd-nodejs-client`](https://github.com/alexpacio/pathlockd-nodejs-client).
 
-- **Write throughput scales per handler, not without bound.** All mutations that
-  touch a given handler serialize through the handler's Raft group leader.
-  Spread load across handlers — or split a hot handler — to scale; a single hot
-  handler is the throughput ceiling.
-- **Descendant index size.** A write lock is indexed under every ancestor up to
-  the handler root, so the root index aggregates every write lock in the handler
-  in one value. This bounds the practical number of concurrent locks per handler;
-  very wide/deep trees in one handler are not yet sharded (future work).
-- **Input limits (enforced server-side).** `ttl_ms` must be `> 0` (a `0` TTL
-  would never expire) and `≤ 7 days`; paths must be normalized
-  (`<handler>:/rooted/path`, no `//`, `.`/`..`, or trailing slash);
-  `owner_id`/paths are length-bounded; `DetectCycle.max_depth` is clamped.
-  Malformed input is rejected with `InvalidArgument`.
-- **Trust model.** There is no authentication on the gRPC surface — any client
-  can release or revoke any owner's locks. Run pathlockd on a trusted network
-  (or behind a TLS-terminating, authenticating proxy).
-- **Storage format.** This is a pre-1.0 daemon; the on-disk value encoding may
-  change between versions. Run against a fresh/flushed keyspace when upgrading.
+## Configuration
 
-### Roadmap to 1.0.0 (TODO)
+A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
+`PATHLOCKD_*` env vars (env wins). See
+[`pathlockd.example.toml`](pathlockd.example.toml) and the full reference in
+[llmwiki/05-config.md](llmwiki/05-config.md).
 
-The following are **not yet implemented** and are planned for the final `1.0.0`
-release:
+The env vars you actually need:
 
-- [ ] **Authentication & authorization, TLS** — the gRPC surface is currently
-  unauthenticated and in plaintext; until then, run pathlockd only on a trusted
-  network or behind a TLS-terminating, authenticating proxy.
-- [ ] **Multitenancy** — no tenant isolation yet (per-tenant authn/authz,
-  namespacing beyond the handler convention, and quotas).
-
-Internals are documented for contributors and tools in [`llmwiki/`](llmwiki/).
-For end-to-end, copy-pasteable usage when building a user-space virtual
-filesystem, see the [**usage guide**](docs/usage-virtual-filesystem.md).
-
-## Platform support
-
-Container images are published for **linux/amd64** and **linux/arm64** (Apple
-Silicon / AWS Graviton). The Node.js client targets `linux/amd64`.
-
-
-## Running from the container image
-
-Pre-built images are published to GHCR on every version tag (`v*`):
-
-| Image tag | Binary | Notes |
+| Env var | Default | Notes |
 | --- | --- | --- |
-| `ghcr.io/alexpacio/pathlockd:0.6.0` | native (amd64/arm64) | |
+| `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
+| `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory (one per node, persistent) |
+| `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable identifier; must end in a unique integer per node |
+| `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a new cluster (exactly one node) |
+| `PATHLOCKD_SEED_NODES` | *(none)* | Comma-separated gossip seed addresses (multi-node) |
+| `PATHLOCKD_INTERNAL_AUTH_TOKEN` | *(required)* | Shared random cluster credential, at least 32 bytes |
+| `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
 
-**Run pathlockd** (single node, no external dependencies):
+## Container image
+
+`ghcr.io/alexpacio/pathlockd:vX.Y.Z` (linux/amd64 + linux/arm64, published on
+every `v*` tag). Single-node run:
 
 ```bash
 docker run -d --restart=unless-stopped \
   -p 50051:50051 \
   -e PATHLOCKD_BOOTSTRAP=true \
-  -e PATHLOCKD_DATA_DIR=/data/pathlockd \
-  -v pathlockd-data:/data/pathlockd \
-  ghcr.io/alexpacio/pathlockd:0.6.0
-```
-
-**Key env vars** (see [Configuration](#configuration) for the full list):
-
-| Env var | Default | Notes |
-| --- | --- | --- |
-| `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | gRPC bind address |
-| `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory |
-| `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable node identifier |
-| `PATHLOCKD_BOOTSTRAP` | `false` | Bootstrap a new cluster (single node or first node) |
-| `PATHLOCKD_SEED_NODES` | *(none)* | Comma-separated gossip seed addresses (multi-node) |
-| `PATHLOCKD_PEERS` | *(none)* | Comma-separated sibling addresses for event fan-out |
-| `PATHLOCKD_LOG_LEVEL` | `info` | `trace` / `debug` / `info` / `warn` / `error` |
-
-The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
-`HEALTHCHECK` via `--health-check`.
-
-## Quick start (development / playground)
-
-Single-binary quick start — no external services required:
-
-```bash
-docker compose up --build
-# pathlockd is now at localhost:50051
-```
-
-Try it with [`grpcurl`](https://github.com/fullstorydev/grpcurl):
-
-```bash
-grpcurl -plaintext -d '{}' localhost:50051 pathlockd.v1.PathLock/IncrFencingToken
-grpcurl -plaintext localhost:50051 pathlockd.v1.PathLock/Health
-```
-
-Or use the typed Node.js client, [`pathlockd-nodejs-client`](https://github.com/alexpacio/pathlockd-nodejs-client).
-
-To run the daemon on your host for development, see
-[`llmwiki/06-testing.md`](llmwiki/06-testing.md).
-
-## Production deployment
-
-A cluster is N self-contained nodes. Each node needs three things:
-
-1. a **stable identity** — `node_id` ending in a unique integer
-   (`pathlockd-0`, `pathlockd-1`, …) that survives restarts;
-2. a **persistent volume** of its own — a node must come back on its own
-   disk (a wiped disk means rejoining as a learner and re-syncing);
-3. **addresses peers can reach**: `raft_addr` (gRPC/TCP), `gossip_addr`
-   (UDP), `public_addr` (client gRPC, used for event fan-out).
-
-Exactly **one** node sets `bootstrap = true` (it initializes the cluster the
-first time, idempotently); every node lists `seed_nodes` (gossip addresses of
-the others). A bootstrap-flagged node restarting on an empty disk **refuses to
-re-initialize** when its cluster still answers through the seeds, and joins it
-instead — so the flag is safe to leave set in static configs.
-
-Single node (dev or no-HA):
-
-```bash
-docker run -d --restart=unless-stopped -p 50051:50051 \
-  -e PATHLOCKD_NODE_ID="pathlockd-0" \
-  -e PATHLOCKD_BOOTSTRAP="true" \
+  -e PATHLOCKD_INTERNAL_AUTH_TOKEN=replace-with-a-random-32-byte-secret \
   -v pathlockd-data:/data/pathlockd \
   ghcr.io/alexpacio/pathlockd:latest
 ```
 
-**Docker Swarm (3-node HA)**: see [`docker-stack.yml`](docker-stack.yml) — a
-ready-to-deploy reference stack. The pattern is **one single-replica service
-per node** (`pathlockd-0/1/2`), because lock state is per-task and Swarm's
-`replicas: 3` gives tasks neither stable identity nor stable volumes:
-
-```bash
-# Pin each instance to a host so it always finds its volume:
-docker node update --label-add pathlockd=0 <node-A>
-docker node update --label-add pathlockd=1 <node-B>
-docker node update --label-add pathlockd=2 <node-C>
-docker stack deploy -c docker-stack.yml pathlockd
-```
-
-Clients on the same overlay network reach any service (`pathlockd-0:50051`,
-…); every node serves every request, forwarding writes to the right Raft
-leader internally. Kill any one container/host: the other two keep serving,
-acknowledged locks survive, and the node rejoins and re-syncs when it returns.
-
-On **Kubernetes**, the same shape is a StatefulSet with a headless Service:
-ordinal hostnames give the node ids, `volumeClaimTemplates` give per-pod
-disks, and `seed_nodes` points at the headless DNS name of pod 0 (or all
-pods).
-
-> **Clocks.** Lease expiry uses a `now_ms` stamped at proposal and clamped
-> monotonically inside each group's replicated state machine, so a backwards
-> clock step (NTP, VM resume) or a leader change to a node with a slower
-> clock can never make later commands apply with earlier timestamps. Fencing
-> tokens are one monotonic counter in the system Raft group.
-
-### Event fan-out across instances
-
-The per-owner event stream (`Subscribe` → `released` / `killed` / `revoke`)
-raises an event on whichever node handled the call, which may be a different
-node than the one holding the subscriber. Nodes discover each other via
-gossip and forward events peer-to-peer automatically — no configuration
-needed. Fan-out is best-effort by design: the client-side recheck poll is the
-correctness backstop, so a dropped event costs wakeup latency, never safety.
-
-### Scaling and write throughput
-
-Reads scale with nodes (any replica serves stale-tolerable reads locally).
-Writes scale with **routing domains**: every domain (handler prefix by
-default) serializes through one Raft group leader, and leaders spread across
-nodes. Many handlers → near-linear write scaling. Few handlers → set
-`routing_prefix_segments = K` to shard by the first K path segments instead,
-accepting that locks *above* depth K are rejected (containment must stay
-single-group). Renews should declare their domains (`RenewRequest.domains`)
-so each heartbeat touches only the groups that actually hold state.
-
-To **decommission** a node gracefully, mark it draining (internal
-`RaftTransport/SetDraining` RPC, or just stop it and let the eviction window
-re-place its groups); scale-up is automatic on join.
-
-## Configuration
-
-A TOML file (`--config pathlockd.toml` or `PATHLOCKD_CONFIG`) overlaid by
-`PATHLOCKD_*` environment variables (env wins). See
-[`pathlockd.example.toml`](pathlockd.example.toml).
-
-| TOML key | Env var | Default | Meaning |
-| --- | --- | --- | --- |
-| `listen` | `PATHLOCKD_LISTEN` | `0.0.0.0:50051` | Client gRPC listen address |
-| `node_id` | `PATHLOCKD_NODE_ID` | `pathlockd-0` | Stable identifier; must end in a unique integer per node |
-| `data_dir` | `PATHLOCKD_DATA_DIR` | `/var/lib/pathlockd` | RocksDB data directory (one per node, persistent) |
-| `public_addr` | `PATHLOCKD_PUBLIC_ADDR` | `http://localhost:50051` | Client gRPC address advertised to peers (event fan-out) |
-| `raft_addr` | `PATHLOCKD_RAFT_ADDR` | `http://localhost:50052` | Internal Raft/forwarding gRPC address advertised to peers |
-| `gossip_addr` | `PATHLOCKD_GOSSIP_ADDR` | `0.0.0.0:7946` | SWIM gossip UDP bind address |
-| `gossip_advertise_addr` | `PATHLOCKD_GOSSIP_ADVERTISE_ADDR` | auto | Concrete `ip:port` advertised for gossip (set behind NAT) |
-| `gossip_cluster_size` | `PATHLOCKD_GOSSIP_CLUSTER_SIZE` | `32` | Expected SWIM members for Foca dissemination/suspicion tuning |
-| `gossip_max_packet_size` | `PATHLOCKD_GOSSIP_MAX_PACKET_SIZE` | `1400` | Maximum Foca UDP payload size |
-| `gossip_seed_announce_interval_ms` | `PATHLOCKD_GOSSIP_SEED_ANNOUNCE_INTERVAL_MS` | `5000` | Seed DNS refresh and announce cadence while lonely |
-| `gossip_manual_gossip_interval_ms` | `PATHLOCKD_GOSSIP_MANUAL_GOSSIP_INTERVAL_MS` | `0` | Extra manual Foca gossip tick; 0 uses Foca periodic gossip only |
-| `gossip_foca_periodic` | `PATHLOCKD_GOSSIP_FOCA_PERIODIC` | `true` | Enable Foca's built-in periodic announce/gossip timers |
-| `gossip_send_queue_depth` | `PATHLOCKD_GOSSIP_SEND_QUEUE_DEPTH` | `1024` | Bounded UDP writer queue depth |
-| `seed_nodes` | `PATHLOCKD_SEED_NODES` | `[]` | Gossip addresses of existing members (required unless bootstrapping) |
-| `bootstrap` | `PATHLOCKD_BOOTSTRAP` | `false` | Initialize a brand-new cluster (exactly one node; guarded against re-init on empty disks) |
-| `group_count` | `PATHLOCKD_GROUP_COUNT` | `32` | Number of Raft groups (fixed at cluster birth) |
-| `routing_prefix_segments` | `PATHLOCKD_ROUTING_PREFIX_SEGMENTS` | `0` | Path depth of the routing domain (0 = handler only) |
-| `replication_factor` | `PATHLOCKD_REPLICATION_FACTOR` | `3` | Voters per group (odd; auto-degrades/upgrades with node count) |
-| `stability_window_secs` | `PATHLOCKD_STABILITY_WINDOW_SECS` | `30` | Node uptime required before group placement |
-| `eviction_window_secs` | `PATHLOCKD_EVICTION_WINDOW_SECS` | `60` | How long a voter must be gone before replacement |
-| `leader_balance_interval_secs` | `PATHLOCKD_LEADER_BALANCE_INTERVAL_SECS` | `60` | Leadership rebalancing cadence |
-| `max_inflight_per_group` | `PATHLOCKD_MAX_INFLIGHT_PER_GROUP` | `1024` | Per-group write budget; overflow rejected with `UNAVAILABLE` |
-| `raft_election_timeout_min_ms` / `_max_ms` | `PATHLOCKD_RAFT_ELECTION_TIMEOUT_*` | `1500`/`3000` | Election window (failover time ceiling) |
-| `raft_heartbeat_interval_ms` | `PATHLOCKD_RAFT_HEARTBEAT_INTERVAL_MS` | `500` | Leader heartbeat |
-| `raft_snapshot_interval_entries` | — | `10000` | Snapshot after this many log entries |
-| `group_gc_interval_secs` | `PATHLOCKD_GROUP_GC_INTERVAL_SECS` | `1` | GC sweep interval (0 disables; leaders sweep their groups) |
-| `group_gc_batch` | `PATHLOCKD_GROUP_GC_BATCH` | `1024` | Keys per GC sweep command |
-| `gc_compact_interval_secs` | `PATHLOCKD_GC_COMPACT_INTERVAL_SECS` | `600` | Physically compact swept expiry regions (0 disables) |
-| `rocksdb_wal_sync` | `PATHLOCKD_ROCKSDB_WAL_SYNC` | `true` | Fsync the WAL once per batched append group |
-| `rocksdb_max_total_wal_size_mb` | `PATHLOCKD_ROCKSDB_MAX_TOTAL_WAL_SIZE_MB` | `512` | Upper bound on total WAL size |
-| `rocksdb_max_background_jobs` | `PATHLOCKD_ROCKSDB_MAX_BACKGROUND_JOBS` | `4` | RocksDB flush/compaction parallelism |
-| `rocksdb_block_cache_mb` | `PATHLOCKD_ROCKSDB_BLOCK_CACHE_MB` | `128` | Shared block cache size |
-| `rocksdb_write_buffer_mb` | `PATHLOCKD_ROCKSDB_WRITE_BUFFER_MB` | `16` | Per-column-family memtable size |
-| `peers` | `PATHLOCKD_PEERS` | `[]` | Extra static event fan-out endpoints (members are auto-discovered) |
-| `event_buffer` | `PATHLOCKD_EVENT_BUFFER` | `8192` | in-process event channel capacity |
-| `log_level` | `PATHLOCKD_LOG_LEVEL` | `info` | tracing filter |
-
-### OpenTelemetry
-
-Remote APM export is configured with standard `OTEL_*` environment variables,
-not TOML. Traces and metrics are enabled when `OTEL_EXPORTER_OTLP_ENDPOINT` (or
-the signal-specific traces/metrics endpoint) is set, or when the matching
-`OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` includes `otlp`.
-
-Common variables:
-
-| Env var | Meaning |
-| --- | --- |
-| `OTEL_SERVICE_NAME` | service name resource attribute (defaults to `pathlockd`) |
-| `OTEL_RESOURCE_ATTRIBUTES` | extra resource attributes, e.g. `deployment.environment.name=prod` |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | shared OTLP collector/APM endpoint |
-| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | traces-only OTLP endpoint |
-| `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | metrics-only OTLP endpoint |
-| `OTEL_EXPORTER_OTLP_PROTOCOL` | `http/protobuf` or `grpc` |
-| `OTEL_EXPORTER_OTLP_HEADERS` | comma-separated auth headers for HTTP OTLP |
-| `OTEL_SDK_DISABLED` | set to `true` to disable OTEL entirely |
-
-Example:
-
-```sh
-export OTEL_SERVICE_NAME=pathlockd
-export OTEL_RESOURCE_ATTRIBUTES=deployment.environment.name=prod,service.namespace=locks
-export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel-collector.example:4318
-export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-```
+The daemon runs as a non-root user (`uid 10001`) and exposes a liveness
+`HEALTHCHECK`. For multi-node HA (Swarm / Kubernetes), see
+[docs/operations.md](docs/operations.md).
 
 ## gRPC API
 
-The full contract is in [`proto/pathlockd.proto`](proto/pathlockd.proto). The
-`PathLock` service: `Acquire`, `Release`, `ReleaseAll`, `Renew`, `ForceRelease`,
-`AssertFencing`, `DetectCycle`, `IsBlocking`, `IncrFencingToken`, `SetWaitEdge`,
-`ClearWaitEdge`, `SetClaim`, `ClearClaim`, `IsOwnerAlive`, `RequestRevoke`,
-`Subscribe` (server stream), `Health`.
+The wire contract is the source of truth: [`proto/pathlockd.proto`](proto/pathlockd.proto).
+The `PathLock` service exposes `Acquire`, `Release`, `ReleaseAll`, `Renew`,
+`ForceRelease`, `AssertFencing`, `DetectCycle`, `IsBlocking`,
+`SetNamespacePolicy` / `GetNamespacePolicy` / `DeleteNamespacePolicy`,
+`IncrFencingToken`, `IsOwnerAlive`, and a server-streaming `Subscribe`.
 
-Claims (`SetClaim`/`ClearClaim`) are TTL-governed anti-starvation reservations:
-a waiter plants a claim on the path it is queued for, new overlapping acquires
-by other owners bounce with `preempt_claimed` while existing holders drain, and
-the claimant's own acquire consumes the claim atomically on grant. `SetClaim`
-is claim-if-absent — a live foreign claim is reported, never overwritten — and
-claims require no liveness lease, so a pure waiter (holding nothing yet) can
-reserve, and a crashed claimant's reservation simply expires.
+## Web facade (HTTP/1.1, HTTP/2, HTTP/3)
 
-## Building
+Set `web_listen` (off by default) to expose the *same* `PathLock` engine as a
+JSON API over **HTTPS** (HTTP/1.1 + HTTP/2) and, with `h3_listen`, over
+**HTTP/3** (QUIC) — alongside the gRPC server, sharing one code path through the
+engine. With `tls_cert_path`/`tls_key_path` unset, a self-signed dev cert is
+generated at boot.
 
-`cargo build --release` with standard Rust tooling. The
-[`Dockerfile`](Dockerfile) bundles the builder stage, so `docker build`
-needs nothing on the host.
-
-## Testing
-
-Everything runs inside containers, so Docker is the only prerequisite (no host
-cargo/protoc/clang). The first run builds a small cached builder image.
+- **Every RPC as JSON.** `POST /v1/<rpc>` with the request message as a
+  proto3-JSON body (camelCase fields), e.g. `POST /v1/acquire`,
+  `/v1/release`, `/v1/renew`, `/v1/incrFencingToken`; `GET /v1/health`. gRPC
+  status codes map to HTTP status codes.
+- **Events over SSE.** `GET /v1/events/sse?owner_id=…` is a `text/event-stream`
+  of that owner's lifecycle events; each frame carries a monotonic `id`, so a
+  reconnecting `EventSource` resumes from `Last-Event-ID`. SSE is the only event
+  *stream* — clients that can't hold one don't need it (see the polling loop
+  below); the cooperative-revoke signal is also delivered on `renew`.
+- **HTTP/3 0-RTT, reads-only.** QUIC early data is replayable, so the facade
+  dispatches **only read-only RPCs** received before the handshake completes;
+  mutating RPCs in early data get `425 Too Early` and must retry on the 1-RTT
+  connection.
 
 ```bash
-./scripts/test-unit.sh           # crate unit tests (no cluster needed)
-cargo test --test engine_tests    # lock engine tests (RocksDB integration)
-cargo test --test e2e_tests       # full e2e tests (starts a 1-node cluster, drives gRPC)
-cargo test --test cluster_tests   # 3-node cluster: formation, leader-kill failover under
-                                  # contention (exactly-one-holder invariant), wiped-disk
-                                  # bootstrap guard, node rejoin
-cargo test --test load            # throughput benchmarks
-./scripts/test-e2e-stress.sh     # starts peered replicas, checks cross-replica events, runs GC stress
+curl -k https://localhost:8443/v1/health
+curl -k -X POST https://localhost:8443/v1/incrFencingToken \
+  -H 'content-type: application/json' -d '{"path":"s3:/a/b"}'
+curl -kN "https://localhost:8443/v1/events/sse?owner_id=op-7"
 ```
 
-Engine tests and e2e tests run directly against the embedded RocksDB — no
-external cluster is needed. See [`llmwiki/06-testing.md`](llmwiki/06-testing.md).
+Config keys (and `PATHLOCKD_WEB_*` env equivalents) are in
+[`pathlockd.example.toml`](pathlockd.example.toml). The facade is unauthenticated
+like gRPC — front it with an mTLS/auth proxy or restrict reachability.
+
+## Polling-based client loop (no event stream required)
+
+A client never has to open a `Subscribe`/SSE stream. Every signal maps to a
+poll-friendly read, so environments that can't hold a long-lived stream
+(browsers without SSE, restricted networks, request/response-only clients) lose
+nothing:
+
+| Event | Poll-only equivalent |
+| --- | --- |
+| `GRANT` (queued acquire became held) | `listOwnerLocks` / `inspectPath` — level-triggered, can't be missed |
+| `KILLED` (lease force-released) | `isOwnerAlive`, or `assertFencing` returns `stale_fencing_token` before your next write |
+| `REVOKE` (asked to yield) | `renew` returns `revokeRequested: true` — the request is persisted and rides your heartbeat |
+
+So the whole loop is just the request/response RPCs:
+
+```
+acquire → if OK proceed; if QUEUED, poll listOwnerLocks until the path is yours
+          (or queue_ttl_ms lapses and you abandon).
+renew on a timer → if revokeRequested, finish current work and releaseAll.
+assertFencing right before each backing-store write.
+release when done.
+```
+
+Correctness never depends on events either way: `assertFencing` (fencing) and
+the TTL lease are the safety mechanisms. `RequestRevoke` is advisory graceful
+preemption — pair it with a deadline and escalate to `ForceRelease` if a holder
+won't yield.
+
+`GET /v1/events/poll` still gives you a long-poll fallback for any
+cross-owner notifications (e.g. a `killed` you didn't trigger).
+
+## SSE-based client loop
+
+The streaming equivalent — preferred when you can hold a long-lived
+connection (gRPC `Subscribe` or `GET /v1/events/sse`):
+
+```
+acquire → if OK proceed; if QUEUED, wait for a GRANT event on your owner's
+          event stream (or queue_ttl_ms lapses and you abandon).
+renew on a timer.
+assertFencing right before each backing-store write.
+release when done.
+```
+
+The same stream also delivers `REVOKE` (cooperative yield request) and
+`KILLED` (you were force-released — stop all backing-store I/O at once).
+
+## Examples
+
+Runnable examples in [`examples/`](examples/) — HTTP/1.1, gRPC, and HTTP/3
+against a local daemon. Each is a self-contained demo:
+
+| Example | Transport | What it shows |
+| --- | --- | --- |
+| [`python/mutex.py`](examples/python/mutex.py) | HTTP/1.1 + SSE | Mutual exclusion: two workers contend on one path; the second is enqueued and waits for a `GRANT` event. |
+| [`python/hierarchical_rwlock.py`](examples/python/hierarchical_rwlock.py) | HTTP/1.1 + SSE | Tree-shaped RWLock: a subtree write queues a descendant read (`ancestor_locked`), a sibling read succeeds, and the queued read is granted when the writer releases. |
+| [`python/semaphore.py`](examples/python/semaphore.py) | HTTP/1.1 + SSE | Counting semaphore: sets `LOCK_ALGORITHM_SEMAPHORE`, caps at N permits, queues the N+1th acquire. |
+| [`python/lock_lifecycle.py`](examples/python/lock_lifecycle.py) | HTTP/1.1 + SSE | A high-level `Lock` object: add/remove paths mid-lease, fencing checks, renewals, preemption via `KILLED`, deadlock detection with `DetectCycle`. |
+| [`python/grpc_client.py`](examples/python/grpc_client.py) | gRPC | Native gRPC wire with `Subscribe` stream for `GRANT` events; async with `grpcio`. |
+| [`python/http3_zero_rtt.py`](examples/python/http3_zero_rtt.py) | HTTP/3 + 0-RTT | QUIC early data: read-only RPCs succeed, mutations get `425 Too Early` and retry on the 1-RTT connection. Uses `aioquic`. |
+| [`php/polling_client.php`](examples/php/polling_client.php) | HTTP/1.1 polling | No SSE: `acquire` → poll `listOwnerLocks` until granted → `renew` → `assertFencing` → `release`. Preemption via `isOwnerAlive`. |
+
+```bash
+# Python (HTTP/1.1 + SSE) — stdlib only, no extra deps
+python3 examples/python/mutex.py
+python3 examples/python/hierarchical_rwlock.py
+python3 examples/python/semaphore.py
+python3 examples/python/lock_lifecycle.py
+
+# Python gRPC — needs grpcio + grpcio-tools (see file header for stub generation)
+python3 examples/python/grpc_client.py
+
+# Python HTTP/3 + 0-RTT — needs aioquic
+python3 examples/python/http3_zero_rtt.py
+
+# PHP — cURL only, no SSE
+php examples/php/polling_client.php
+```
+
+The shared helper [`examples/python/pathlockd_client.py`](examples/python/pathlockd_client.py)
+wraps the JSON RPCs and the SSE stream in a small client class — use it as a
+starting point for your own integration. Third-party deps for the gRPC and
+HTTP/3 examples are listed in
+[`examples/python/requirements.txt`](examples/python/requirements.txt).
+
+## Documentation
+
+| Topic | Where |
+| --- | --- |
+| Conflict rules, fencing, leases, re-entrancy, outcomes | [docs/locking-semantics.md](docs/locking-semantics.md) |
+| VFS usage (end-to-end, copy-pasteable) | [docs/usage-virtual-filesystem.md](docs/usage-virtual-filesystem.md) |
+| Deployment, recovery, OTel, scaling | [docs/operations.md](docs/operations.md) |
+| Backup / restore | [docs/backup-restore.md](docs/backup-restore.md) |
+| Architecture, data model, engine, events | [llmwiki/](llmwiki/) |
+| Lock algorithms & namespace policies | [llmwiki/08-lock-algorithms.md](llmwiki/08-lock-algorithms.md) |
+| Configuration reference | [llmwiki/05-config.md](llmwiki/05-config.md) |
+| Testing & benchmarking | [llmwiki/06-testing.md](llmwiki/06-testing.md) |
+| Contributor / extender guide | [llmwiki/07-extending.md](llmwiki/07-extending.md) |
+
+## Build and test
+
+```bash
+cargo build --release
+./scripts/test-unit.sh            # cargo test --lib
+./scripts/test-integration.sh     # in-process RocksDB engine tests
+./scripts/test-e2e-safety.sh      # 1-node cluster, gRPC
+./scripts/test-e2e-state.sh
+./scripts/test-e2e-stress.sh      # peered replicas, cross-replica events, GC stress
+
+cargo fmt --all
+cargo clippy --all-targets -- -D warnings
+```
 
 ## Releasing
 
-[`scripts/release.sh`](scripts/release.sh) builds the linux/amd64 artifacts,
-tags, pushes, and publishes the GitHub release in one shot.
-
 ```bash
-# 1. bump the version in Cargo.toml, commit it
-# 2. write the release notes for the tag:
-#      release_notes/v0.1.2/gh.md      # used as the release body + tag message
-# 3. publish (tag must match Cargo.toml; tree must be clean):
-./scripts/release.sh v0.1.2
-
-# preview without tagging/pushing/publishing:
-./scripts/release.sh --dry-run v0.1.2
-# extra flags: --prerelease, --draft
+./scripts/release.sh v0.X.Y                # build, tag, push, publish
+./scripts/release.sh --dry-run v0.X.Y      # preview without side effects
 ```
 
-It refuses to run on a dirty tree, on a version/tag mismatch, or if the tag or
-release already exists. Artifacts land in `dist/<tag>/` (release + debug
-tarballs + `SHA256SUMS`).
-
-**Container images** are published automatically by the
-[Docker publish workflow](.github/workflows/docker-publish.yml) whenever a
-`v*` tag is pushed from the same [`Dockerfile`](Dockerfile):
-
-| Tag pattern | `RUSTFLAGS` | Notes |
-| --- | --- | --- |
-| `:v1.2.3`, `:1.2` | (none) | native on amd64 and arm64 |
-
-Images are pushed to `ghcr.io/alexpacio/pathlockd` using the built-in
-`GITHUB_TOKEN`; no extra secrets are required.
+The release body is `release_notes/v0.X.Y/gh.md` (also the tag message).
 
 ## License
 

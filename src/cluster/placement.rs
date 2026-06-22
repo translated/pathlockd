@@ -19,12 +19,12 @@ pub const SYS_GROUP: GroupId = u32::MAX;
 pub fn place_domain(domain: &str, group_count: u32) -> GroupId {
     let mut best_group: GroupId = 0;
     let mut best_weight = 0u64;
+    let mut buf = Vec::with_capacity(8 + domain.len());
+    buf.extend_from_slice(&0u64.to_le_bytes());
+    buf.extend_from_slice(domain.as_bytes());
 
     for g in 0..group_count {
-        let seed = (g as u64).to_le_bytes();
-        let mut buf = Vec::with_capacity(seed.len() + domain.len());
-        buf.extend_from_slice(&seed);
-        buf.extend_from_slice(domain.as_bytes());
+        buf[..8].copy_from_slice(&(g as u64).to_le_bytes());
         let weight = xxh3_64(&buf);
         if weight > best_weight {
             best_weight = weight;
@@ -38,14 +38,14 @@ pub fn place_domain(domain: &str, group_count: u32) -> GroupId {
 /// The routing domain of a path: the handler plus the first
 /// `prefix_segments` path segments.
 ///
-/// With `prefix_segments == 0` (the default) the domain is the handler alone,
+/// With `prefix_segments == 0` the domain is the handler alone,
 /// so a handler's entire tree lives in one group and every operation —
 /// including locking the handler root — is single-group.
 ///
 /// With `prefix_segments == K > 0`, paths shard by their first K segments for
 /// write parallelism within one handler. Containment-closure then requires
-/// that no lock is ever taken at depth < K (the service layer rejects such
-/// paths), because an ancestor at depth < K would span groups.
+/// that new locks above depth K use an explicit namespace or are rejected by
+/// the router, because an ancestor at depth < K would span groups.
 pub fn routing_prefix(path: &str, prefix_segments: u32) -> &str {
     let Some(colon) = path.find(':') else {
         return path;
@@ -66,6 +66,34 @@ pub fn routing_prefix(path: &str, prefix_segments: u32) -> &str {
     }
     // Fewer than K segments: the whole path is the domain.
     path
+}
+
+/// True when `namespace` contains `path`.
+///
+/// Handler-only namespaces (`"google_drive"`) contain every path in that
+/// handler. Path namespaces contain their exact root plus descendants, so
+/// `"google_drive:/a"` contains `"google_drive:/a"` and
+/// `"google_drive:/a/b"`, but not `"google_drive:/ab"`.
+pub fn namespace_contains_path(namespace: &str, path: &str) -> bool {
+    let Some(ns_colon) = namespace.find(':') else {
+        return path
+            .find(':')
+            .is_some_and(|colon| &path[..colon] == namespace);
+    };
+    let Some(path_colon) = path.find(':') else {
+        return false;
+    };
+    if namespace[..ns_colon] != path[..path_colon] {
+        return false;
+    }
+    if namespace == path {
+        return true;
+    }
+    if namespace.ends_with(":/") {
+        return path.starts_with(namespace);
+    }
+    path.strip_prefix(namespace)
+        .is_some_and(|rest| rest.starts_with('/'))
 }
 
 /// Number of `/`-separated segments in the path part (after the handler).
@@ -130,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn routing_prefix_handler_only_by_default() {
+    fn routing_prefix_handler_only_when_zero() {
         assert_eq!(routing_prefix("h:/a/b/c", 0), "h");
         assert_eq!(routing_prefix("google_drive:/x", 0), "google_drive");
         assert_eq!(routing_prefix("h:/", 0), "h");
@@ -143,6 +171,25 @@ mod tests {
         // Fewer segments than K: whole path is the domain.
         assert_eq!(routing_prefix("h:/a", 2), "h:/a");
         assert_eq!(routing_prefix("h:/", 1), "h:/");
+    }
+
+    #[test]
+    fn namespace_contains_path_is_segment_aware() {
+        assert!(namespace_contains_path("google_drive", "google_drive:/a/b"));
+        assert!(!namespace_contains_path("google_drive", "s3:/a/b"));
+        assert!(namespace_contains_path(
+            "google_drive:/a",
+            "google_drive:/a"
+        ));
+        assert!(namespace_contains_path(
+            "google_drive:/a",
+            "google_drive:/a/b"
+        ));
+        assert!(!namespace_contains_path(
+            "google_drive:/a",
+            "google_drive:/ab"
+        ));
+        assert!(namespace_contains_path("google_drive:/", "google_drive:/a"));
     }
 
     #[test]

@@ -28,14 +28,15 @@ remote drive, DB rows); pathlockd makes that I/O safe under concurrency.
 
 | Concept | In your VFS |
 |---|---|
-| **Handler** | A backend/namespace, e.g. `google_drive`, `s3`, `local`. The segment before the first `:` in a path. Locks in different handlers never conflict and run fully in parallel. |
+| **Handler** | A backend prefix, e.g. `google_drive`, `s3`, `local`. The segment before the first `:` in a path. |
+| **Routing namespace** | The shard/conflict domain. By default `google_drive:/team/report` routes by `google_drive:/team`; operators can define deeper roots such as `google_drive:/team/archive` with `SetNamespacePolicy`. |
 | **Path** | `"<handler>:<normalizedPath>"`, e.g. `google_drive:/team/reports/q3.xlsx`. Must be rooted (`/…`), no trailing slash, no `//`, `.` or `..`. |
 | **Owner** | One logical lock session = one owner id = ideally one connection. All paths you take under that owner id share **one lease**. Use a fresh UUID per operation (e.g. `mv-7f3a…`). |
 | **Write lock** | Covers the whole **subtree**: `…:/a` conflicts with any lock on `/a`, on an ancestor of `/a`, or anywhere under `/a/…`. "This subtree is mine." |
 | **Read lock** | **Point-only**: protects exactly one node. An ancestor read does *not* cover descendants. Many readers share a node; a writer on that exact node conflicts. |
 | **Fencing token** | A monotonic integer stamped on each write-locked path. Prove you still hold it (`AssertFencing`) right before you mutate the backing store; a stale token is rejected. |
 | **Lease (TTL)** | Every lock expires after `ttl_ms`. You **renew** to stay alive. Die without renewing → the lease lapses and the subtree frees itself. |
-| **Events** | A per-owner stream delivering `REVOKE` / `KILLED` / `RELEASED` for *that* owner, so a holder learns it must yield or has been preempted. |
+| **Events** | A per-owner stream delivering `GRANT` / `REVOKE` / `KILLED` for *that* owner: a waiter learns its queued acquire became grantable, and a holder learns it must yield or has been preempted. |
 
 ### The conflict matrix
 
@@ -124,7 +125,8 @@ $PL -d '{ "owner_id": "op-abc", "del_wait_key": true }' \
 | Status | Meaning | What to do |
 |---|---|---|
 | `OK` | All requested paths are yours. | Proceed. |
-| `CONFLICT` | A path is blocked. `path`/`owner`/`reason` say which and by whom. | Wait, retry, or fail — see §4. (For `stale_fencing_token`, `owner` holds the *persisted fence value*, not an owner id.) |
+| `QUEUED` | A path is contended; your request was enqueued in FIFO order. `path`/`owner`/`reason` say what it is queued behind. | Wait for a `GRANT` event for your owner id, then proceed (or re-issue the acquire, which returns `OK` once granted). See §4. |
+| `CONFLICT` | A non-waitable condition — chiefly `stale_fencing_token` (here `owner` holds the *persisted fence value*, not an owner id). | Refresh your fencing token (`IncrFencingToken`) and retry. |
 | `LOST` | A `HELD` path you claimed to own is gone (`missing_write`/`missing_read`/`missing_fence`/`missing_alive`). | Your lease/lock lapsed. Stop, drop in-flight work, re-mint a token and re-acquire from scratch. |
 
 `Renew` returns `OK` or `LOST`. `LOST` (`missing_alive`, `missing_owner_set`,
@@ -227,29 +229,30 @@ Subscribe once per owner, on the same instance you hold locks on:
 
 ```bash
 $PL -d '{ "owner_id": "op-abc" }' localhost:50051 pathlockd.v1.PathLock/Subscribe
-# server stream of: { "type": "EVENT_TYPE_REVOKE",  "owner_id": "op-abc" }
-#                   { "type": "EVENT_TYPE_KILLED",  "owner_id": "op-abc" }
-#                   { "type": "EVENT_TYPE_RELEASED","owner_id": "op-abc" }
+# server stream of: { "type": "EVENT_TYPE_GRANT",  "owner_id": "op-abc" }
+#                   { "type": "EVENT_TYPE_REVOKE", "owner_id": "op-abc" }
+#                   { "type": "EVENT_TYPE_KILLED", "owner_id": "op-abc" }
 ```
 
 Handle them:
 
+- **`GRANT`** — your queued (`QUEUED`) acquire became grantable. Re-issue the
+  acquire (it returns `OK`), or treat the event as your signal to proceed. If the
+  re-acquire returns `stale_fencing_token`, refresh the token and retry.
 - **`REVOKE`** — another worker asks you to yield (deadlock or priority). Finish
   the smallest safe unit of work, then `Release`/`ReleaseAll`. Cooperative.
 - **`KILLED`** — you were force-released. Your locks are **already gone**. Stop
   all backing-store I/O at once; do not release (nothing to release); restart the
   operation from scratch if needed (new token).
-- **`RELEASED`** — confirmation your own release/​shadow-transition happened
-  (useful for internal bookkeeping).
 
 > A subscription only ever sees **its own** owner's events — never another
-> owner's. The event is best-effort (a `REVOKE` may be missed if a peer forward
-> drops); your `IsBlocking`/`DetectCycle` polling and the lease are the
-> correctness backstops, so events are an optimization, not a guarantee.
+> owner's. Events are best-effort (a `GRANT` may be missed if a peer forward
+> drops); the lease and a coarse `IsBlocking` recheck are the correctness
+> backstops, so events are the fast path, not a guarantee.
 
 In a multi-replica deployment, keep an owner sticky to one replica (one lock =
-one connection). If clients hop replicas, set `PATHLOCKD_PEERS` so events fan out
-to siblings.
+one connection). If clients hop replicas, set `PATHLOCKD_PEERS` to the siblings'
+internal Raft endpoints so events fan out.
 
 ---
 
@@ -326,10 +329,10 @@ children in the same transaction** so there is never a gap:
 { "owner_id": "op-abc", "ttl_ms": "30000", "fencing_token": "70",
   "requests":        [{ "path": "fs:/s",   "mode": "MODE_WRITE", "state": "LOCK_STATE_NEW" }],
   "release_requests":[{ "path": "fs:/s/a", "mode": "MODE_WRITE" },
-                      { "path": "fs:/s/b", "mode": "MODE_WRITE" }],
-  "emit_release": true }
+                      { "path": "fs:/s/b", "mode": "MODE_WRITE" }] }
 ```
-`emit_release: true` publishes a `RELEASED` event when the inline release runs.
+The acquire and the child releases apply atomically; any waiter freed by the
+inline release is granted in place and gets a `GRANT` event.
 
 ### Upgrading a read lock to a write lock
 
@@ -424,7 +427,7 @@ stop RENEW; stop SUBSCRIBE
 | `RequestRevoke` | Politely ask an owner to yield (sends it a `REVOKE`). |
 | `ForceRelease` | Preempt an owner (drops its locks, sends it `KILLED`). |
 | `IsOwnerAlive` | Is an owner's lease still live? |
-| `Subscribe` | Stream `REVOKE`/`KILLED`/`RELEASED` for one owner. |
+| `Subscribe` | Stream `GRANT`/`REVOKE`/`KILLED` for one owner. |
 | `Health` | Readiness (verifies internal state-machine liveness). |
 
 For the exact message fields and enum values, see

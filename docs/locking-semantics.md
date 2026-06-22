@@ -14,14 +14,53 @@ the [traceability map](#rule--test-traceability) at the end).
 | Term | Definition |
 |---|---|
 | **Path** | `"<handler>:<normalizedPath>"`, e.g. `google_drive:/team/q3.xlsx`. The segment before the first `:` is the **handler**; the rest is rooted (`/…`), with no trailing slash, `//`, `.` or `..`. |
-| **Handler** | A backend/namespace. Locks in *different* handlers never conflict and serialize independently. |
+| **Handler** | A backend namespace prefix before `:`. |
+| **Routing namespace** | The Raft sharding and conflict domain for a path. By default this is the handler plus the first path segment, e.g. `google_drive:/team`; explicit namespace roots can be configured deeper or at the handler/root level. |
 | **Owner** | A caller-supplied id identifying one lock session. Every path held under that id shares a single lease. Conflict checks are always *between different owners* — an owner never conflicts with itself. |
 | **Mode** | `write` or `read`. |
 | **Ancestor / descendant** | `/a` is an ancestor of `/a/b`; `/a/b` is a descendant of `/a`. A path is neither its own ancestor nor descendant. Ancestry is computed per handler. |
+| **Namespace policy** | The lock algorithm configured for a routing namespace. Missing settings use the default `recursive_rw` policy. |
+
+## Namespace policies
+
+Policies are configured with `SetNamespacePolicy` and read with
+`GetNamespacePolicy`. The namespace key may be a handler (`google_drive`) or a
+normalized path root (`google_drive:/team` or `google_drive:/team/archive`).
+Path-root settings also define explicit routing namespaces; the longest
+explicit root containing a path wins, otherwise the fallback resolver uses
+handler plus the first path segment. Settings are Raft-replicated into each
+lock group and the system group, stored permanently in the `namespace_settings`
+RocksDB column family until `DeleteNamespacePolicy` removes them. The default
+is the first policy:
+
+| Policy | Reads | Write scope |
+|---|---|---|
+| `recursive_rw` | Shared point reads | Path plus descendants |
+| `point_rw` | Shared point reads | Exact path only |
+| `recursive_write` | Reads disabled | Path plus descendants |
+| `point_write` | Reads disabled | Exact path only |
+| `semaphore` | Reads disabled | Exact path, up to that path's `LockRequest.permits` capacity |
+
+An existing lock keeps the policy it was acquired with until it is released,
+force-cleared, or its owner lease expires. A namespace policy change that alters
+algorithm or semaphore capacity force-clears held and queued locks under that
+namespace so no stale conflict semantics linger.
+
+Recursive lock guarantees are scoped to the selected routing namespace. A
+nested explicit namespace such as `google_drive:/team/archive` intentionally
+lets that subtree route to a different Raft group; parent locks in
+`google_drive:/team` do not coordinate with that child namespace. Define or
+delete namespace roots while the affected subtree is drained if callers rely on
+parent recursive locks covering the whole subtree.
+
+> The per-algorithm conflict matrices, the rationale for each policy, and the
+> interplay with routing and the wait queue are documented in depth in
+> [`llmwiki/08-lock-algorithms.md`](../llmwiki/08-lock-algorithms.md). The rest
+> of this file describes the **default** `recursive_rw` model in full.
 
 ## The core invariant
 
-This is a **reader-writer lock generalized to a tree** — and the generalization
+The default `recursive_rw` policy is a **reader-writer lock generalized to a tree** — and the generalization
 is *asymmetric*, which is what sets it apart from a classic RWLock. A textbook
 RWLock is flat and symmetric: one resource, readers share, a writer excludes
 everyone. pathlockd keeps "shared readers, exclusive writer" but gives the two
@@ -46,7 +85,7 @@ directly:
 - An **ancestor read** is point-only: it does **not** cover its descendants, so
   it neither blocks nor is blocked by a lock deeper in the tree.
 
-## Conflict matrix
+## Default Conflict Matrix
 
 Because the relation is symmetric (the same pair of locks conflicts regardless of
 which is acquired first), it is enough to read it as "a **new request** on `P`
@@ -82,9 +121,15 @@ subtree):
 ancestor_locked → write_locked → read_locked → descendant_write_locked → descendant_read_locked → stale_fencing_token
 ```
 
-A `CONFLICT` outcome carries `{ path, owner, reason }`: the conflicting path, the
-owner that holds it, and the reason. For `stale_fencing_token` the `owner` field
-carries the *persisted fence value* rather than an owner id.
+The outcome carries `{ path, owner, reason }`: the conflicting path, the owner
+that holds it, and the reason. A **waitable** conflict (any held-lock reason
+above) does not refuse the request — it **enqueues** it in the per-group FIFO
+wait queue and returns `QUEUED`; the daemon grants it in place and sends a
+`GRANT` event when the path frees (FIFO admission also means a newcomer yields to
+earlier waiters, so no one is starved). `CONFLICT` is reserved for non-waitable
+request faults: `read_locks_disabled` in write-only namespaces, and
+`stale_fencing_token`, where `current_fencing_token` carries the persisted fence
+value and the caller should retry with a fresh server-minted token.
 
 ## Same-owner re-entrancy
 
@@ -103,36 +148,40 @@ still excluded from the whole subtree.
 
 ## Fencing tokens
 
-Every write-locked path stores a **fencing token** — a value from a strictly
-monotonic counter (`IncrFencingToken`). The token gives the backing store a way
-to reject a stale writer:
+Every write-locked path stores a **fencing token** — a value minted by the
+daemon from a strictly monotonic per-group counter unless the caller supplies a
+positive token explicitly. The token gives the backing store a way to reject a
+stale writer:
 
 - An acquire whose token is **older** than the path's persisted fence is rejected
   with `stale_fencing_token` (whether the request is `New` or `Held`). The holder
   is expected to fetch a fresh token and retry.
-- Write acquires and non-empty `AssertFencing` calls require a positive token;
-  read-only acquires may pass `0`.
+- Write acquires may pass `0` to let the server mint the token. Non-empty
+  `AssertFencing` calls require the concrete positive token being asserted.
 - `AssertFencing(owner, token, paths)` re-verifies, just before an external side
   effect, that for each path the owner **still** holds the write lock
   (`stale_owner` otherwise) **and** the persisted fence **still** equals the token
   (`stale_fencing_token` otherwise). A holder calls this right before mutating the
   backing store so a lock it lost mid-operation cannot corrupt newer state.
 
-The fence key outlives the lock (its TTL is `max(ttl, 1 day)`) so a token that
-briefly outlives its lease is still rejected.
+The fence key is a durable per-path high-water mark. It does not expire when a
+lease expires or is released, so a later caller can never move the path's token
+backward.
 
 ## Leases, renewal, and lock-loss
 
 Every lock is a **TTL lease**, not a permanent grant:
 
-- Acquiring or renewing stamps an expiry `now + ttl_ms` on the owner's keys.
-- The holder must **renew** before expiry to keep the lock. Renewal re-validates
-  and refreshes every held path.
+- Acquiring or renewing stamps an expiry `now + ttl_ms` on the owner's liveness
+  key.
+- The holder must **renew** before expiry to keep the lock. Renewal refreshes
+  owner liveness; held lock records are valid only while that owner is alive.
 - If the holder stops renewing (crash, partition, GC pause past the TTL), the
   lease lapses and the subtree frees itself — there are no orphaned locks.
 
-Renewal — and any acquire that re-validates a `Held` path — reports **`LOST`**
-(with a reason: `missing_alive`, `missing_write`, `missing_fence`, `missing_read`,
+Renewal reports **`LOST`** when the owner lease or portfolio is gone; any acquire
+that re-validates a `Held` path reports **`LOST`** (with a reason:
+`missing_alive`, `missing_write`, `missing_fence`, `missing_read`,
 `missing_owner_set`, `empty_owner_set`) when a key the owner believed it held has
 vanished. `LOST` is how a holder learns its lock is gone instead of silently
 re-acquiring it; the caller must treat any work done under that lock as unsafe. A

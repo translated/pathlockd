@@ -58,6 +58,13 @@ message SetDrainingRequest {
 
 message SetDrainingResponse {}
 
+message PublishEventRequest {
+  int32 type = 1;
+  string owner_id = 2;
+}
+
+message PublishEventResponse {}
+
 service RaftTransport {
   rpc AppendEntries(RaftFrame) returns (RaftFrame);
   rpc Vote(RaftFrame) returns (RaftFrame);
@@ -66,4 +73,5 @@ service RaftTransport {
   rpc Forward(ForwardRequest) returns (ForwardResponse);
   rpc ForwardRead(ForwardReadRequest) returns (ForwardReadResponse);
   rpc SetDraining(SetDrainingRequest) returns (SetDrainingResponse);
+  rpc PublishEvent(PublishEventRequest) returns (PublishEventResponse);
 }

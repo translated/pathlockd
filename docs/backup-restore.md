@@ -105,14 +105,14 @@ This prevents state/log divergence after a process crash.
 | `raft_log` | Raft log entries | Yes — needed for catch-up |
 | `write_locks` | Exclusive write lock state | Yes |
 | `read_locks` | Shared read lock state | Yes |
-| `fences` | Per-path fencing tokens | Yes (long-lived) |
-| `claims` | Preemption claims | Transient but include |
+| `fences` | Per-path fencing tokens | Yes (durable high-water marks) |
 | `desc_write` | Write descendant indexes | Yes |
 | `desc_read` | Read descendant indexes | Yes |
-| `desc_claim` | Claim descendant indexes | Transient but include |
 | `owner_alive` | Owner liveness leases | Yes |
 | `owner_holds` | Owner-to-locks mappings | Yes |
 | `wait_edges` | Deadlock-detection wait edges | Advisory but include |
+| `namespace_settings` | Namespace lock algorithm policies and explicit route roots | Yes |
+| `lock_queue` | FIFO wait queue (queued waiters) | Yes — preserves wait order |
 | `expiry` | Expiry index for active GC | No — rebuilt on restart |
 
 ## Verification after restore
