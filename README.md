@@ -159,9 +159,19 @@ fenced out.
 
 ## Why pathlockd?
 
-General-purpose coordination stores can be *made* to lock, but the lock-specific
-behavior is something you assemble out of recipes. pathlockd makes these
-primitives first-class.
+pathlockd grew out of replacing a homegrown hierarchical lock manager built on
+**Redis + Lua**. That design hit a wall: every acquire ran a non-trivial Lua
+script, and Redis executes Lua **single-threaded and atomically** — a
+stop-the-world interpreter run that serialized the whole instance and capped
+throughput under contention. It was hard to debug (lock logic buried in opaque
+scripts), and Redis has **one writer** with no native horizontal write
+scalability or high availability for this workload. pathlockd was built to keep
+the hierarchical semantics while removing those ceilings — sharded consensus for
+write parallelism, real fencing/TTL safety, and self-contained HA.
+
+More broadly, general-purpose coordination stores can be *made* to lock, but the
+lock-specific behavior is something you assemble out of recipes. pathlockd makes
+these primitives first-class.
 
 Legend: ✓ native · ◐ via client recipe / derived value · ✗ not available.
 
